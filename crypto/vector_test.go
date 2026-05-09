@@ -22,7 +22,7 @@ func TestCanonicalEncodingVector(t *testing.T) {
 	// Fixed inputs (all implementations must use these exact values)
 	env := &Envelope{
 		Version:              "3",
-		CipherSuite:          "HPKE_X25519_MLKEM768_ED25519_MLDSA65_WITH_AES_256_GCM_SHA256",
+		CipherSuite:          "HPKE_X25519MLKEM768_HKDFSHA256_AES256GCM_ED25519_MLDSA65",
 		SenderFingerprint:    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
 		SenderED25519:        bytes.Repeat([]byte{0x01}, ED25519PubKeySize),
 		SenderX25519:         bytes.Repeat([]byte{0x02}, X25519PubKeySize),
@@ -53,7 +53,7 @@ func TestCanonicalEncodingVector(t *testing.T) {
 	// Field 1: Version
 	writeLenPrefixed(h, []byte("3"))
 	// Field 2: CipherSuite
-	writeLenPrefixed(h, []byte("HPKE_X25519_MLKEM768_ED25519_MLDSA65_WITH_AES_256_GCM_SHA256"))
+	writeLenPrefixed(h, []byte("HPKE_X25519MLKEM768_HKDFSHA256_AES256GCM_ED25519_MLDSA65"))
 	// Field 3: SenderFingerprint
 	writeLenPrefixed(h, []byte("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"))
 	// Field 4: SenderED25519
@@ -89,7 +89,7 @@ func TestCanonicalEncodingVector(t *testing.T) {
 	// AAD is fields 1-10, 13-14 (skip 11 and 12: Enc and Ciphertext)
 	h2 := sha256.New()
 	writeLenPrefixed(h2, []byte("3"))
-	writeLenPrefixed(h2, []byte("HPKE_X25519_MLKEM768_ED25519_MLDSA65_WITH_AES_256_GCM_SHA256"))
+	writeLenPrefixed(h2, []byte("HPKE_X25519MLKEM768_HKDFSHA256_AES256GCM_ED25519_MLDSA65"))
 	writeLenPrefixed(h2, []byte("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"))
 	writeLenPrefixed(h2, bytes.Repeat([]byte{0x01}, 32))
 	writeLenPrefixed(h2, bytes.Repeat([]byte{0x02}, 32))

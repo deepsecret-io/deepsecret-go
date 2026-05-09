@@ -22,7 +22,7 @@ const (
 
 	// CipherSuite identifies the HPKE cipher suite with hybrid PQ signatures:
 	// KEM=MLKEM768-X25519, KDF=HKDF-SHA256, AEAD=AES-256-GCM, SIG=Ed25519+ML-DSA-65.
-	CipherSuite = "HPKE_X25519_MLKEM768_ED25519_MLDSA65_WITH_AES_256_GCM_SHA256"
+	CipherSuite = "HPKE_X25519MLKEM768_HKDFSHA256_AES256GCM_ED25519_MLDSA65"
 
 	// KDF identifies the key derivation function used within HPKE.
 	KDF = "hkdf-sha256"
