@@ -36,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatal("whoami: ", err)
 	}
-	fmt.Printf("Authenticated: %s %s (%s)\n", me.FirstName, me.LastName, me.Email)
+	fmt.Printf("Authenticated: %s (%s)\n", me.Name, me.Email)
 	fmt.Printf("Plan: %s | Status: %s\n\n", me.TierName, me.SubscriptionStatus)
 
 	// ── Identity ──

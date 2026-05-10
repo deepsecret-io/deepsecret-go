@@ -12,36 +12,61 @@ import (
 	"github.com/deepsecret-io/sdk/crypto"
 )
 
-// MembershipInfo holds per-org membership details from the API.
-type MembershipInfo struct {
-	OrgID             string `json:"org_id"`
-	OrgName           string `json:"org_name"`
-	Role              string `json:"role"`
-	TierName          string `json:"tier_name"`
-	MaxFilesPerSecret int    `json:"max_files_per_secret,omitempty"`
-	MaxUploadBytes    int64  `json:"max_upload_bytes,omitempty"`
-	PolicyTTL         bool   `json:"policy_ttl,omitempty"`
-	PolicyIPLock      bool   `json:"policy_ip_lock,omitempty"`
+// Membership is the single org membership pulled from /api/me. Per
+// PERMISSIONS.md §2.3 an actor belongs to at most one org, so this is a
+// pointer (nil when the actor is in ONBOARDING).
+type Membership struct {
+	OrgID string `json:"org_id"`
+	Role  string `json:"role"`
 }
 
-// ActorInfo holds the authenticated user's details and tier limits.
-// Flat fields (OrgID, TierName, etc.) are derived from the first membership.
-type ActorInfo struct {
-	ID                 string           `json:"id"`
-	Email              string           `json:"email"`
-	FirstName          string           `json:"first_name"`
-	LastName           string           `json:"last_name"`
-	IsActive           bool             `json:"is_active"`
-	SubscriptionStatus string           `json:"subscription_status"`
-	Memberships        []MembershipInfo `json:"memberships"`
+// Subscription mirrors /api/me's subscription block: the OWNER's
+// authz row. Tier-display fields (name, price, limits) live on the
+// `subscriptions` table per STRIPE_WEBHOOKS.md §6 and are surfaced
+// separately via /api/v1/orgs (TierName below).
+type Subscription struct {
+	Status     string  `json:"status"`
+	ExpiresAt  *string `json:"expires_at"`
+	CanceledAt *string `json:"canceled_at"`
+}
 
-	// Derived from primary membership (populated by WhoAmI)
-	OrgID             string `json:"-"`
-	TierName          string `json:"-"`
-	MaxFilesPerSecret int    `json:"-"`
-	MaxUploadBytes    int64  `json:"-"`
-	PolicyTTL         bool   `json:"-"`
-	PolicyIPLock      bool   `json:"-"`
+// Actor is the identity block from /api/me.
+type Actor struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
+// ActorInfo bundles everything WhoAmI returns: the raw /api/me payload
+// plus a few flat fields derived from a follow-up /api/v1/orgs call so
+// callers don't have to thread two requests through their own code.
+//
+// What changed from the pre-Phase-5 SDK:
+//
+//	  - first_name / last_name → single Name field (PERMISSIONS.md §7).
+//	  - is_active dropped (effective_state encodes the same information).
+//	  - memberships []  → membership * (single-org-per-actor).
+//	  - tier limits (max_files_per_secret, max_upload_bytes, policy_ttl,
+//	    policy_ip_lock) are gone from /api/me. The backend enforces them;
+//	    the SDK no longer mirrors them client-side. Callers that want
+//	    tier metadata fetch /api/v1/tiers explicitly.
+type ActorInfo struct {
+	Actor          Actor             `json:"actor"`
+	Membership     *Membership       `json:"membership"`
+	EffectiveState string            `json:"effective_state"`
+	Permissions    map[string]bool   `json:"permissions"`
+	Subscription   Subscription      `json:"subscription"`
+
+	// Flat conveniences populated post-parse so existing call sites
+	// (encrypt.go, the CLI, examples) keep reading actor.OrgID etc.
+	// without traversing the new nested shape. Empty when the actor
+	// has no membership.
+	ID                 string `json:"-"`
+	Email              string `json:"-"`
+	Name               string `json:"-"`
+	OrgID              string `json:"-"`
+	TierName           string `json:"-"`
+	SubscriptionStatus string `json:"-"`
 }
 
 // RemoteKey represents an identity key registered on the server.
@@ -53,9 +78,13 @@ type RemoteKey struct {
 	CreatedAt    string `json:"created_at"`
 }
 
-// WhoAmI returns the authenticated user's info and tier limits.
-// Flat fields (OrgID, TierName, policy flags, limits) are derived from the
-// first membership in the response.
+// WhoAmI returns the authenticated user's info. Hits /api/v1/actors/me
+// for the canonical authz state; if the actor has a membership, makes
+// a second call to /api/v1/orgs to populate the flat TierName field
+// (the spec moved tier display info off the actor row to the org
+// response, and old SDK consumers expect it on ActorInfo). The /orgs
+// call is best-effort: a failure leaves TierName empty rather than
+// failing the whole call.
 func WhoAmI(c *api.Client) (*ActorInfo, error) {
 	resp, err := c.Get("/api/v1/actors/me")
 	if err != nil {
@@ -65,16 +94,36 @@ func WhoAmI(c *api.Client) (*ActorInfo, error) {
 	if err := json.Unmarshal(resp.Data, &info); err != nil {
 		return nil, fmt.Errorf("parse actor: %w", err)
 	}
-	// Derive flat fields from first membership
-	if len(info.Memberships) > 0 {
-		m := info.Memberships[0]
-		info.OrgID = m.OrgID
-		info.TierName = m.TierName
-		info.MaxFilesPerSecret = m.MaxFilesPerSecret
-		info.MaxUploadBytes = m.MaxUploadBytes
-		info.PolicyTTL = m.PolicyTTL
-		info.PolicyIPLock = m.PolicyIPLock
+
+	info.ID = info.Actor.ID
+	info.Email = info.Actor.Email
+	info.Name = info.Actor.Name
+	info.SubscriptionStatus = info.Subscription.Status
+	if info.Membership != nil {
+		info.OrgID = info.Membership.OrgID
 	}
+
+	// Best-effort tier-name lookup. /api/v1/orgs returns the actor's
+	// org with tier_name on it; if the call fails (no membership,
+	// permissions issue, network), we just leave TierName empty.
+	if info.OrgID != "" {
+		orgResp, oerr := c.Get("/api/v1/orgs")
+		if oerr == nil {
+			var orgs []struct {
+				ID       string `json:"id"`
+				TierName string `json:"tier_name"`
+			}
+			if jerr := json.Unmarshal(orgResp.Data, &orgs); jerr == nil {
+				for _, o := range orgs {
+					if o.ID == info.OrgID {
+						info.TierName = o.TierName
+						break
+					}
+				}
+			}
+		}
+	}
+
 	return &info, nil
 }
 

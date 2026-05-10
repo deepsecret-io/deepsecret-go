@@ -329,10 +329,14 @@ func (c *Client) shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptio
 	if err != nil {
 		return false, "", fmt.Errorf("fetch tier info: %w", err)
 	}
-	maxFiles := info.MaxFilesPerSecret
-	if maxFiles == 0 {
-		maxFiles = 50
-	}
+	// Phase 5 removed per-tier limits from /api/me (the spec keeps the
+	// authz state on actors, billing-display on subscriptions). The
+	// SDK no longer mirrors max_files_per_secret client-side; the
+	// server CreateSecret handler enforces the cap. Use a generous
+	// default for the auto-archive heuristic so legitimate large
+	// directories still trip auto-archive without an extra fetch.
+	_ = info
+	maxFiles := 50
 	// Count only regular file entries against the tier cap — directory
 	// entries are structural placeholders, not files the server would
 	// charge.
@@ -513,18 +517,13 @@ func (c *Client) encryptAndSend(recipientEmail string, plaintext []byte, payload
 	debugf("actor", "org=%s", actorInfo.OrgID)
 	debugf("actor", "tier=%s", actorInfo.TierName)
 
-	// Tier validation
-	if opt.ValidateTier {
-		if actorInfo.MaxUploadBytes > 0 && int64(len(plaintext)) > actorInfo.MaxUploadBytes {
-			return nil, fmt.Errorf("payload size exceeds your plan limit of %d bytes", actorInfo.MaxUploadBytes)
-		}
-		if opt.TTL != "" && !actorInfo.PolicyTTL {
-			return nil, fmt.Errorf("TTL policy is not available on your current plan (%s)", actorInfo.TierName)
-		}
-		if len(opt.IPs) > 0 && !actorInfo.PolicyIPLock {
-			return nil, fmt.Errorf("IP lock policy is not available on your current plan (%s)", actorInfo.TierName)
-		}
-	}
+	// Phase 5 removed per-tier limits from /api/me. The backend
+	// authoritatively enforces max payload size, TTL policy, and IP
+	// lock policy in CreateSecret + UpdatePolicies; the SDK no longer
+	// duplicates the rules client-side. opt.ValidateTier is retained
+	// in the API surface for source compatibility but is now a no-op:
+	// any policy violation surfaces as an HTTP error from the server.
+	_ = opt.ValidateTier
 
 	var kp *crypto.KeyPair
 	var senderFP string
