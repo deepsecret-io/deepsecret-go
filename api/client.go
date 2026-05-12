@@ -633,14 +633,24 @@ func secureJitter() float64 {
 
 // retryBackoff sleeps for exponential backoff with jitter before a retry.
 // base = 2^attempt seconds, jitter = ±25% sourced from crypto/rand.
-func retryBackoff(attempt int) {
+// Returns ctx.Err() if the context is cancelled during the sleep so Ctrl+C
+// unblocks an in-progress upload/download retry within a few ms instead of
+// waiting up to ~16s for the timer to elapse.
+func retryBackoff(ctx context.Context, attempt int) error {
 	base := math.Pow(2, float64(attempt))
 	jitter := base * 0.25 * secureJitter()
 	d := time.Duration((base + jitter) * float64(time.Second))
 	if d < 100*time.Millisecond {
 		d = 100 * time.Millisecond
 	}
-	time.Sleep(d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // presignTimeout returns a request timeout proportional to payload size.
@@ -654,10 +664,17 @@ func presignTimeout(size int64) time.Duration {
 func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Reader, error), size int64, contentMD5 string, onProgress func(int64, int64)) error {
 	timeout := presignTimeout(size)
 
+	ctx := c.reqCtx()
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Bail before scheduling more work if the caller already hit Ctrl+C.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
-			retryBackoff(attempt)
+			if err := retryBackoff(ctx, attempt); err != nil {
+				return err
+			}
 		}
 
 		body, err := makeBody()
@@ -668,7 +685,7 @@ func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Read
 			body = &progressCallbackReader{r: body, onProgress: onProgress, total: size}
 		}
 
-		req, err := http.NewRequestWithContext(c.reqCtx(), "PUT", presignedURL, body)
+		req, err := http.NewRequestWithContext(ctx, "PUT", presignedURL, body)
 		if err != nil {
 			return err
 		}
@@ -789,16 +806,22 @@ func (c *Client) downloadFromPresignedURL(presignedURL string) ([]byte, error) {
 func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64, int64)) ([]byte, error) {
 	c.presignClient.Timeout = 10 * time.Minute
 
+	ctx := c.reqCtx()
 	var buf bytes.Buffer
 	var totalSize int64 = -1 // unknown until first response
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempt > 0 {
-			retryBackoff(attempt)
+			if err := retryBackoff(ctx, attempt); err != nil {
+				return nil, err
+			}
 		}
 
-		req, err := http.NewRequestWithContext(c.reqCtx(), "GET", presignedURL, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
 		if err != nil {
 			return nil, err
 		}

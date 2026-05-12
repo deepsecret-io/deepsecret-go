@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -230,10 +231,16 @@ func (c *Client) downloadRange(presignedURL string, start, end int64, dst []byte
 		return fmt.Errorf("downloadRange: dst size %d != expected %d", len(dst), expected)
 	}
 
+	ctx := c.reqCtx()
 	var lastErr error
 	for attempt := 0; attempt <= downloadPartMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
-			retryBackoff(attempt)
+			if err := retryBackoff(ctx, attempt); err != nil {
+				return err
+			}
 			debugf("retry", "worker=%d part=%d attempt=%d range=%d-%d err=%v", workerID, partIdx, attempt, start, end, lastErr)
 		}
 		t0 := time.Now()
@@ -301,9 +308,13 @@ func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) e
 }
 
 // isDownloadRetryable distinguishes transient network/server failures from
-// hard errors that won't get better on retry.
+// hard errors that won't get better on retry. Context cancellation is NOT
+// retryable so Ctrl+C surfaces immediately without burning the retry budget.
 func isDownloadRetryable(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var apiErr *APIError

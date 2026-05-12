@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
@@ -306,10 +307,16 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 	// a brief rate-limit hit at the start doesn't cost us the resume window.
 	var status *MultipartStatus
 	{
+		statusCtx := c.reqCtx()
 		var statusErr error
 		for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
+			if err := statusCtx.Err(); err != nil {
+				return err
+			}
 			if attempt > 0 {
-				multipartBackoff(attempt, statusErr)
+				if err := multipartBackoff(statusCtx, attempt, statusErr); err != nil {
+					return err
+				}
 			}
 			status, statusErr = c.MultipartStatus(revisionID)
 			if statusErr == nil {
@@ -500,10 +507,16 @@ func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, on
 	md5Sum := md5.Sum(p.Data)
 	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
 
+	ctx := c.reqCtx()
 	var lastErr error
 	for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if attempt > 0 {
-			multipartBackoff(attempt, lastErr)
+			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
+				return "", err
+			}
 		}
 		urlResp, err := c.MultipartPartURL(revisionID, p.Number)
 		if err != nil {
@@ -529,6 +542,9 @@ func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, on
 			if onChunk != nil && attemptBytes > 0 {
 				onChunk(-int(attemptBytes))
 			}
+			if !isMultipartRetryableErr(err) {
+				return "", err
+			}
 			lastErr = err
 			continue
 		}
@@ -542,10 +558,16 @@ func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, on
 // this, a /multipart/parts call that hits the rate limit fails the whole
 // upload even though the part itself was successfully PUT to S3.
 func (c *Client) registerPartWithRetry(revisionID string, partNumber int, etag string, size int64, sha256Hex string) error {
+	ctx := c.reqCtx()
 	var lastErr error
 	for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
-			multipartBackoff(attempt, lastErr)
+			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
+				return err
+			}
 		}
 		err := c.MultipartRegisterPart(revisionID, partNumber, etag, size, sha256Hex)
 		if err == nil {
@@ -563,10 +585,16 @@ func (c *Client) registerPartWithRetry(revisionID string, partNumber int, etag s
 //   - transport errors (no APIError wrapped) — likely network blip.
 //   - 5xx server errors.
 //   - 429 rate-limit responses.
+// Context cancellation (Ctrl+C, parent deadline) is NOT retryable — surfacing
+// it immediately lets the user's interrupt take effect without burning the
+// retry budget on requests that are guaranteed to fail.
 // Everything else (auth, validation, conflict) is fatal and surfaced
 // immediately so we don't burn the whole retry budget on a permanent failure.
 func isMultipartRetryableErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var apiErr *APIError
@@ -584,8 +612,10 @@ func isMultipartRetryableErr(err error) bool {
 
 // multipartBackoff sleeps before the next retry. If the most recent error was
 // a 429 with a Retry-After hint, honor it (clamped); otherwise fall back to
-// the standard exponential-jittered backoff.
-func multipartBackoff(attempt int, lastErr error) {
+// the standard exponential-jittered backoff. Returns ctx.Err() if the
+// context is cancelled during the sleep so a Ctrl+C during an upload retry
+// unblocks immediately instead of holding the worker for the full backoff.
+func multipartBackoff(ctx context.Context, attempt int, lastErr error) error {
 	var apiErr *APIError
 	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > 0 {
 		d := apiErr.RetryAfter
@@ -596,10 +626,16 @@ func multipartBackoff(attempt int, lastErr error) {
 		// Add a small jitter (±10%) so a fleet of clients hitting the same
 		// 429 don't all retry on the same wall-clock instant.
 		j := float64(d) * 0.1 * secureJitter()
-		time.Sleep(d + time.Duration(j))
-		return
+		timer := time.NewTimer(d + time.Duration(j))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
 	}
-	retryBackoff(attempt)
+	return retryBackoff(ctx, attempt)
 }
 
 // putPart PUTs a single part to the presigned URL and returns the ETag.
