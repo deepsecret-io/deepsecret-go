@@ -63,7 +63,7 @@ Never expose raw endpoint logic to callers.
 - No JSON for encrypted payloads
 
 7. Payload structure must be stable
-- Versioned (v2)
+- Versioned (protocol v4)
 - Backward compatible
 - Explicit typing (message, files, data)
 

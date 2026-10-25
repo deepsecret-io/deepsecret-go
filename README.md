@@ -31,9 +31,12 @@ sdk/                 ← orchestration (encrypt, decrypt, revoke)
 ## Quick Start
 
 ```go
-import "deepsecret/sdk"
+import "github.com/deepsecret-io/sdk"
 
-client := sdk.NewClient("https://api.deepsecret.io", "ds_your_api_key")
+client, err := sdk.NewClient("https://api.deepsecret.io", "ds_your_api_key")
+if err != nil {
+    log.Fatal(err)
+}
 
 // Encrypt a message once for two recipients (you are a recipient only if listed)
 res, _ := client.EncryptText([]string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
@@ -141,7 +144,7 @@ Sender                                           Recipients
 ## Running Tests
 
 ```bash
-go test ./sdk/... -v
+go test ./... -v
 ```
 
 ## Cross-Language Porting
