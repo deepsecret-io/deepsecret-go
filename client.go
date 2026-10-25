@@ -48,6 +48,14 @@ func (c *Client) SetRootContext(ctx context.Context) { c.api.SetRootContext(ctx)
 
 // ── Identity ─────────────────────────────────────────────────────────────────
 
+// Logout revokes the Bearer token this client authenticates with, so a
+// copy of it stops working immediately. API-key clients have no session
+// and the call is a no-op on the server.
+func (c *Client) Logout() error {
+	_, err := c.api.Post("/api/v1/auth/logout", nil)
+	return err
+}
+
 // WhoAmI returns the authenticated user's info and tier limits.
 func (c *Client) WhoAmI() (*ActorInfo, error) {
 	return identity.WhoAmI(c.api)
