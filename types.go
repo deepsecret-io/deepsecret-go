@@ -16,6 +16,10 @@ import (
 // EncryptOptions.MaxPayloadSize.
 const DefaultMaxPayloadSize int64 = 50 * 1024 * 1024 * 1024
 
+// MaxRecipientsPerSend is the most recipients one send may have. The API
+// enforces the same cap; the protocol itself allows crypto.MaxRecipients.
+const MaxRecipientsPerSend = 100
+
 // CompressZstd is the Zstandard compression algorithm identifier.
 // Use this with EncryptOptions.Compress.
 const CompressZstd = compress.Zstd
@@ -39,6 +43,9 @@ type GroupMemberInfo = identity.GroupMemberInfo
 // SecretInfo holds detailed metadata about a secret (returned by list/describe).
 type SecretInfo = secrets.SecretInfo
 
+// SecretRecipient is one person with access to a secret.
+type SecretRecipient = secrets.SecretRecipient
+
 // ListOptions configures pagination and filtering for secret listing.
 type ListOptions = secrets.ListOptions
 
@@ -59,13 +66,19 @@ type EncryptOptions struct {
 	Compress   compress.Algorithm
 	Archive    bool
 	SkipHidden bool
-	TTL string // "30m", "24h", "7d"
-	IPs []string
+	TTL        string // "30m", "24h", "7d"
+	IPs        []string
+
+	// RevokeMissing confirms that a send under an existing name may leave
+	// out people who have access to that secret now, revoking them.
+	// Without it such a send fails with api.ErrConflict and the server's
+	// message names them.
+	RevokeMissing bool
 
 	// MaxPayloadSize limits the total uncompressed payload size in bytes.
-	// All file contents are loaded into memory for encryption (HPKE protocol
-	// constraint). Set this to prevent accidental OOM with large inputs.
-	// Zero means use DefaultMaxPayloadSize (500 MB).
+	// The SDK builds and seals the payload in memory, so set this to
+	// prevent accidental OOM with large inputs. Zero means use
+	// DefaultMaxPayloadSize.
 	MaxPayloadSize int64
 
 	// OnUploadProgress is called during ciphertext upload with bytes transferred
@@ -112,20 +125,30 @@ type EncryptOptions struct {
 	archiveCompressedSize int64
 }
 
-// EncryptResult is returned by all encrypt methods with full metadata.
+// Recipient is one recipient of a revision: their email and the
+// fingerprint of the key their wrap was made for.
+type Recipient struct {
+	Email       string `json:"email,omitempty" yaml:"email,omitempty"`
+	Fingerprint string `json:"fingerprint" yaml:"fingerprint"`
+}
+
+// EncryptResult is returned by all encrypt methods with full metadata. One
+// send encrypts the payload once for every recipient, so the sizes are
+// those of the single stored payload.
 type EncryptResult struct {
-	Secret               secrets.Secret
-	EncryptedSize        int64
-	SenderFingerprint    string
-	RecipientFingerprint string
-	Compressed           bool
-	Compression          string  // "zstd", "tar+zstd", ""
-	CompressionRatio     float64 // compressed/original * 100
-	OriginalSize         int64
-	PayloadType          string // "message", "data", "files"
-	FilesCount           int    // visible files sent to server metadata (0 when archived)
-	Archived             bool
-	ArchiveEntryCount    int // original file count before archiving (set only when Archived=true)
+	Secret            secrets.Secret
+	EncryptedSize     int64
+	SenderFingerprint string
+	Recipients        []Recipient       // everyone the revision was sealed for, in the order given
+	Revoked           []SecretRecipient // people a send with RevokeMissing removed
+	Compressed        bool
+	Compression       string  // "zstd", "tar+zstd", ""
+	CompressionRatio  float64 // compressed/original * 100
+	OriginalSize      int64
+	PayloadType       string // "message", "data", "files"
+	FilesCount        int    // visible files sent to server metadata (0 when archived)
+	Archived          bool
+	ArchiveEntryCount int // original file count before archiving (set only when Archived=true)
 }
 
 // DecryptOptions configures decrypt behavior.
@@ -148,12 +171,12 @@ type DecryptOptions struct {
 	Password string
 
 	// DownloadThreads sets the maximum number of parallel Range GETs the SDK
-	// uses for downloading the ciphertext envelope. 0 = SDK default (4).
-	// 1 = force single-stream download. Values are clamped to a sane upper
-	// bound by the SDK. Larger values trade more sockets and memory for
-	// faster transfer on high-RTT or high-bandwidth links; the entire
-	// envelope is buffered in memory regardless of value, since AEAD
-	// verification needs the full ciphertext.
+	// uses for downloading the payload. 0 = SDK default (4). 1 = force
+	// single-stream download. Values are clamped to a sane upper bound by
+	// the SDK. Larger values trade more sockets and memory for faster
+	// transfer on high-RTT or high-bandwidth links; the entire payload is
+	// buffered in memory regardless of value, since its digest is verified
+	// against the signed manifest before any plaintext is released.
 	DownloadThreads int
 
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes for
@@ -162,19 +185,28 @@ type DecryptOptions struct {
 	PresignExpiryMinutes int
 }
 
-// DecryptResult is returned by full decrypt methods with envelope metadata.
+// DecryptResult is returned by full decrypt methods with the metadata of
+// the verified manifest.
 type DecryptResult struct {
 	Decrypted            *payload.Decrypted
 	RevisionID           string // UUID of the revision that was decrypted (resolved if Revision was empty)
 	SenderFingerprint    string
-	RecipientFingerprint string
+	RecipientFingerprint string      // the caller's own key, which the wrap was made for
+	Recipients           []Recipient // every recipient the sender signed for; Email is the server's label for each fingerprint
 	Compressed           bool
 	Compression          string
 	PayloadType          string
-	ProtocolVersion      string
-	CipherSuite          string
-	EnvelopeChecksum     string // hex-encoded SHA-256 of downloaded envelope
+	ProtocolVersion      string // from the signed manifest
+	CipherSuite          string // from the signed manifest
+	PayloadDigest        string // hex SHA-256 of the stored payload, verified against the signed manifest
 	EncryptedSize        int64
+}
+
+// RevokeResult is returned by RevokeRecipient.
+type RevokeResult struct {
+	RecipientID   string // actor id of the revoked recipient
+	Email         string
+	SecretDeleted bool // revoking the last recipient deleted the secret
 }
 
 // SecretDetail holds a secret's full metadata including revisions.
@@ -212,29 +244,40 @@ type RevisionInfo struct {
 
 // IntegrityInfo holds cryptographic integrity metadata for a revision.
 type IntegrityInfo struct {
-	ProtocolVersion         string  `json:"protocol_version" yaml:"protocol_version"`
-	CipherSuite             string  `json:"cipher_suite" yaml:"cipher_suite"`
-	KDF                     string  `json:"kdf" yaml:"kdf"`
-	Encryption              string  `json:"encryption" yaml:"encryption"`
-	KEM                     string  `json:"kem" yaml:"kem"`
-	Signing                 string  `json:"signing" yaml:"signing"`
-	Serialization           string  `json:"serialization" yaml:"serialization"`
-	PayloadType             string  `json:"payload_type" yaml:"payload_type"`
-	Compressed              bool    `json:"compressed" yaml:"compressed"`
-	Compression             string  `json:"compression" yaml:"compression"`
-	CompressionRatio        float64 `json:"compression_ratio" yaml:"compression_ratio"`
-	OriginalSize            int64   `json:"original_size" yaml:"original_size"`
-	KeyFingerprint          string  `json:"key_fingerprint" yaml:"key_fingerprint"`
-	RecipientKeyFingerprint string  `json:"recipient_key_fingerprint" yaml:"recipient_key_fingerprint"`
+	ProtocolVersion  string  `json:"protocol_version" yaml:"protocol_version"`
+	CipherSuite      string  `json:"cipher_suite" yaml:"cipher_suite"`
+	KDF              string  `json:"kdf" yaml:"kdf"`
+	Encryption       string  `json:"encryption" yaml:"encryption"`
+	KEM              string  `json:"kem" yaml:"kem"`
+	Signing          string  `json:"signing" yaml:"signing"`
+	Serialization    string  `json:"serialization" yaml:"serialization"`
+	PayloadType      string  `json:"payload_type" yaml:"payload_type"`
+	Compressed       bool    `json:"compressed" yaml:"compressed"`
+	Compression      string  `json:"compression" yaml:"compression"`
+	CompressionRatio float64 `json:"compression_ratio" yaml:"compression_ratio"`
+	OriginalSize     int64   `json:"original_size" yaml:"original_size"`
+	KeyFingerprint   string  `json:"key_fingerprint" yaml:"key_fingerprint"` // the sender's
 	// Tri-state trust status returned by the API. Drives the colored
 	// indicator in the CLI / UI:
-	//   "primary"   — fingerprint matches the actor's primary identity
-	//   "secondary" — fingerprint matches a known non-primary identity
-	//   "invalid"   — fingerprint not found (identity has been deleted)
-	SenderKeyStatus    *string `json:"sender_key_status" yaml:"sender_key_status"`
-	RecipientKeyStatus *string `json:"recipient_key_status" yaml:"recipient_key_status"`
-	ChecksumSHA256          string  `json:"checksum_sha256" yaml:"checksum_sha256"`
-	Etag                    string  `json:"etag" yaml:"etag"`
+	//   "primary"   : fingerprint matches the actor's primary identity
+	//   "secondary" : fingerprint matches a known non-primary identity
+	//   "invalid"   : fingerprint not found (identity has been deleted)
+	SenderKeyStatus *string `json:"sender_key_status" yaml:"sender_key_status"`
+	ChecksumSHA256  string  `json:"checksum_sha256" yaml:"checksum_sha256"` // the payload digest
+	Etag            string  `json:"etag" yaml:"etag"`
+
+	// Recipients holding a wrap for this revision, with the key each wrap
+	// was made for.
+	Recipients []RevisionRecipient `json:"recipients" yaml:"recipients"`
+}
+
+// RevisionRecipient is one recipient a revision was sealed for: the key
+// their wrap was made for, and that key's trust status.
+type RevisionRecipient struct {
+	ID             string  `json:"id" yaml:"id"`
+	Email          string  `json:"email" yaml:"email"`
+	KeyFingerprint string  `json:"key_fingerprint" yaml:"key_fingerprint"`
+	KeyStatus      *string `json:"key_status,omitempty" yaml:"key_status,omitempty"`
 }
 
 // FileMeta holds per-file metadata as stored on the server.

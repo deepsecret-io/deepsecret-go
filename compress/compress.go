@@ -18,7 +18,7 @@ const (
 	// None means no compression (pass-through).
 	None Algorithm = ""
 
-	// Zstd is Zstandard compression (recommended — fast with high ratio).
+	// Zstd is Zstandard compression (recommended: fast with high ratio).
 	Zstd Algorithm = "zstd"
 )
 
@@ -50,7 +50,7 @@ func NewDecompressReader(r io.Reader, algo Algorithm) (io.ReadCloser, error) {
 		return io.NopCloser(r), nil
 	case Zstd:
 		// Cap the decoder's working memory and pin concurrency to one goroutine
-		// so a hostile envelope cannot steer the decompressor into large
+		// so a hostile payload cannot steer the decompressor into large
 		// in-memory dictionary/window allocations on a streaming read. The
 		// output-size limit is enforced at a higher layer by readBounded.
 		zr, err := zstd.NewReader(r,

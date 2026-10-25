@@ -17,7 +17,7 @@ import (
 // ── Parallel Range download ─────────────────────────────────────────────────
 //
 // One presigned GET URL is requested up front. We fan out N concurrent
-// `Range: bytes=A-B` requests against that single URL — S3 supports Range
+// `Range: bytes=A-B` requests against that single URL; S3 supports Range
 // natively on every GET, so no server-side change is required.
 //
 // Per-part retry is independent: a stalled part doesn't block its peers,
@@ -26,7 +26,7 @@ import (
 
 const (
 	// DefaultDownloadConcurrency is what callers get when they don't pass
-	// an explicit thread count. 4 is a conservative default — high enough
+	// an explicit thread count. 4 is a conservative default: high enough
 	// to mask per-stream slow starts on long-RTT links, low enough to be
 	// polite to free-tier S3-compatible backends.
 	DefaultDownloadConcurrency = 4
@@ -85,7 +85,7 @@ type MultipartDownloadOptions struct {
 }
 
 // MultipartDownload fetches the entire object using N concurrent Range GETs.
-// totalSize MUST match the object's actual size or the caller's expectation —
+// totalSize MUST match the object's actual size or the caller's expectation:
 // it gates the byte budget and short-read detection.
 //
 // Resilience: each range is retried up to downloadPartMaxRetries times on
@@ -95,8 +95,8 @@ type MultipartDownloadOptions struct {
 // shares one signature.
 //
 // Security: the assembled bytes are still authenticated end-to-end by the
-// caller's HPKE AEAD verification — Range stitching does not bypass
-// integrity. Range responses are size-bounded, so a compromised S3 cannot
+// caller, which checks the payload digest against the signed manifest and
+// authenticates every chunk, so Range stitching does not bypass integrity. Range responses are size-bounded, so a compromised S3 cannot
 // over-read into adjacent objects' data.
 func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int64, opts MultipartDownloadOptions) ([]byte, error) {
 	if totalSize <= 0 {
@@ -192,7 +192,7 @@ func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int6
 					}
 					return
 				case <-errCh:
-					// Another worker already failed — don't pile on with
+					// Another worker already failed; don't pile on with
 					// more requests; fast-exit. The first error wins.
 					return
 				default:
@@ -275,11 +275,11 @@ func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) e
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
-	case http.StatusPartialContent: // 206 — what we expect
+	case http.StatusPartialContent: // 206: what we expect
 	case http.StatusOK:
 		// Server returned the whole object instead of honoring Range. We
 		// can still satisfy this single-range case if the slice fits, but
-		// it defeats parallelism — surface as a transient so the next
+		// it defeats parallelism; surface as a transient so the next
 		// attempt can be cleaner. Falling back silently would mask a
 		// misconfigured backend.
 		body, _ := io.ReadAll(resp.Body)
@@ -321,8 +321,8 @@ func isDownloadRetryable(err error) bool {
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode >= 500 || apiErr.StatusCode == http.StatusTooManyRequests
 	}
-	// Unwrapped errors from doRangeGET — transport blips, server-ignored-Range,
-	// transient 5xx — all retryable.
+	// Unwrapped errors from doRangeGET (transport blips, server-ignored-Range,
+	// transient 5xx) are all retryable.
 	return true
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 DeepSecret
 
-// Example: basic — demonstrates text, key-value, and byte encryption with the
+// Example basic demonstrates text, key-value, and byte encryption with the
 // DeepSecret SDK.
 package main
 
@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/deepsecret-io/sdk"
 	"github.com/deepsecret-io/sdk/compress"
@@ -18,13 +19,14 @@ import (
 func main() {
 	apiURL := envOr("DS_API_URL", "http://localhost:80")
 	apiKey := envOr("DS_API_KEY", "")
-	recipient := envOr("DS_RECIPIENT", "you@example.com")
+	// One send encrypts once for every recipient listed.
+	recipients := []string{envOr("DS_RECIPIENT", "you@example.com")}
 
 	if apiKey == "" {
 		log.Fatal("DS_API_KEY is required")
 	}
 
-	fmt.Printf("DeepSecret SDK v%s — basic example\n\n", sdk.Version)
+	fmt.Printf("DeepSecret SDK v%s: basic example\n\n", sdk.Version)
 
 	client, err := sdk.NewClient(apiURL, apiKey)
 	if err != nil {
@@ -47,7 +49,7 @@ func main() {
 	fmt.Printf("Primary key: %s\n\n", fp)
 
 	// ── Encrypt text ──
-	secret, err := client.EncryptText(recipient, "Hello from the DeepSecret Go SDK!", sdk.EncryptOptions{
+	secret, err := client.EncryptText(recipients, "Hello from the DeepSecret Go SDK!", sdk.EncryptOptions{
 		Name: "sdk-basic-text",
 	})
 	if err != nil {
@@ -63,7 +65,7 @@ func main() {
 	fmt.Printf("Decrypted: type=%s message=%q\n\n", result.Type, result.Message)
 
 	// ── Encrypt key-value data ──
-	kvSecret, err := client.EncryptData(recipient, map[string]string{
+	kvSecret, err := client.EncryptData(recipients, map[string]string{
 		"DB_HOST":     "db.internal:5432",
 		"DB_PASSWORD": "super-secret-password",
 		"API_KEY":     "ak_live_xyz123",
@@ -88,7 +90,7 @@ func main() {
 
 	// ── Encrypt raw bytes ──
 	jsonPayload := []byte(`{"event":"deploy","version":"2.1.0","env":"production"}`)
-	byteSecret, err := client.EncryptBytes(recipient, jsonPayload, sdk.EncryptOptions{
+	byteSecret, err := client.EncryptBytes(recipients, jsonPayload, sdk.EncryptOptions{
 		Name: "sdk-basic-bytes",
 	})
 	if err != nil {
@@ -109,7 +111,7 @@ func main() {
 	}
 	fmt.Printf("Sent secrets: %d (showing %d)\n", total, len(sent))
 	for _, s := range sent {
-		fmt.Printf("  %s  %s  → %s\n", s.ID[:8], s.Name, s.RecipientEmail)
+		fmt.Printf("  %s  %s  → %s\n", s.ID[:8], s.Name, recipientEmails(s.Recipients))
 	}
 
 	// ── Describe secret ──
@@ -118,7 +120,7 @@ func main() {
 		log.Fatal("describe: ", err)
 	}
 	fmt.Printf("\nSecret detail: %s\n", info.Name)
-	fmt.Printf("  From: %s → To: %s\n", info.SenderEmail, info.RecipientEmail)
+	fmt.Printf("  From: %s → To: %s\n", info.SenderEmail, recipientEmails(info.Recipients))
 	fmt.Printf("  Size: %d bytes, Revisions: %d\n", info.TotalSize, info.RevisionCount)
 
 	// ── Delete secrets ──
@@ -126,6 +128,14 @@ func main() {
 		log.Fatal("delete: ", err)
 	}
 	fmt.Println("\nCleaned up example secrets.")
+}
+
+func recipientEmails(rs []sdk.SecretRecipient) string {
+	emails := make([]string, len(rs))
+	for i, r := range rs {
+		emails[i] = r.Email
+	}
+	return strings.Join(emails, ", ")
 }
 
 func envOr(key, fallback string) string {

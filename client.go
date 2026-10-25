@@ -138,6 +138,26 @@ func (c *Client) DeleteSecrets(ids []string) error {
 	return secrets.DeleteBatch(c.api, ids)
 }
 
+// RevokeRecipient removes one recipient's access to a sent secret, with
+// every wrap made for them. Only the sender may revoke. A recipient who
+// already downloaded a revision keeps what they downloaded. Revoking the
+// last recipient deletes the secret, which the result reports.
+func (c *Client) RevokeRecipient(secretID, recipientEmail string) (*RevokeResult, error) {
+	info, err := secrets.Describe(c.api, secretID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch secret: %w", err)
+	}
+	r, ok := info.Recipient(recipientEmail)
+	if !ok {
+		return nil, fmt.Errorf("not a recipient of this secret")
+	}
+	deleted, err := secrets.RevokeRecipient(c.api, secretID, r.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &RevokeResult{RecipientID: r.ID, Email: r.Email, SecretDeleted: deleted}, nil
+}
+
 // ListRevisions returns all revisions for a secret.
 func (c *Client) ListRevisions(secretID string) ([]RevisionInfo, error) {
 	resp, err := c.api.Get("/api/v1/secrets/" + secretID + "/revisions")

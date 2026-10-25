@@ -73,9 +73,9 @@ func (k *KeyPair) MarshalJSON() ([]byte, error) {
 }
 
 // PublicKeys holds a recipient's public key bundle for encryption.
-// The Fingerprint field is validated against the public keys during
-// encryption — if non-empty and it does not match the computed fingerprint,
-// HybridEncrypt returns an error.
+// The Fingerprint field is validated against the public keys when sealing:
+// if non-empty and it does not match the computed fingerprint, Seal returns
+// an error.
 type PublicKeys struct {
 	ED25519     string // base64-encoded Ed25519 public key
 	X25519      string // base64-encoded X25519 public key
@@ -166,7 +166,7 @@ func FingerprintFromPubs(ed25519Pub, x25519Pub, mlkemPK, mldsa65PK string) (stri
 }
 
 // ShortFingerprint returns the first 16 hex characters of a fingerprint for
-// display purposes. This is NOT the canonical fingerprint — it is a UI
+// display purposes. This is NOT the canonical fingerprint: it is a UI
 // convenience only. The full 64-char fingerprint is used in all protocol
 // operations.
 func ShortFingerprint(fp string) string {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 DeepSecret
 
-// Example: files — demonstrates file, directory, and archive encryption with
+// Example files demonstrates file, directory, and archive encryption with
 // the DeepSecret SDK.
 package main
 
@@ -17,13 +17,14 @@ import (
 func main() {
 	apiURL := envOr("DS_API_URL", "http://localhost:80")
 	apiKey := envOr("DS_API_KEY", "")
-	recipient := envOr("DS_RECIPIENT", "you@example.com")
+	// One send encrypts once for every recipient listed.
+	recipients := []string{envOr("DS_RECIPIENT", "you@example.com")}
 
 	if apiKey == "" {
 		log.Fatal("DS_API_KEY is required")
 	}
 
-	fmt.Printf("DeepSecret SDK v%s — files example\n\n", sdk.Version)
+	fmt.Printf("DeepSecret SDK v%s: files example\n\n", sdk.Version)
 
 	client, err := sdk.NewClient(apiURL, apiKey)
 	if err != nil {
@@ -39,7 +40,7 @@ func main() {
 	var cleanupIDs []string
 
 	// ── Single file ──
-	fileSecret, err := client.EncryptFile(recipient, "./sdk/examples/files/main.go", sdk.EncryptOptions{
+	fileSecret, err := client.EncryptFile(recipients, "./sdk/examples/files/main.go", sdk.EncryptOptions{
 		Name: "sdk-file-example",
 	})
 	if err != nil {
@@ -59,7 +60,7 @@ func main() {
 	fmt.Println()
 
 	// ── Multiple files ──
-	multiSecret, err := client.EncryptFiles(recipient, []string{
+	multiSecret, err := client.EncryptFiles(recipients, []string{
 		"./sdk/examples/files/main.go",
 		"./sdk/examples/basic/main.go",
 	}, sdk.EncryptOptions{
@@ -82,7 +83,7 @@ func main() {
 	fmt.Println()
 
 	// ── Directory (individual files) ──
-	dirSecret, err := client.EncryptDir(recipient, "./sdk/examples", sdk.EncryptOptions{
+	dirSecret, err := client.EncryptDir(recipients, "./sdk/examples", sdk.EncryptOptions{
 		Name:       "sdk-dir-example",
 		SkipHidden: true,
 	})
@@ -103,7 +104,7 @@ func main() {
 	fmt.Println()
 
 	// ── Directory as archive (privacy mode with zstd) ──
-	archiveSecret, err := client.EncryptDir(recipient, "./sdk/examples", sdk.EncryptOptions{
+	archiveSecret, err := client.EncryptDir(recipients, "./sdk/examples", sdk.EncryptOptions{
 		Name:       "sdk-archive-zstd",
 		Archive:    true,
 		Compress:   compress.Zstd,
@@ -119,12 +120,12 @@ func main() {
 	if err != nil {
 		log.Fatal("decrypt archive: ", err)
 	}
-	fmt.Printf("Decrypted: %d file(s) — archive name: %s\n", len(archiveResult.Files), archiveResult.Files[0].Name)
+	fmt.Printf("Decrypted: %d file(s), archive name: %s\n", len(archiveResult.Files), archiveResult.Files[0].Name)
 	fmt.Printf("  Archive size: %d bytes\n", len(archiveResult.Files[0].Data))
 	fmt.Println()
 
 	// ── Mixed paths ──
-	mixedSecret, err := client.EncryptPaths(recipient, []string{
+	mixedSecret, err := client.EncryptPaths(recipients, []string{
 		"./sdk/examples/basic",
 		"./sdk/examples/files/main.go",
 	}, sdk.EncryptOptions{

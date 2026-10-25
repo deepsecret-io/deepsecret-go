@@ -3,7 +3,7 @@
 
 // Package payload defines the plaintext payload types for encrypted secrets.
 //
-// These types are serialized with CBOR (RFC 8949) inside the encrypted envelope.
+// These types are serialized with CBOR (RFC 8949) inside the encrypted payload.
 // Canonical CBOR encoding is used for deterministic output.
 package payload
 

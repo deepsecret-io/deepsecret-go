@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 DeepSecret
+
+package sdk
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/sdk/crypto"
+)
+
+// ── A fake of the protocol v4 secrets API ───────────────────────────────────
+//
+// It stores what the real API stores (docs/design/2026-10-25-protocol-v4-
+// secrets-api.md) and makes the same agreement checks at create, so these
+// tests pin the JSON contract the SDK speaks. Callers authenticate with
+// their email as the API key.
+
+type fakeActor struct {
+	id, email string
+	kp        *crypto.KeyPair
+	fp        string
+}
+
+type fakeWrap struct {
+	fp      string
+	enc, ct []byte
+}
+
+type fakeRevision struct {
+	id, secretID string
+	manifest     []byte
+	wraps        map[string]fakeWrap // by actor id
+}
+
+type fakeSecret struct {
+	id, name, senderID string
+	recipients         []string // actor ids
+	revisions          []*fakeRevision
+}
+
+type fakeAPI struct {
+	t       *testing.T
+	srv     *httptest.Server
+	mu      sync.Mutex
+	actors  map[string]*fakeActor // by email
+	secrets map[string]*fakeSecret
+	revs    map[string]*fakeRevision
+	objects map[string][]byte
+	creates int
+	puts    int
+	lastReq createBody
+}
+
+type createBody struct {
+	Name            string `json:"name"`
+	RevisionID      string `json:"revision_id"`
+	ChecksumSHA256  string `json:"checksum_sha256"`
+	Size            int64  `json:"size"`
+	KDF             string `json:"kdf"`
+	ProtocolVersion string `json:"protocol_version"`
+	CipherSuite     string `json:"cipher_suite"`
+	KeyFingerprint  string `json:"key_fingerprint"`
+	Manifest        []byte `json:"manifest"`
+	Recipients      []struct {
+		RecipientID    string `json:"recipient_id"`
+		RecipientOrgID string `json:"recipient_org_id"`
+		KeyFingerprint string `json:"key_fingerprint"`
+		Wrap           struct {
+			Enc []byte `json:"enc"`
+			Ct  []byte `json:"ct"`
+		} `json:"wrap"`
+	} `json:"recipients"`
+	RevokeMissing bool `json:"revoke_missing"`
+}
+
+func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	f := &fakeAPI{t: t, actors: map[string]*fakeActor{}, secrets: map[string]*fakeSecret{},
+		revs: map[string]*fakeRevision{}, objects: map[string][]byte{}}
+	for i, email := range emails {
+		kp, err := crypto.GenerateKeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fp, _ := crypto.Fingerprint(kp)
+		if err := crypto.SaveKeyPair(fp, kp, ""); err != nil {
+			t.Fatal(err)
+		}
+		f.actors[email] = &fakeActor{id: fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1), email: email, kp: kp, fp: fp}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/actors/me", f.me)
+	mux.HandleFunc("GET /api/v1/orgs", func(w http.ResponseWriter, r *http.Request) { ok(w, []any{}) })
+	mux.HandleFunc("GET /api/v1/actors/email/{email}", f.actorByEmail)
+	mux.HandleFunc("GET /api/v1/actors/{id}", f.actorByID)
+	mux.HandleFunc("GET /api/v1/identities/{$}", f.ownKeys)
+	mux.HandleFunc("GET /api/v1/identities/actor/{email}", f.publicKeys)
+	mux.HandleFunc("POST /api/v1/orgs/{org}/secrets", f.create)
+	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
+	mux.HandleFunc("PUT /s3/{key}", f.putObject)
+	mux.HandleFunc("GET /s3/{key}", f.getObject)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/confirm", func(w http.ResponseWriter, r *http.Request) { ok(w, map[string]string{"status": "uploaded"}) })
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/presign", f.presignDownload)
+	mux.HandleFunc("GET /api/v1/secrets/revisions/{id}/manifest", f.manifest)
+	mux.HandleFunc("GET /api/v1/secrets/{id}", f.secret)
+	mux.HandleFunc("GET /api/v1/secrets/{id}/revisions", f.revisions)
+	mux.HandleFunc("DELETE /api/v1/secrets/{id}/recipients/{actor}", f.revoke)
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeAPI) client(email string) *Client {
+	f.t.Helper()
+	c, err := NewClient(f.srv.URL, email)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return c
+}
+
+func ok(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "data": data})
+}
+
+func fail(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"success": false, "error": msg})
+}
+
+func (f *fakeAPI) caller(r *http.Request) *fakeActor { return f.actors[r.Header.Get("DS-API-KEY")] }
+
+func (f *fakeAPI) byID(id string) *fakeActor {
+	for _, a := range f.actors {
+		if a.id == id {
+			return a
+		}
+	}
+	return nil
+}
+
+func (f *fakeAPI) me(w http.ResponseWriter, r *http.Request) {
+	a := f.caller(r)
+	ok(w, map[string]any{"actor": map[string]string{"id": a.id, "email": a.email},
+		"membership": map[string]string{"org_id": "org-1", "role": "owner"}})
+}
+
+func (f *fakeAPI) actorByEmail(w http.ResponseWriter, r *http.Request) {
+	a := f.actors[r.PathValue("email")]
+	if a == nil {
+		fail(w, http.StatusNotFound, "Actor not found")
+		return
+	}
+	ok(w, map[string]string{"id": a.id})
+}
+
+func (f *fakeAPI) actorByID(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]string{"email": f.byID(r.PathValue("id")).email})
+}
+
+func (f *fakeAPI) ownKeys(w http.ResponseWriter, r *http.Request) {
+	a := f.caller(r)
+	ok(w, map[string]any{"keys": []map[string]any{{"id": "k-" + a.id, "fingerprint": a.fp, "is_primary": true}}})
+}
+
+func (f *fakeAPI) publicKeys(w http.ResponseWriter, r *http.Request) {
+	a := f.actors[r.PathValue("email")]
+	edSig, mldsaSig, err := crypto.SignKeyBundle(a.kp)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	ok(w, map[string]any{"keys": []map[string]any{{
+		"ed25519": a.kp.ED25519Public, "x25519": a.kp.X25519Public, "mlkem768": a.kp.MLKEM768PK,
+		"mldsa65": a.kp.MLDSA65PK, "fingerprint": a.fp, "signature": edSig, "signature_mldsa65": mldsaSig,
+		"is_primary": true,
+	}}})
+}
+
+// create makes the checks of the API contract §3 before storing anything.
+func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sender := f.caller(r)
+	var req createBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	f.creates++
+	f.lastReq = req
+	m, err := crypto.UnmarshalManifest(req.Manifest)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if m.Version != req.ProtocolVersion || m.CipherSuite != req.CipherSuite || req.KDF != crypto.KDF ||
+		m.RevisionID != req.RevisionID || m.CiphertextSize != req.Size ||
+		hex.EncodeToString(m.PayloadDigest) != req.ChecksumSHA256 || m.SenderFingerprint != req.KeyFingerprint {
+		fail(w, 400, "manifest does not agree with the request")
+		return
+	}
+	if len(req.Recipients) != len(m.Recipients) {
+		fail(w, 400, "manifest lists a different set of recipients")
+		return
+	}
+	rev := &fakeRevision{id: req.RevisionID, manifest: req.Manifest, wraps: map[string]fakeWrap{}}
+	var ids []string
+	for _, in := range req.Recipients {
+		a := f.byID(in.RecipientID)
+		if a == nil || a.fp != in.KeyFingerprint {
+			fail(w, 400, "key_fingerprint is not the recipient's primary key")
+			return
+		}
+		listed, found := m.Recipient(in.KeyFingerprint)
+		digest := (&crypto.Wrap{RecipientFingerprint: in.KeyFingerprint, Enc: in.Wrap.Enc, Ciphertext: in.Wrap.Ct}).Digest()
+		if !found || hex.EncodeToString(listed.WrapDigest) != hex.EncodeToString(digest) {
+			fail(w, 400, "wrap does not match the manifest")
+			return
+		}
+		rev.wraps[a.id] = fakeWrap{fp: in.KeyFingerprint, enc: in.Wrap.Enc, ct: in.Wrap.Ct}
+		ids = append(ids, a.id)
+	}
+
+	var revoked []map[string]string
+	s := f.secretByName(sender.id, req.Name)
+	if s == nil {
+		s = &fakeSecret{id: fmt.Sprintf("10000000-0000-4000-8000-%012d", len(f.secrets)+1), name: req.Name, senderID: sender.id}
+		f.secrets[s.id] = s
+	} else {
+		var missing []string
+		for _, id := range s.recipients {
+			if !slices.Contains(ids, id) {
+				missing = append(missing, id)
+			}
+		}
+		if len(missing) > 0 && !req.RevokeMissing {
+			var emails []string
+			for _, id := range missing {
+				emails = append(emails, f.byID(id).email)
+			}
+			fail(w, http.StatusConflict, "This send leaves out people who have access now: "+strings.Join(emails, ", "))
+			return
+		}
+		for _, id := range missing {
+			revoked = append(revoked, map[string]string{"id": id, "email": f.byID(id).email})
+			for _, old := range s.revisions {
+				delete(old.wraps, id)
+			}
+		}
+	}
+	s.recipients = ids
+	rev.secretID = s.id
+	s.revisions = append(s.revisions, rev)
+	f.revs[rev.id] = rev
+	ok(w, map[string]any{
+		"secret":   map[string]string{"id": s.id, "name": s.name},
+		"revision": map[string]any{"id": rev.id, "is_multipart": false},
+		"revoked":  revoked,
+	})
+}
+
+func (f *fakeAPI) secretByName(senderID, name string) *fakeSecret {
+	for _, s := range f.secrets {
+		if s.senderID == senderID && s.name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func (f *fakeAPI) presignUpload(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Key string `json:"key"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	ok(w, map[string]string{"url": f.srv.URL + "/s3/" + body.Key})
+}
+
+func (f *fakeAPI) putObject(w http.ResponseWriter, r *http.Request) {
+	data, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.objects[r.PathValue("key")] = data
+	f.puts++
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) getObject(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w.Write(f.objects[r.PathValue("key")])
+}
+
+func (f *fakeAPI) presignDownload(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rev := f.revs[r.PathValue("id")]
+	if _, held := rev.wraps[f.caller(r).id]; !held {
+		fail(w, http.StatusForbidden, "no access to this revision")
+		return
+	}
+	ok(w, map[string]any{"url": f.srv.URL + "/s3/" + rev.id, "size": len(f.objects[rev.id])})
+}
+
+func (f *fakeAPI) manifest(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rev := f.revs[r.PathValue("id")]
+	wr, held := rev.wraps[f.caller(r).id]
+	if !held {
+		fail(w, http.StatusNotFound, "Revision not found")
+		return
+	}
+	ok(w, map[string]any{"revision_id": rev.id, "manifest": rev.manifest, "key_fingerprint": wr.fp,
+		"wrap": map[string][]byte{"enc": wr.enc, "ct": wr.ct}})
+}
+
+func (f *fakeAPI) secret(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.secrets[r.PathValue("id")]
+	var recipients []map[string]string
+	for _, id := range s.recipients {
+		recipients = append(recipients, map[string]string{"id": id, "email": f.byID(id).email})
+	}
+	ok(w, map[string]any{"id": s.id, "name": s.name, "sender_id": s.senderID, "sender_email": f.byID(s.senderID).email,
+		"recipients": recipients, "latest_revision_id": s.revisions[len(s.revisions)-1].id, "revision_count": len(s.revisions)})
+}
+
+func (f *fakeAPI) revisions(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.secrets[r.PathValue("id")]
+	var out []map[string]any
+	for i, rev := range s.revisions {
+		var recipients []map[string]string
+		for id, wr := range rev.wraps {
+			recipients = append(recipients, map[string]string{"id": id, "email": f.byID(id).email, "key_fingerprint": wr.fp})
+		}
+		out = append(out, map[string]any{"id": rev.id, "revision_number": i + 1,
+			"integrity": map[string]any{"protocol_version": crypto.ProtocolVersion, "recipients": recipients}})
+	}
+	ok(w, map[string]any{"revisions": out, "total": len(out)})
+}
+
+func (f *fakeAPI) revoke(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.secrets[r.PathValue("id")]
+	actor := r.PathValue("actor")
+	if s.senderID != f.caller(r).id || !slices.Contains(s.recipients, actor) {
+		fail(w, http.StatusNotFound, "Recipient not found")
+		return
+	}
+	s.recipients = slices.DeleteFunc(s.recipients, func(id string) bool { return id == actor })
+	for _, rev := range s.revisions {
+		delete(rev.wraps, actor)
+	}
+	ok(w, map[string]bool{"secret_deleted": len(s.recipients) == 0})
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+func TestValidateRecipients(t *testing.T) {
+	many := make([]string, MaxRecipientsPerSend+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("u%d@example.com", i)
+	}
+	cases := map[string]struct {
+		emails []string
+		want   string
+	}{
+		"none":      {nil, "at least one recipient"},
+		"too many":  {many, "at most 100"},
+		"invalid":   {[]string{"bob"}, "invalid recipient email"},
+		"duplicate": {[]string{"bob@example.com", "Bob@Example.com"}, "listed twice"},
+	}
+	for name, c := range cases {
+		if err := ValidateRecipients(c.emails); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", name, err, c.want)
+		}
+	}
+	if err := ValidateRecipients(many[:MaxRecipientsPerSend]); err != nil {
+		t.Errorf("100 recipients: %v", err)
+	}
+}
+
+// One send seals once and uploads once for every recipient, and each
+// recipient decrypts the same payload. The sender is not a recipient
+// unless listed.
+func TestSendOnceToManyRecipients(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+
+	res, err := f.client(alice.email).EncryptText([]string{bob.email, carol.email}, "hello, both", EncryptOptions{Name: "greeting"})
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if f.creates != 1 || f.puts != 1 {
+		t.Fatalf("want one create and one upload, got %d and %d", f.creates, f.puts)
+	}
+	want := []Recipient{{Email: bob.email, Fingerprint: bob.fp}, {Email: carol.email, Fingerprint: carol.fp}}
+	if !slices.Equal(res.Recipients, want) || res.SenderFingerprint != alice.fp {
+		t.Fatalf("result recipients %+v, sender %s", res.Recipients, res.SenderFingerprint)
+	}
+	stored := f.objects[res.Secret.RevisionID]
+	if res.EncryptedSize != int64(len(stored)) || len(res.Revoked) != 0 {
+		t.Fatalf("size %d, stored %d, revoked %v", res.EncryptedSize, len(stored), res.Revoked)
+	}
+	for _, in := range f.lastReq.Recipients {
+		if in.RecipientOrgID != "" {
+			t.Errorf("recipient_org_id set for %s, which only the server knows", in.RecipientID)
+		}
+	}
+
+	digest := sha256.Sum256(stored)
+	for _, r := range []*fakeActor{bob, carol} {
+		out, err := f.client(r.email).DecryptSecretFull(res.Secret.ID, DecryptOptions{})
+		if err != nil {
+			t.Fatalf("%s decrypt: %v", r.email, err)
+		}
+		if out.Decrypted.Message != "hello, both" || out.RecipientFingerprint != r.fp || out.SenderFingerprint != alice.fp {
+			t.Fatalf("%s: got %+v", r.email, out)
+		}
+		if out.ProtocolVersion != crypto.ProtocolVersion || out.CipherSuite != crypto.CipherSuite ||
+			out.PayloadDigest != hex.EncodeToString(digest[:]) || len(out.Recipients) != 2 {
+			t.Fatalf("%s: metadata %+v", r.email, out)
+		}
+		for _, sr := range out.Recipients {
+			if sr.Email == "" {
+				t.Errorf("%s: no email for signed recipient %s", r.email, sr.Fingerprint)
+			}
+		}
+	}
+
+	if _, err := f.client(alice.email).DecryptSecret(res.Secret.ID); err == nil || !strings.Contains(err.Error(), "not encrypted for your key") {
+		t.Fatalf("sender who is not a recipient: %v", err)
+	}
+}
+
+// A self-send lists only the sender, whose org is the one known recipient
+// org.
+func TestSelfSend(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com")
+	alice := f.actors["alice@example.com"]
+	c := f.client(alice.email)
+	res, err := c.EncryptData([]string{alice.email}, map[string]string{"K": "V"}, EncryptOptions{Name: "vault"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.lastReq.Recipients) != 1 || f.lastReq.Recipients[0].RecipientOrgID != "org-1" {
+		t.Fatalf("self-send recipients %+v", f.lastReq.Recipients)
+	}
+	out, err := c.DecryptSecret(res.Secret.ID)
+	if err != nil || len(out.Entries) != 1 || out.Entries[0].Value != "V" {
+		t.Fatalf("decrypt: %+v, %v", out, err)
+	}
+}
+
+// A send under an existing name that leaves out a current recipient is
+// refused with the server's message unless RevokeMissing is set.
+func TestResendLeavingOutRecipient(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	c := f.client(alice.email)
+	if _, err := c.EncryptText([]string{bob.email, carol.email}, "v1", EncryptOptions{Name: "db"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := c.EncryptText([]string{bob.email}, "v2", EncryptOptions{Name: "db"})
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "leaves out people who have access now: carol@example.com") {
+		t.Fatalf("leaving out carol: %v", err)
+	}
+
+	res, err := c.EncryptText([]string{bob.email}, "v2", EncryptOptions{Name: "db", RevokeMissing: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Revoked) != 1 || res.Revoked[0].Email != carol.email {
+		t.Fatalf("revoked %+v", res.Revoked)
+	}
+	if out, err := f.client(bob.email).DecryptSecret(res.Secret.ID); err != nil || out.Message != "v2" {
+		t.Fatalf("bob reads v2: %+v, %v", out, err)
+	}
+	if _, err := f.client(carol.email).DecryptSecret(res.Secret.ID); err == nil {
+		t.Fatal("carol still decrypts after being revoked")
+	}
+}
+
+func TestRevokeRecipient(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	c := f.client(alice.email)
+	res, err := c.EncryptText([]string{bob.email, carol.email}, "x", EncryptOptions{Name: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.RevokeRecipient(res.Secret.ID, "dave@example.com"); err == nil || !strings.Contains(err.Error(), "not a recipient") {
+		t.Fatalf("unknown recipient: %v", err)
+	}
+	r, err := c.RevokeRecipient(res.Secret.ID, "Bob@Example.com")
+	if err != nil || r.RecipientID != bob.id || r.Email != bob.email || r.SecretDeleted {
+		t.Fatalf("revoke bob: %+v, %v", r, err)
+	}
+	if _, err := f.client(bob.email).DecryptSecret(res.Secret.ID); err == nil {
+		t.Fatal("bob still decrypts after being revoked")
+	}
+	r, err = c.RevokeRecipient(res.Secret.ID, carol.email)
+	if err != nil || !r.SecretDeleted {
+		t.Fatalf("revoke the last recipient: %+v, %v", r, err)
+	}
+}

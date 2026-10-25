@@ -76,17 +76,20 @@ Never expose raw endpoint logic to callers.
 - Hybrid KEM: ML-KEM-768 + X25519
 - AEAD: AES-256-GCM
 - KDF: HKDF-SHA256
-- Signatures: Ed25519
+- Signatures: Ed25519 and ML-DSA-65
+- Payload: AES-256-GCM STREAM, 1 MiB chunks, key derived with HKDF
 
 9. No partial implementations
 - Encryption must always include:
   - authenticated encryption
   - signature verification
   - AAD binding
+  - payload digest verified against the signed manifest before plaintext is released
 
 10. Forward secrecy
 - Always use ephemeral sender keys
 - Never reuse encryption context
+- A fresh content key per revision, and a fresh HPKE context per wrap
 
 ---
 
@@ -105,15 +108,11 @@ Never expose raw endpoint logic to callers.
 
 ## Memory & Streaming
 
-13. Current constraint (v2)
-- Encryption requires full plaintext in memory
-- Streaming only applies to:
-  - archive creation
-  - upload/download
+13. Streaming (protocol v4)
+- Encryption and decryption stream in 1 MiB chunks (protocol v4).
 
-14. Do NOT fake streaming encryption
-- No partial AEAD hacks
-- No chunking unless protocol v3 is introduced
+14. Plaintext release
+- Plaintext is released only after the payload digest is verified.
 
 ---
 

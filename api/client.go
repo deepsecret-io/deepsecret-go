@@ -11,8 +11,8 @@ package api
 import (
 	"bytes"
 	"context"
-	cryptorand "crypto/rand"
 	"crypto/md5"
+	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -61,7 +61,7 @@ type APIError struct {
 	Code       string
 	Message    string
 	// RetryAfter is parsed from the Retry-After response header when present.
-	// Zero means "not provided" — callers should fall back to their own
+	// Zero means "not provided"; callers should fall back to their own
 	// backoff schedule.
 	RetryAfter time.Duration
 }
@@ -76,14 +76,14 @@ func (e *APIError) Error() string {
 // Sentinel errors callers can use with errors.Is. Each maps to one or more
 // HTTP status codes returned by the backend.
 var (
-	ErrUnauthorized = errors.New("unauthorized")    // 401
-	ErrForbidden    = errors.New("forbidden")       // 403
-	ErrNotFound     = errors.New("not found")       // 404
-	ErrConflict     = errors.New("conflict")        // 409
-	ErrTierLimit    = errors.New("tier limit")      // 402, 429 with code=tier_limit
-	ErrRateLimited  = errors.New("rate limited")    // 429
-	ErrServerError  = errors.New("server error")    // 5xx (not maintenance)
-	ErrBadRequest   = errors.New("bad request")     // 400, 422
+	ErrUnauthorized = errors.New("unauthorized") // 401
+	ErrForbidden    = errors.New("forbidden")    // 403
+	ErrNotFound     = errors.New("not found")    // 404
+	ErrConflict     = errors.New("conflict")     // 409
+	ErrTierLimit    = errors.New("tier limit")   // 402, 429 with code=tier_limit
+	ErrRateLimited  = errors.New("rate limited") // 429
+	ErrServerError  = errors.New("server error") // 5xx (not maintenance)
+	ErrBadRequest   = errors.New("bad request")  // 400, 422
 )
 
 // Is implements errors.Is so callers can write
@@ -122,7 +122,7 @@ type Client struct {
 	httpClient *http.Client
 	// presignClient is a separate client used for object-storage presign
 	// uploads/downloads. It carries no auth headers (the presigned URL is the
-	// authentication) and rejects every redirect — S3 PUT/GET should never
+	// authentication) and rejects every redirect: S3 PUT/GET should never
 	// redirect, and a 30x from a compromised presign endpoint should not be
 	// allowed to redirect attacker-controlled bodies anywhere.
 	presignClient *http.Client
@@ -178,7 +178,7 @@ func isLocalhostURL(raw string) bool {
 // allowlist (e.g. "vpn.internal,10.0.0.5"); only those exact hostnames are
 // permitted to use plaintext HTTP, and a loud warning is still printed.
 // The legacy global DEEPSECRET_ALLOW_INSECURE_HTTP env var is no longer
-// honored — set the per-host allowlist instead.
+// honored; set the per-host allowlist instead.
 func ValidateTransportSecurity(apiURL string) error {
 	if !strings.HasPrefix(apiURL, "http://") || isLocalhostURL(apiURL) {
 		return nil
@@ -430,7 +430,7 @@ func (c *Client) do(method, path string, body any) (*Response, error) {
 	return &apiResp, nil
 }
 
-// parseRetryAfter parses the Retry-After header per RFC 7231 — either a
+// parseRetryAfter parses the Retry-After header per RFC 7231: either a
 // decimal number of seconds or an HTTP-date. Returns 0 when the header is
 // missing or malformed.
 func parseRetryAfter(h string) time.Duration {
@@ -470,7 +470,7 @@ func strconvParseInt(s string) (int64, error) {
 
 // DefaultPresignExpiryMinutes is the lifetime the SDK requests for every
 // presigned URL. Mirrors the server's MaxPresignExpiryMinutes (30 min) so
-// the SDK always asks for the maximum it's allowed — long enough to finish
+// the SDK always asks for the maximum it's allowed, long enough to finish
 // multi-GiB multipart uploads / parallel-Range downloads on slow links,
 // while still bounded enough that a leaked URL has a finite abuse window.
 const DefaultPresignExpiryMinutes = 30
@@ -525,7 +525,7 @@ type PresignDownloadPlan struct {
 }
 
 // presignDownloadPlan requests a presigned download URL plus size hints so
-// the caller can pick a transport strategy. Only ONE call is made — the
+// the caller can pick a transport strategy. Only ONE call is made: the
 // response is reused for every Range GET in a parallel download.
 func (c *Client) presignDownloadPlan(revisionID string, expiryMinutes int) (*PresignDownloadPlan, error) {
 	resp, err := c.Post("/api/v1/secrets/revisions/"+revisionID+"/presign", map[string]any{
@@ -594,7 +594,7 @@ func (c *Client) PresignDownloadReader(revisionID string, expiryMinutes int) (io
 }
 
 // PresignUpload gets a presigned PUT URL and uploads data from a byte slice.
-// Convenience wrapper — computes MD5 and size automatically.
+// Convenience wrapper: computes MD5 and size automatically.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
 func (c *Client) PresignUpload(orgID, objectKey string, data []byte, expiryMinutes int) error {
@@ -799,9 +799,9 @@ func (c *Client) downloadFromPresignedURL(presignedURL string) ([]byte, error) {
 // connection drops mid-body, the next retry uses HTTP `Range: bytes=N-` to
 // resume from where it stopped instead of restarting at byte zero. S3
 // supports Range natively on every GET, so this works without any
-// server-side change. The buffer is preserved across retries; the AEAD
-// integrity check happens at the client when the assembled bytes are
-// decrypted, so a Range-resumed body is no less secure than a single-shot
+// server-side change. The buffer is preserved across retries; the payload
+// digest and chunk AEAD checks happen at the client when the assembled bytes
+// are decrypted, so a Range-resumed body is no less secure than a single-shot
 // one.
 func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64, int64)) ([]byte, error) {
 	c.presignClient.Timeout = 10 * time.Minute
@@ -854,7 +854,7 @@ func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64,
 		// a 206 reflects only the requested range, not the whole object.
 		if totalSize < 0 {
 			if resp.StatusCode == http.StatusPartialContent {
-				// The server unexpectedly returned Range on the first call —
+				// The server unexpectedly returned Range on the first call;
 				// treat as full reset.
 				buf.Reset()
 				rangeStart = 0

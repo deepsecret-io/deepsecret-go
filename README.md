@@ -3,7 +3,7 @@
 End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 
 **Version:** 0.3.0
-**Protocol:** v2 — HPKE (MLKEM768-X25519 + HKDF-SHA256 + AES-256-GCM) + Ed25519
+**Protocol:** v4: one payload per revision (AES-256-GCM, 1 MiB chunks), a content-key wrap per recipient (HPKE X25519-ML-KEM-768 + HKDF-SHA256 + AES-256-GCM), and a manifest signed with Ed25519 + ML-DSA-65. See [PROTOCOL_V4.md](PROTOCOL_V4.md).
 **Payload:** CBOR (RFC 8949, canonical encoding)
 **Compression:** Zstandard only
 **Go:** 1.26+
@@ -11,22 +11,22 @@ End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 ## Architecture
 
 ```
-sdk/                 ← orchestration (encrypt, decrypt)
+sdk/                 ← orchestration (encrypt, decrypt, revoke)
 ├── api/             ← HTTP client, presigned upload/download
 ├── identity/        ← actor info, key management, resolution
 ├── secrets/         ← secret CRUD, creation request types
 ├── payload/         ← CBOR payload types (wire format)
-├── crypto/          ← HPKE encrypt/decrypt, Ed25519, keystore
+├── crypto/          ← payload stream, HPKE wraps, signed manifest, keystore
 ├── compress/        ← streaming zstd compression/decompression
 ├── archive/         ← tar creation/extraction, path validation
 └── examples/
 ```
 
 **Standalone packages** (no API dependency, portable to other languages):
-- `crypto/` — encryption, signing, key management
-- `compress/` — streaming zstd
-- `archive/` — tar, path validation, file expansion
-- `payload/` — CBOR payload types
+- `crypto/`: encryption, signing, key management
+- `compress/`: streaming zstd
+- `archive/`: tar, path validation, file expansion
+- `payload/`: CBOR payload types
 
 ## Quick Start
 
@@ -35,12 +35,15 @@ import "deepsecret/sdk"
 
 client := sdk.NewClient("https://api.deepsecret.io", "ds_your_api_key")
 
-// Encrypt a message
-secret, _ := client.EncryptText("bob@example.com", "sensitive data")
+// Encrypt a message once for two recipients (you are a recipient only if listed)
+res, _ := client.EncryptText([]string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
 
-// Decrypt (auto-unarchives if needed)
-result, _ := client.DecryptSecret(secret.ID)
+// Decrypt, as one of the recipients
+result, _ := client.DecryptSecret(res.Secret.ID)
 fmt.Println(result.Message)
+
+// Revoke one recipient
+client.RevokeRecipient(res.Secret.ID, "bob@example.com")
 ```
 
 ## Encrypt Options
@@ -53,30 +56,35 @@ sdk.EncryptOptions{
     SkipHidden: true,
     TTL:        "7d",              // "30m", "24h", "7d"
     IPs:        []string{"10.0.0.0/8"},
+    // Resending under an existing name must list everyone with access now;
+    // this revokes anyone the send leaves out.
+    RevokeMissing: true,
 }
 ```
 
 ## Memory Model
 
-The current protocol uses single-shot HPKE encryption, which requires the full
-plaintext in memory. All `Encrypt*` functions load file contents into RAM.
-For very large payloads, consider file-size limits. Future protocol versions
-may add chunked encryption for true streaming.
+Protocol v4 encrypts in 1 MiB chunks, and `crypto.Seal` / `Opened.DecryptTo`
+stream. The high-level `Encrypt*` functions still build the payload in memory,
+and decrypt buffers the downloaded object so its digest is checked against the
+signed manifest before any plaintext is released. For very large payloads,
+consider file-size limits.
 
 ## Packages
 
-### `sdk/crypto` — Cryptographic Primitives
+### `sdk/crypto`: Cryptographic Primitives
 
 | Function | Description |
 |---|---|
-| `GenerateKeyPair()` | Generate Ed25519 + X25519 + ML-KEM-768 key pair |
+| `GenerateKeyPair()` | Generate Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768 key pair |
 | `Fingerprint(kp)` | Full SHA-256 hex fingerprint (64 chars) |
-| `HybridEncrypt(pt, sender, recipient, params)` | HPKE encrypt + Ed25519 sign |
-| `HybridDecrypt(envelope, recipient, senderPub)` | Verify + HPKE decrypt |
-| `UnmarshalEnvelope(data)` | Inspect envelope without decrypting |
+| `Seal` / `SealBytes(pt, sender, recipients, params)` | Encrypt once, wrap the content key per recipient, sign the manifest |
+| `Open(manifest, wrap, recipient, params)` | Verify the manifest, open the caller's wrap |
+| `Opened.Decrypt` / `DecryptTo` | Check the payload digest, then decrypt the chunks |
+| `UnmarshalManifest(data)` | Inspect a manifest without opening it |
 | `SaveKeyPair` / `LoadKeyPair` | Password-protected key storage |
 
-### `sdk/compress` — Streaming Compression
+### `sdk/compress`: Streaming Compression
 
 | Function | Description |
 |---|---|
@@ -87,7 +95,7 @@ may add chunked encryption for true streaming.
 
 Algorithms: `compress.Zstd`, `compress.None`
 
-### `sdk/archive` — Tar & File Operations
+### `sdk/archive`: Tar & File Operations
 
 | Function | Description |
 |---|---|
@@ -97,34 +105,37 @@ Algorithms: `compress.Zstd`, `compress.None`
 | `ValidateArchivePath(name)` | Portable archive path validation |
 | `ExpandPaths(paths, skipHidden)` | Recursive file expansion |
 
-### `sdk/payload` — Wire Format
+### `sdk/payload`: Wire Format
 
 CBOR-encoded payload types with canonical deterministic encoding.
 
-### `sdk/identity` — Identity Management
+### `sdk/identity`: Identity Management
 
 Actor info, key resolution, sync, fingerprint lookup.
 
-### `sdk/secrets` — Secret CRUD
+### `sdk/secrets`: Secret CRUD
 
-List, describe, delete, create secrets via the API.
+List, describe, delete, create secrets, fetch a revision's manifest and wrap, and revoke recipients via the API.
 
-## Encryption Protocol (v2)
+## Encryption Protocol (v4)
 
 ```
-Sender                                           Recipient
+Sender                                           Recipients
   │                                                  │
-  │  1. HPKE Encapsulate (MLKEM768-X25519) ─────►   │
-  │  2. HPKE derives keys (HKDF-SHA256) internally  │
-  │  3. HPKE encrypts plaintext (AES-256-GCM + AAD) │
-  │  4. Ed25519 Sign(envelope)                       │
+  │  1. Fresh content key K per revision             │
+  │  2. AES-256-GCM, 1 MiB chunks, key HKDF(K)       │
+  │  3. HPKE-wrap K for each recipient               │
+  │     (X25519-ML-KEM-768, fresh context per wrap)  │
+  │  4. Sign manifest (Ed25519 + ML-DSA-65):         │
+  │     payload digest + every recipient's wrap      │
   │                                                  │
-  │  ──── encrypted envelope (CBOR) ────────────►    │
+  │  ──── one payload, manifest, one wrap each ──►   │
   │                                                  │
-  │                          5. Verify Ed25519 sig   │
-  │                          6. Verify sender bundle │
-  │                          7. HPKE Decapsulate     │
-  │                          8. HPKE decrypt         │
+  │                   5. Verify sender bundle + sigs │
+  │                   6. Check listed + wrap digest  │
+  │                   7. HPKE-open own wrap → K      │
+  │                   8. Verify payload digest       │
+  │                   9. Decrypt chunks in order     │
 ```
 
 ## Running Tests
@@ -138,10 +149,11 @@ go test ./sdk/... -v
 The SDK is designed for portability:
 
 - **Standalone packages**: `crypto/`, `compress/`, `archive/`, `payload/` have no HTTP dependency
-- **Wire format**: CBOR (RFC 8949) with canonical encoding — deterministic across languages
-- **Compression**: Zstandard (RFC 8878) — implementations in every language
-- **Encryption**: HPKE (RFC 9180) with MLKEM768-X25519 — Go stdlib `crypto/hpke`
-- **Signing**: Ed25519 (RFC 8032) — universal
+- **Wire format**: CBOR (RFC 8949) with canonical encoding, deterministic across languages
+- **Compression**: Zstandard (RFC 8878), implementations in every language
+- **Encryption**: HPKE (RFC 9180) with X25519-ML-KEM-768 (Go stdlib `crypto/hpke`) for wraps, AES-256-GCM in 1 MiB chunks for payloads
+- **Signing**: Ed25519 (RFC 8032) and ML-DSA-65 (FIPS 204), both required
+- **Test vectors**: `crypto/v4_vector_test.go` pins every deterministic v4 value
 - **Archive paths**: strict portable format (forward-slash, no traversal, validated)
 
 Key porting targets: TypeScript/Node.js, Python, Rust, Swift, Kotlin

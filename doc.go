@@ -3,54 +3,65 @@
 
 // Package sdk provides a high-level Go SDK for the DeepSecret API.
 //
-// DeepSecret uses hybrid post-quantum encryption (HPKE with MLKEM768-X25519,
-// HKDF-SHA256, AES-256-GCM) with Ed25519 signatures. All cryptographic
-// operations happen client-side — private keys never leave the device.
+// DeepSecret uses protocol v4 (PROTOCOL_V4.md): each revision's payload is
+// encrypted once with AES-256-GCM in 1 MiB chunks under a fresh content
+// key, that key is wrapped for every recipient with hybrid post-quantum
+// HPKE (X25519-ML-KEM-768, HKDF-SHA256, AES-256-GCM), and the sender signs
+// a manifest covering the payload and every wrap with Ed25519 and
+// ML-DSA-65. All cryptographic operations happen client-side: private keys
+// never leave the device.
 //
 // # Package Structure
 //
-//	sdk/           — high-level orchestration (encrypt, decrypt)
-//	sdk/api/       — HTTP client, presigned URL upload/download
-//	sdk/identity/  — actor info, key management, resolution
-//	sdk/secrets/   — secret CRUD, creation request types
-//	sdk/payload/   — CBOR payload types (wire format)
-//	sdk/crypto/    — HPKE encrypt/decrypt, Ed25519 signing, keystore
-//	sdk/compress/  — streaming zstd compression/decompression
-//	sdk/archive/   — tar creation/extraction, path validation
+//	sdk/           : high-level orchestration (encrypt, decrypt, revoke)
+//	sdk/api/       : HTTP client, presigned URL upload/download
+//	sdk/identity/  : actor info, key management, resolution
+//	sdk/secrets/   : secret CRUD, creation request types
+//	sdk/payload/   : CBOR payload types (wire format)
+//	sdk/crypto/    : payload stream, HPKE wraps, signed manifest, keystore
+//	sdk/compress/  : streaming zstd compression/decompression
+//	sdk/archive/   : tar creation/extraction, path validation
 //
 // The crypto, compress, and archive packages are standalone with no API
 // dependency. They can be used independently or ported to other languages.
 //
+// # Recipients
+//
+// One send seals the payload once for any number of recipients and uploads
+// it once. The sender is a recipient only when listed. Sending again under
+// an existing name adds a revision, and must list everyone who has access
+// now unless EncryptOptions.RevokeMissing is set. RevokeRecipient removes
+// one recipient.
+//
 // # Memory Model
 //
-// The current protocol uses single-shot HPKE encryption, which requires the
-// full plaintext payload in memory. For large files, this means:
+// The protocol streams in 1 MiB chunks, but the high-level methods build
+// the payload in memory:
 //
 //   - File data is loaded into the CBOR payload (in memory)
 //   - The payload is optionally compressed (in memory)
-//   - The compressed payload is encrypted as a single HPKE operation
-//   - The encrypted envelope is uploaded to storage
+//   - The payload is sealed once, chunk by chunk, into an in-memory object
+//   - The object is uploaded to storage
 //
-// The archive and compress packages support streaming internally, but the
-// HPKE single-shot constraint means the full encrypted envelope must be
-// buffered. Future protocol versions may add chunked encryption to enable
-// true end-to-end streaming for very large payloads.
+// On decrypt the downloaded object is buffered so its digest can be checked
+// against the signed manifest before any plaintext is released.
 //
 // # Quick Start
 //
 //	client, err := sdk.NewClient("https://api.deepsecret.io", "your-api-key")
 //	if err != nil { log.Fatal(err) }
 //
-//	// Encrypt a message
-//	secret, _ := client.EncryptText("recipient@example.com", "sensitive data")
+//	// Encrypt a message for two recipients in one send
+//	res, _ := client.EncryptText([]string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
 //
-//	// Decrypt a secret
-//	result, _ := client.DecryptSecret(secret.ID)
+//	// Decrypt a secret (as one of its recipients)
+//	result, _ := client.DecryptSecret(res.Secret.ID)
 //	fmt.Println(result.Message)
 //
 // # Secret Management
 //
 //	secrets, total, _ := client.ListSecrets("received", sdk.ListOptions{Limit: 50})
 //	info, _ := client.DescribeSecret(secretID)
+//	client.RevokeRecipient(secretID, "bob@example.com")
 //	client.DeleteSecret(secretID)
 package sdk

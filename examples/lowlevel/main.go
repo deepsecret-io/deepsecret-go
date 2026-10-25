@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 DeepSecret
 
-// Example: lowlevel — demonstrates direct usage of the crypto and archive
+// Example lowlevel demonstrates direct usage of the crypto and archive
 // packages without the high-level SDK client.
 //
 // This shows how the low-level primitives can be used independently for
@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	fmt.Println("DeepSecret SDK — low-level crypto & archive example")
+	fmt.Println("DeepSecret SDK: low-level crypto & archive example")
 	fmt.Println()
 
 	// ────────────────────────────────────────────────────────────────────────
@@ -81,10 +81,10 @@ func main() {
 	fmt.Printf("Keys in temp dir:      %v\n\n", keyList)
 
 	// ────────────────────────────────────────────────────────────────────────
-	// 2. Hybrid Encryption / Decryption
+	// 2. Seal / Open (protocol v4)
 	// ────────────────────────────────────────────────────────────────────────
 
-	fmt.Println("=== Hybrid Encrypt/Decrypt ===")
+	fmt.Println("=== Seal/Open (protocol v4) ===")
 
 	plaintext := []byte("Top secret message: the launch code is 42.")
 	fmt.Printf("Plaintext: %q (%d bytes)\n", string(plaintext), len(plaintext))
@@ -94,34 +94,48 @@ func main() {
 		ED25519:     recipientKP.ED25519Public,
 		X25519:      recipientKP.X25519Public,
 		MLKEM768:    recipientKP.MLKEM768PK,
+		MLDSA65:     recipientKP.MLDSA65PK,
 		Fingerprint: recipientFP,
 	}
 
-	// Encrypt
-	envelope, err := crypto.HybridEncrypt(plaintext, senderKP, recipientPub, crypto.EncryptParams{
+	// Seal once for every recipient. The revision id is bound into the
+	// payload, the wraps and the manifest; the API assigns it at create.
+	revisionID := "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70"
+	sealedPayload, sealed, err := crypto.SealBytes(plaintext, senderKP, []*crypto.PublicKeys{recipientPub}, crypto.SealParams{
+		RevisionID:  revisionID,
 		PayloadType: "message",
 	})
 	if err != nil {
-		log.Fatal("encrypt: ", err)
+		log.Fatal("seal: ", err)
 	}
-	fmt.Printf("Envelope size: %d bytes (%.1fx expansion)\n", len(envelope), float64(len(envelope))/float64(len(plaintext)))
+	fmt.Printf("Payload size:  %d bytes\n", len(sealedPayload))
+	fmt.Printf("Manifest size: %d bytes\n", len(sealed.ManifestData))
 
-	// Inspect envelope without decrypting
-	env, _ := crypto.UnmarshalEnvelope(envelope)
-	fmt.Printf("Envelope metadata:\n")
-	fmt.Printf("  Protocol:    v%s\n", env.Version)
-	fmt.Printf("  Suite:       %s\n", env.CipherSuite)
-	fmt.Printf("  Sender FP:   %s\n", env.SenderFingerprint)
-	fmt.Printf("  Recipient FP:%s\n", env.RecipientFingerprint)
-	fmt.Printf("  Type:        %s\n", env.PayloadType)
+	// Inspect the manifest without opening it
+	m, _ := crypto.UnmarshalManifest(sealed.ManifestData)
+	fmt.Printf("Manifest metadata:\n")
+	fmt.Printf("  Protocol:    v%s\n", m.Version)
+	fmt.Printf("  Suite:       %s\n", m.CipherSuite)
+	fmt.Printf("  Sender FP:   %s\n", m.SenderFingerprint)
+	fmt.Printf("  Recipients:  %d\n", len(m.Recipients))
+	fmt.Printf("  Type:        %s\n", m.PayloadType)
 
-	// Decrypt
-	result, err := crypto.HybridDecrypt(envelope, recipientKP, senderKP.ED25519Public)
+	// Open as the recipient, then decrypt the payload
+	wrap, _ := sealed.Wrap(recipientFP)
+	opened, err := crypto.Open(sealed.ManifestData, wrap, recipientKP, crypto.OpenParams{
+		RevisionID:    revisionID,
+		SenderED25519: senderKP.ED25519Public,
+	})
+	if err != nil {
+		log.Fatal("open: ", err)
+	}
+	decrypted, err := opened.Decrypt(sealedPayload)
+	opened.Close()
 	if err != nil {
 		log.Fatal("decrypt: ", err)
 	}
-	fmt.Printf("Decrypted: %q\n", string(result.Plaintext))
-	fmt.Printf("Match: %v\n\n", string(result.Plaintext) == string(plaintext))
+	fmt.Printf("Decrypted: %q\n", string(decrypted))
+	fmt.Printf("Match: %v\n\n", string(decrypted) == string(plaintext))
 
 	// With compression
 	fmt.Println("=== With Compression ===")
@@ -135,23 +149,30 @@ func main() {
 	fmt.Printf("Original: %d bytes → Compressed: %d bytes (%.1f%% ratio)\n",
 		len(longText), len(compressed), float64(len(compressed))/float64(len(longText))*100)
 
-	envComp, err := crypto.HybridEncrypt(compressed, senderKP, recipientPub, crypto.EncryptParams{
+	compPayload, compSealed, err := crypto.SealBytes(compressed, senderKP, []*crypto.PublicKeys{recipientPub}, crypto.SealParams{
+		RevisionID:  revisionID,
 		PayloadType: "message",
 		Compressed:  true,
 		Compression: "zstd",
 	})
 	if err != nil {
-		log.Fatal("encrypt compressed: ", err)
+		log.Fatal("seal compressed: ", err)
 	}
 
-	resultComp, err := crypto.HybridDecrypt(envComp, recipientKP, senderKP.ED25519Public)
+	compWrap, _ := compSealed.Wrap(recipientFP)
+	compOpened, err := crypto.Open(compSealed.ManifestData, compWrap, recipientKP, crypto.OpenParams{RevisionID: revisionID})
+	if err != nil {
+		log.Fatal("open compressed: ", err)
+	}
+	compPlain, err := compOpened.Decrypt(compPayload)
+	compOpened.Close()
 	if err != nil {
 		log.Fatal("decrypt compressed: ", err)
 	}
 
-	decompressed, _ := compress.DecompressZstd(resultComp.Plaintext)
+	decompressed, _ := compress.DecompressZstd(compPlain)
 	fmt.Printf("Roundtrip match: %v (compressed=%v, algo=%s)\n\n",
-		string(decompressed) == string(longText), resultComp.Compressed, resultComp.Compression)
+		string(decompressed) == string(longText), compOpened.Manifest.Compressed, compOpened.Manifest.Compression)
 
 	// ────────────────────────────────────────────────────────────────────────
 	// 3. Archive & Compression
