@@ -4,10 +4,13 @@
 package sdk
 
 import (
+	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +28,13 @@ import (
 )
 
 // ── High-level Encrypt Functions ─────────────────────────────────────────────
+//
+// Files and directories stream: each file is read once, encoded, compressed
+// and sealed chunk by chunk into a private temporary file holding only
+// ciphertext, which is then uploaded. Memory stays flat whatever the size;
+// the temporary file needs free disk space for the encrypted payload (see
+// EncryptOptions.TempDir). Text, key-value data and in-memory bytes are
+// small and are encoded in memory.
 
 // EncryptText encrypts a text message for one or more recipients and
 // uploads it once.
@@ -37,7 +47,7 @@ func (c *Client) EncryptText(recipients []string, text string, opt EncryptOption
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	return c.encryptAndSend(recipients, data, "message", nil, false, opt)
+	return c.encryptAndSend(recipients, memPlaintext("message", data, nil), opt)
 }
 
 // EncryptData encrypts key-value pairs for one or more recipients and
@@ -58,11 +68,11 @@ func (c *Client) EncryptData(recipients []string, kvPairs map[string]string, opt
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	return c.encryptAndSend(recipients, data, "data", nil, false, opt)
+	return c.encryptAndSend(recipients, memPlaintext("data", data, nil), opt)
 }
 
 // EncryptFile encrypts a single file for one or more recipients and
-// uploads it once.
+// uploads it once. The file streams from disk.
 //
 //	result, _ := client.EncryptFile([]string{"bob@example.com"}, "./report.pdf", sdk.EncryptOptions{})
 func (c *Client) EncryptFile(recipients []string, filePath string, opt EncryptOptions) (*EncryptResult, error) {
@@ -70,44 +80,12 @@ func (c *Client) EncryptFile(recipients []string, filePath string, opt EncryptOp
 	if opt.Name == "" {
 		opt.Name = filepath.Base(filePath)
 	}
-
-	maxSize := opt.MaxPayloadSize
-	if maxSize <= 0 {
-		maxSize = DefaultMaxPayloadSize
-	}
-	if _, err := preflightFileSize([]string{filePath}, maxSize); err != nil {
-		return nil, err
-	}
-
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("read file: %w", err)
-	}
-
-	h := sha256.Sum256(content)
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("stat file: %w", err)
-	}
-
-	files := []payload.FileEntry{{
-		Name:   filepath.Base(filePath),
-		Data:   content,
-		Size:   info.Size(),
-		SHA256: hex.EncodeToString(h[:]),
-		Mode:   info.Mode(),
-	}}
-
-	p := payload.Payload{Type: "files", Files: files}
-	data, err := payload.Marshal(p)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
-	}
-	return c.encryptAndSend(recipients, data, "files", files, false, opt)
+	return c.EncryptFiles(recipients, []string{filePath}, opt)
 }
 
 // EncryptFiles encrypts multiple files for one or more recipients and
-// uploads them once.
+// uploads them once. Each file is named by its base name and streams from
+// disk.
 //
 //	result, _ := client.EncryptFiles([]string{"bob@example.com"}, []string{
 //	    "./report.pdf",
@@ -115,40 +93,27 @@ func (c *Client) EncryptFile(recipients []string, filePath string, opt EncryptOp
 //	}, sdk.EncryptOptions{})
 func (c *Client) EncryptFiles(recipients []string, filePaths []string, opt EncryptOptions) (*EncryptResult, error) {
 
-	maxSize := opt.MaxPayloadSize
-	if maxSize <= 0 {
-		maxSize = DefaultMaxPayloadSize
-	}
-	if _, err := preflightFileSize(filePaths, maxSize); err != nil {
+	if _, err := preflightFileSize(filePaths, maxPayloadSize(opt)); err != nil {
 		return nil, err
 	}
-
-	var files []payload.FileEntry
-	for _, fp := range filePaths {
-		content, err := os.ReadFile(fp)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", fp, err)
-		}
-		h := sha256.Sum256(content)
+	seen := make(map[string]bool, len(filePaths))
+	srcs := make([]payload.FileSource, len(filePaths))
+	for i, fp := range filePaths {
 		info, err := os.Stat(fp)
 		if err != nil {
 			return nil, fmt.Errorf("stat %s: %w", fp, err)
 		}
-		files = append(files, payload.FileEntry{
-			Name:   filepath.Base(fp),
-			Data:   content,
-			Size:   info.Size(),
-			SHA256: hex.EncodeToString(h[:]),
-			Mode:   info.Mode(),
-		})
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", fp)
+		}
+		name := filepath.Base(fp)
+		if seen[name] {
+			return nil, fmt.Errorf("two files are named %q: a secret's files need distinct names", name)
+		}
+		seen[name] = true
+		srcs[i] = fileSource(name, fp, info)
 	}
-
-	p := payload.Payload{Type: "files", Files: files}
-	data, err := payload.Marshal(p)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
-	}
-	return c.encryptAndSend(recipients, data, "files", files, false, opt)
+	return c.encryptAndSend(recipients, filesPlaintext(srcs), opt)
 }
 
 // EncryptBytes encrypts raw binary data for one or more recipients as a
@@ -158,19 +123,19 @@ func (c *Client) EncryptFiles(recipients []string, filePaths []string, opt Encry
 func (c *Client) EncryptBytes(recipients []string, raw []byte, opt EncryptOptions) (*EncryptResult, error) {
 
 	h := sha256.Sum256(raw)
-	files := []payload.FileEntry{{
+	file := payload.FileEntry{
 		Name:   "data.bin",
 		Data:   raw,
 		Size:   int64(len(raw)),
 		SHA256: hex.EncodeToString(h[:]),
 		Mode:   0644,
-	}}
-	p := payload.Payload{Type: "files", Files: files}
-	data, err := payload.Marshal(p)
+	}
+	data, err := payload.Marshal(payload.Payload{Type: "files", Files: []payload.FileEntry{file}})
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	return c.encryptAndSend(recipients, data, "files", files, false, opt)
+	meta := []secrets.FileMetaEntry{{Name: file.Name, Size: file.Size, SHA256: file.SHA256}}
+	return c.encryptAndSend(recipients, memPlaintext("files", data, meta), opt)
 }
 
 // EncryptDir encrypts all files in a directory (recursively) for one or
@@ -360,15 +325,12 @@ func (c *Client) shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptio
 }
 
 func (c *Client) encryptExpandedFiles(recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
-	maxSize := opt.MaxPayloadSize
-	if maxSize <= 0 {
-		maxSize = DefaultMaxPayloadSize
-	}
-	if _, err := preflightExpandedSize(expanded, maxSize); err != nil {
+	if _, err := preflightExpandedSize(expanded, maxPayloadSize(opt)); err != nil {
 		return nil, err
 	}
 
-	var files []payload.FileEntry
+	var srcs []payload.FileSource
+	seen := make(map[string]bool, len(expanded))
 	for _, ef := range expanded {
 		// Skip directory entries: they have no byte content; the flat
 		// payload preserves tree structure implicitly via each file's
@@ -379,102 +341,217 @@ func (c *Client) encryptExpandedFiles(recipients []string, expanded []archive.Ex
 		if ef.IsDir || ef.IsSymlink {
 			continue
 		}
-		content, err := os.ReadFile(ef.FullPath)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", ef.FullPath, err)
-		}
-		h := sha256.Sum256(content)
 		info, err := os.Stat(ef.FullPath)
 		if err != nil {
 			return nil, fmt.Errorf("stat %s: %w", ef.FullPath, err)
 		}
-		files = append(files, payload.FileEntry{
-			Name:   ef.RelPath,
-			Data:   content,
-			Size:   info.Size(),
-			SHA256: hex.EncodeToString(h[:]),
-			Mode:   info.Mode(),
-		})
+		if seen[ef.RelPath] {
+			return nil, fmt.Errorf("two files would be named %q: a secret's files need distinct names", ef.RelPath)
+		}
+		seen[ef.RelPath] = true
+		srcs = append(srcs, fileSource(ef.RelPath, ef.FullPath, info))
 	}
-
-	p := payload.Payload{Type: "files", Files: files}
-	data, err := payload.Marshal(p)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
-	}
-	return c.encryptAndSend(recipients, data, "files", files, false, opt)
+	return c.encryptAndSend(recipients, filesPlaintext(srcs), opt)
 }
 
+// encryptArchive sends the files as one tar archive. The tar inside the
+// payload is uncompressed, so its exact length is known before any file is
+// read (archive.TarSize), and the whole payload is zstd-compressed as it
+// streams.
 func (c *Client) encryptArchive(recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
-	algo := opt.Compress
-	if algo == "" {
-		algo = compress.Zstd
-	}
-
-	// Calculate original uncompressed total size from source files. Use
-	// Lstat so dangling symlinks don't fail; skip non-regular entries
-	// (dirs, symlinks); only file content contributes to the budget.
-	var originalFilesSize int64
-	for _, f := range expanded {
-		if f.IsDir || f.IsSymlink {
-			continue
-		}
-		info, err := os.Lstat(f.FullPath)
-		if err == nil && info.Mode().IsRegular() {
-			originalFilesSize += info.Size()
-		}
-	}
-
-	archiveData, err := archive.CreateTar(expanded, algo)
-	if err != nil {
-		return nil, fmt.Errorf("create archive: %w", err)
-	}
-
-	archiveName := "archive.tar"
-	switch algo {
-	case compress.Zstd:
-		archiveName = "archive.tar.zst"
-	}
-
-	h := sha256.Sum256(archiveData)
-	archiveFile := payload.FileEntry{
-		Name:   archiveName,
-		Data:   archiveData,
-		Size:   int64(len(archiveData)),
-		SHA256: hex.EncodeToString(h[:]),
-	}
-
-	p := payload.Payload{
-		Type:               "files",
-		Files:              []payload.FileEntry{archiveFile},
-		Archive:            true,
-		ArchiveCompression: string(algo),
-	}
-	data, err := payload.Marshal(p)
-	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
-	}
-
-	// Pass archive sizes to encryptAndSend for accurate server metadata
-	opt.archiveOriginalSize = originalFilesSize
-	opt.archiveCompressedSize = int64(len(archiveData))
-
-	result, err := c.encryptAndSend(recipients, data, "files", nil, true, opt)
+	originalSize, err := preflightExpandedSize(expanded, maxPayloadSize(opt))
 	if err != nil {
 		return nil, err
 	}
-	result.Archived = true
-	result.ArchiveEntryCount = len(expanded)
-	result.FilesCount = 0
-
-	// Override result with correct archive compression metrics
-	if originalFilesSize > 0 {
-		result.OriginalSize = originalFilesSize
-		result.CompressionRatio = float64(len(archiveData)) / float64(originalFilesSize) * 100
+	tarSize, err := archive.TarSize(expanded)
+	if err != nil {
+		return nil, fmt.Errorf("create archive: %w", err)
 	}
-
-	return result, nil
+	tarFile := payload.FileSource{Name: "archive.tar", Size: tarSize, Open: func() (io.ReadCloser, error) {
+		pr, pw := io.Pipe()
+		go func() { pw.CloseWithError(archive.WriteTar(pw, expanded, compress.None)) }()
+		return pr, nil
+	}}
+	p := &plaintext{
+		payloadType:    "files",
+		size:           tarSize + 512,
+		archived:       true,
+		archiveEntries: len(expanded),
+		originalSize:   originalSize,
+	}
+	p.write = func(w io.Writer) error {
+		_, err := payload.EncodeFiles(w, []payload.FileSource{tarFile}, true, "")
+		return err
+	}
+	return c.encryptAndSend(recipients, p, opt)
 }
+
+// plaintext is what a send seals: a payload written as a stream, and what
+// the create call says about it.
+type plaintext struct {
+	payloadType string
+	size        int64 // the bytes write produces before compression, or a close estimate
+	write       func(w io.Writer) error
+
+	// files are listed in files_meta. For streamed files they are set when
+	// write completes, since their SHA-256 is computed as they stream. An
+	// archive lists none.
+	files []secrets.FileMetaEntry
+
+	archived       bool
+	archiveEntries int
+	originalSize   int64 // an archive's files, before tar and compression
+
+	// inMemory payloads are sealed in memory: they are already there,
+	// and need no disk.
+	inMemory bool
+}
+
+// memPlaintext is an encoded payload already in memory.
+func memPlaintext(payloadType string, data []byte, files []secrets.FileMetaEntry) *plaintext {
+	return &plaintext{payloadType: payloadType, size: int64(len(data)), files: files, inMemory: true,
+		write: func(w io.Writer) error {
+			_, err := w.Write(data)
+			return err
+		}}
+}
+
+// filesPlaintext streams files into a files payload.
+func filesPlaintext(srcs []payload.FileSource) *plaintext {
+	p := &plaintext{payloadType: "files", size: 64}
+	for _, s := range srcs {
+		p.size += s.Size + int64(len(s.Name)) + 128
+	}
+	p.write = func(w io.Writer) error {
+		sums, err := payload.EncodeFiles(w, srcs, false, "")
+		if err != nil {
+			return err
+		}
+		p.files = make([]secrets.FileMetaEntry, len(srcs))
+		for i, s := range srcs {
+			p.files[i] = secrets.FileMetaEntry{Name: s.Name, Size: s.Size, SHA256: sums[i]}
+		}
+		return nil
+	}
+	return p
+}
+
+// fileSource reads the file at path, named name in the payload. info is
+// the file's stat: the send fails if the file's size changes before it is
+// read.
+func fileSource(name, path string, info os.FileInfo) payload.FileSource {
+	return payload.FileSource{Name: name, Size: info.Size(), Mode: info.Mode(),
+		Open: func() (io.ReadCloser, error) { return os.Open(path) }}
+}
+
+func maxPayloadSize(opt EncryptOptions) int64 {
+	if opt.MaxPayloadSize > 0 {
+		return opt.MaxPayloadSize
+	}
+	return DefaultMaxPayloadSize
+}
+
+// compressionSample is how much of a plaintext decides whether compressing
+// it is worth it: it is, when the sample shrinks by at least 5%.
+const compressionSample = 8 << 20
+
+var errSampleFull = errors.New("compression sample is full")
+
+// worthCompressing compresses the first compressionSample bytes of p and
+// reports whether they shrink by at least 5%. Payloads smaller than the
+// sample are decided on all of their bytes.
+func worthCompressing(p *plaintext, algo compress.Algorithm) (bool, error) {
+	sample := &sampleWriter{max: compressionSample}
+	if err := p.write(sample); err != nil && !errors.Is(err, errSampleFull) {
+		return false, err
+	}
+	if len(sample.buf) == 0 {
+		return false, nil
+	}
+	n, err := compress.CompressedSize(sample.buf, algo)
+	if err != nil {
+		return false, nil
+	}
+	return n <= int64(len(sample.buf))*95/100, nil
+}
+
+// sampleWriter keeps the first max bytes written to it, then refuses more.
+type sampleWriter struct {
+	buf []byte
+	max int
+}
+
+func (s *sampleWriter) Write(p []byte) (int, error) {
+	room := s.max - len(s.buf)
+	if len(p) <= room {
+		s.buf = append(s.buf, p...)
+		return len(p), nil
+	}
+	s.buf = append(s.buf, p[:room]...)
+	return room, errSampleFull
+}
+
+// countingWriter counts what passes through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// sealPlaintext writes p, compressed with algo unless it is None, through
+// crypto.Seal into dst. It returns the sealed manifest and wraps, and how
+// many bytes p wrote before compression. It stops when ctx is done.
+func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compress.Algorithm, sender *crypto.KeyPair, pubs []*crypto.PublicKeys, params crypto.SealParams) (*crypto.Sealed, int64, error) {
+	pr, pw := io.Pipe()
+	var written int64
+	done := make(chan error, 1)
+	go func() {
+		err := func() error {
+			var zw io.WriteCloser = nopCloser{pw}
+			if algo != compress.None {
+				w, err := compress.NewCompressWriterFor(pw, algo, p.size)
+				if err != nil {
+					return err
+				}
+				zw = w
+			}
+			cw := &countingWriter{w: zw}
+			if err := p.write(cw); err != nil {
+				zw.Close()
+				return err
+			}
+			written = cw.n
+			return zw.Close()
+		}()
+		pw.CloseWithError(err)
+		done <- err
+	}()
+
+	bw := bufio.NewWriterSize(dst, 1<<20)
+	sealed, sealErr := crypto.Seal(bw, ctxReader{ctx, pr}, sender, pubs, params)
+	// Unblocks the writer when Seal stopped early.
+	pr.Close()
+	writeErr := <-done
+	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return nil, 0, writeErr
+	}
+	if sealErr != nil {
+		return nil, 0, sealErr
+	}
+	if err := bw.Flush(); err != nil {
+		return nil, 0, fmt.Errorf("write payload: %w", err)
+	}
+	return sealed, written, nil
+}
+
+type nopCloser struct{ io.Writer }
+
+func (nopCloser) Close() error { return nil }
 
 // ValidateRecipients checks a send's recipient list before any network
 // call: 1 to MaxRecipientsPerSend plausible emails, none listed twice
@@ -505,8 +582,10 @@ func ValidateRecipients(emails []string) error {
 }
 
 // encryptAndSend seals the plaintext once for every recipient (protocol
-// v4) and sends it in one create call, one upload and one confirm.
-func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadType string, files []payload.FileEntry, archived bool, opt EncryptOptions) (*EncryptResult, error) {
+// v4) and sends it in one create call, one upload and one confirm. The
+// ciphertext goes to a private temporary file, and the upload reads it from
+// there.
+func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOptions) (*EncryptResult, error) {
 	debugf := func(step, format string, args ...any) {
 		if opt.OnDebug == nil {
 			return
@@ -518,25 +597,19 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 	if err := ValidateRecipients(recipients); err != nil {
 		return nil, err
 	}
-	if len(plaintext) == 0 {
+	if p.size == 0 {
 		return nil, fmt.Errorf("payload is empty")
 	}
-	debugf("encrypt", "payload type=%s", payloadType)
-	debugf("encrypt", "plaintext size=%s", humanBytes(int64(len(plaintext))))
-	if archived {
+	debugf("encrypt", "payload type=%s", p.payloadType)
+	debugf("encrypt", "plaintext size=%s", humanBytes(p.size))
+	if p.archived {
 		debugf("encrypt", "archived=true")
-	} else if len(files) > 0 {
-		debugf("encrypt", "files=%d", len(files))
 	}
 
 	// Enforce payload size limit before expensive operations
-	maxSize := opt.MaxPayloadSize
-	if maxSize <= 0 {
-		maxSize = DefaultMaxPayloadSize
-	}
-	if int64(len(plaintext)) > maxSize {
+	if maxSize := maxPayloadSize(opt); p.size > maxSize {
 		return nil, fmt.Errorf("payload size %d exceeds limit %d bytes: reduce input size or increase MaxPayloadSize",
-			len(plaintext), maxSize)
+			p.size, maxSize)
 	}
 
 	// Resolve actor info (always needed for org_id; also used for tier validation)
@@ -605,54 +678,46 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 	}
 	debugf("verify", "recipient public keys resolved from server (%d)", len(recipients))
 
-	// Optionally compress plaintext.
-	//
-	// When `archived` is true the plaintext already wraps a tar.zst blob
-	// (compression done inside encryptArchive). A second outer zstd pass
-	// over already-compressed bytes saves single-digit KiB at best while
-	// burning CPU and adding a redundant frame header, so skip it. The
-	// archive's own compression metrics are reported by encryptArchive
-	// and overridden onto the result there.
-	compressed := false
-	compressionLabel := ""
-	originalSize := int64(len(plaintext))
-	compressionRatio := 0.0
+	// Compression. An archive is always zstd-compressed: the tar inside it
+	// is not. Other payloads are compressed when asked to and when a sample
+	// of them shrinks by at least 5%.
+	algo := compress.None
 	switch {
-	case archived:
-		debugf("compress", "skipped (payload is already a tar.zst archive)")
+	case p.archived:
+		algo = compress.Zstd
+		debugf("compress", "algorithm=zstd (archive)")
 	case opt.Compress != "" && opt.Compress != compress.None:
-		debugf("compress", "algorithm=%s", opt.Compress)
-		debugf("compress", "input=%s", humanBytes(int64(len(plaintext))))
-		tCmp := time.Now()
-		zcompressed, cerr := compress.Compress(plaintext, opt.Compress)
-		cmpElapsed := time.Since(tCmp)
-		if cerr == nil && len(zcompressed) < len(plaintext) {
-			compressionRatio = float64(len(zcompressed)) / float64(len(plaintext)) * 100
-			plaintext = zcompressed
-			compressed = true
-			compressionLabel = string(opt.Compress)
-			debugf("compress", "output=%s", humanBytes(int64(len(plaintext))))
-			debugf("compress", "ratio=%.1f%%", compressionRatio)
-			debugf("compress", "saved=%s", humanBytes(originalSize-int64(len(plaintext))))
-			debugf("compress", "elapsed=%s", cmpElapsed.Round(time.Millisecond))
-			debugf("compress", "rate=%s", formatRate(originalSize, cmpElapsed))
-		} else if cerr != nil {
-			debugf("compress", "skipped: %v", cerr)
+		worth, err := worthCompressing(p, opt.Compress)
+		if err != nil {
+			return nil, fmt.Errorf("read payload: %w", err)
+		}
+		if worth {
+			algo = opt.Compress
+			debugf("compress", "algorithm=%s", algo)
 		} else {
-			debugf("compress", "skipped (compressed size >= original)")
+			debugf("compress", "skipped (a sample does not shrink by 5%%)")
 		}
 	}
 
 	// Seal once: one payload, a fresh content key, a wrap per recipient and
 	// the signed manifest. The revision id is bound into all of them, so it
 	// is chosen here, before the create call.
+	sp := newMemSpool(0)
+	if !p.inMemory {
+		if sp, err = newSpool(opt.TempDir, spoolNeed(p.size)); err != nil {
+			return nil, err
+		}
+		debugf("encrypt", "temporary ciphertext=%s", sp.dir)
+	}
+	defer sp.Close()
+
 	revisionID := uuid.New().String()
 	tEnc := time.Now()
-	payloadData, sealed, err := crypto.SealBytes(plaintext, kp, pubs, crypto.SealParams{
+	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
 		RevisionID:  revisionID,
-		PayloadType: payloadType,
-		Compressed:  compressed,
-		Compression: compressionLabel,
+		PayloadType: p.payloadType,
+		Compressed:  algo != compress.None,
+		Compression: string(algo),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
@@ -660,11 +725,16 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 	encElapsed := time.Since(tEnc)
 	m := sealed.Manifest
 	digestHex := hex.EncodeToString(m.PayloadDigest)
-	debugf("encrypt", "input=%s", humanBytes(int64(len(plaintext))))
-	debugf("encrypt", "payload=%s", humanBytes(int64(len(payloadData))))
+	compressionRatio := 0.0
+	if algo != compress.None && written > 0 {
+		compressionRatio = float64(m.PlaintextSize) / float64(written) * 100
+		debugf("compress", "ratio=%.1f%%", compressionRatio)
+	}
+	debugf("encrypt", "input=%s", humanBytes(written))
+	debugf("encrypt", "payload=%s", humanBytes(m.CiphertextSize))
 	debugf("encrypt", "manifest=%s", humanBytes(int64(len(sealed.ManifestData))))
 	debugf("encrypt", "elapsed=%s", encElapsed.Round(time.Millisecond))
-	debugf("encrypt", "rate=%s", formatRate(int64(len(plaintext)), encElapsed))
+	debugf("encrypt", "rate=%s", formatRate(written, encElapsed))
 	debugf("verify", "content key=fresh per revision, wrapped for %d recipient%s", len(sealed.Wraps), pluralSuffix(len(sealed.Wraps)))
 	debugf("verify", "key encapsulation=HPKE (X25519 + ML-KEM-768), fresh context per wrap")
 	debugf("verify", "payload cipher=AES-256-GCM in 1 MiB chunks (AEAD)")
@@ -705,42 +775,37 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 		Name:            name,
 		RevisionID:      m.RevisionID,
 		ChecksumSHA256:  digestHex,
-		FilesCount:      len(files),
+		FilesCount:      len(p.files),
 		Size:            m.CiphertextSize,
 		Etag:            digestHex[:16],
 		KDF:             crypto.KDF,
 		ProtocolVersion: m.Version,
 		CipherSuite:     m.CipherSuite,
-		PayloadType:     payloadType,
+		PayloadType:     p.payloadType,
 		KeyFingerprint:  m.SenderFingerprint,
 		Manifest:        sealed.ManifestData,
 		Recipients:      inputs,
 		RevokeMissing:   opt.RevokeMissing,
+		FilesMeta:       p.files,
 	}
 
-	if len(files) > 0 {
-		for _, f := range files {
-			req.FilesMeta = append(req.FilesMeta, secrets.FileMetaEntry{
-				Name: f.Name, Size: f.Size, SHA256: f.SHA256,
-			})
+	compressionLabel := ""
+	originalSize := written
+	switch {
+	case p.archived:
+		compressionLabel = "tar+zstd"
+		originalSize = p.originalSize
+		if originalSize > 0 {
+			compressionRatio = float64(m.PlaintextSize) / float64(originalSize) * 100
 		}
+	case algo != compress.None:
+		compressionLabel = string(algo)
 	}
-
-	if compressed {
+	if compressionLabel != "" {
 		req.Compressed = true
 		req.Compression = compressionLabel
 		req.CompressionRatio = compressionRatio
 		req.OriginalSize = originalSize
-	}
-
-	// For archives, set accurate compression metadata from encryptArchive.
-	if archived {
-		req.Compressed = true
-		req.Compression = "tar+zstd"
-		if opt.archiveOriginalSize > 0 {
-			req.OriginalSize = opt.archiveOriginalSize
-			req.CompressionRatio = float64(opt.archiveCompressedSize) / float64(opt.archiveOriginalSize) * 100
-		}
 	}
 
 	if opt.TTL != "" {
@@ -758,7 +823,7 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 	debugf("create", "name=%q", sanitizeForLog(req.Name))
 	debugf("create", "recipients=%d", len(req.Recipients))
 	debugf("create", "payload size=%s", humanBytes(req.Size))
-	if archived {
+	if p.archived {
 		debugf("create", "files=archived")
 	} else {
 		debugf("create", "files=%d", req.FilesCount)
@@ -795,26 +860,20 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 	// The server decides which transport flow applies based on the revision's
 	// declared Size at create time. When secret.IsMultipart is true, the
 	// single-PUT presign endpoint is rejected with 409, so we MUST go through
-	// the /multipart/* endpoints. The high-level MultipartUpload helper does
-	// init + parallel-PUT-with-retry + register + complete, and is resumable
-	// (on retry it queries /multipart/status and skips already-uploaded parts
-	// whose SHA256 matches the local data).
+	// the /multipart/* endpoints. Both read the ciphertext from the
+	// temporary file.
+	size := m.CiphertextSize
 	if secret.IsMultipart {
-		expectedParts := int64(len(payloadData)) / secret.MultipartPartSize
-		if int64(len(payloadData))%secret.MultipartPartSize != 0 {
+		expectedParts := size / secret.MultipartPartSize
+		if size%secret.MultipartPartSize != 0 {
 			expectedParts++
 		}
-		// The server flips IsMultipart when the declared revision Size is
-		// at or above its MultipartThresholdBytes config (default 10 MiB).
-		// We don't get the exact threshold back, but we know it's the
-		// reason the server picked this path; surface that explicitly so
-		// the user understands "why multipart".
 		debugf("upload", "mode=multipart")
-		debugf("upload", "payload=%s", humanBytes(int64(len(payloadData))))
+		debugf("upload", "payload=%s", humanBytes(size))
 		debugf("upload", "parts=%d", expectedParts)
 		debugf("upload", "part_size=%s", humanBytes(secret.MultipartPartSize))
 		tUp := time.Now()
-		if err := c.api.MultipartUploadOpts(revisionID, payloadData, api.MultipartUploadOptions{
+		if err := c.api.MultipartUploadOpts(revisionID, sp, size, api.MultipartUploadOptions{
 			Threads:    opt.UploadThreads,
 			OnProgress: opt.OnUploadProgress,
 			OnDebug:    opt.OnDebug,
@@ -823,24 +882,18 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 		}
 		upElapsed := time.Since(tUp)
 		debugf("upload", "elapsed=%s", upElapsed.Round(time.Millisecond))
-		debugf("upload", "rate=%s", formatRate(int64(len(payloadData)), upElapsed))
+		debugf("upload", "rate=%s", formatRate(size, upElapsed))
 		debugf("verify", "server completed multipart upload (HEAD-verified size)")
 	} else {
 		debugf("upload", "mode=single-PUT")
-		debugf("upload", "payload=%s", humanBytes(int64(len(payloadData))))
+		debugf("upload", "payload=%s", humanBytes(size))
 		tUp := time.Now()
-		if opt.OnUploadProgress != nil {
-			if err := c.api.PresignUploadWithProgress(actorInfo.OrgID, revisionID, payloadData, opt.OnUploadProgress, opt.PresignExpiryMinutes); err != nil {
-				return nil, fmt.Errorf("upload: %w", err)
-			}
-		} else {
-			if err := c.api.PresignUpload(actorInfo.OrgID, revisionID, payloadData, opt.PresignExpiryMinutes); err != nil {
-				return nil, fmt.Errorf("upload: %w", err)
-			}
+		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes); err != nil {
+			return nil, fmt.Errorf("upload: %w", err)
 		}
 		upElapsed := time.Since(tUp)
 		debugf("upload", "elapsed=%s", upElapsed.Round(time.Millisecond))
-		debugf("upload", "rate=%s", formatRate(int64(len(payloadData)), upElapsed))
+		debugf("upload", "rate=%s", formatRate(size, upElapsed))
 
 		// Confirm the upload so the backend HEAD-verifies size/etag and marks
 		// the revision downloadable. Without this, downloads fall back to
@@ -852,25 +905,24 @@ func (c *Client) encryptAndSend(recipients []string, plaintext []byte, payloadTy
 		debugf("verify", "server confirmed upload (HEAD-verified size and etag)")
 	}
 
-	serverCompression := compressionLabel
-	if archived {
-		serverCompression = "tar+zstd"
-	}
-
-	return &EncryptResult{
+	result := &EncryptResult{
 		Secret:            *secret,
-		EncryptedSize:     int64(len(payloadData)),
+		EncryptedSize:     size,
 		SenderFingerprint: senderFP,
 		Recipients:        sentTo,
 		Revoked:           revoked,
-		Compressed:        compressed || archived,
-		Compression:       serverCompression,
+		Compressed:        compressionLabel != "",
+		Compression:       compressionLabel,
 		CompressionRatio:  compressionRatio,
 		OriginalSize:      originalSize,
-		PayloadType:       payloadType,
-		FilesCount:        len(files),
-		Archived:          archived,
-	}, nil
+		PayloadType:       p.payloadType,
+		FilesCount:        len(p.files),
+		Archived:          p.archived,
+	}
+	if p.archived {
+		result.ArchiveEntryCount = p.archiveEntries
+	}
+	return result, nil
 }
 
 // pluralSuffix returns "s" when n != 1.

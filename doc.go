@@ -35,16 +35,23 @@
 //
 // # Memory Model
 //
-// The protocol streams in 1 MiB chunks, but the high-level methods build
-// the payload in memory:
+// Files stream, so memory stays flat at any size, up to 100 GiB a secret:
 //
-//   - File data is loaded into the CBOR payload (in memory)
-//   - The payload is optionally compressed (in memory)
-//   - The payload is sealed once, chunk by chunk, into an in-memory object
-//   - The object is uploaded to storage
+//   - Each file is read once, encoded into the CBOR payload, compressed and
+//     sealed chunk by chunk into a private temporary file that holds only
+//     ciphertext
+//   - The object is uploaded from that file, in parts above the server's
+//     multipart threshold
 //
-// On decrypt the downloaded object is buffered so its digest can be checked
-// against the signed manifest before any plaintext is released.
+// On decrypt the object is downloaded into a temporary file, so its digest
+// can be checked against the signed manifest before any plaintext is
+// released. WriteFiles (and DecryptToDir) then decrypt it once to check
+// every file and again to write them. Both sides need free disk space for
+// the encrypted payload, in EncryptOptions.TempDir or DecryptOptions.TempDir,
+// else $DEEPSECRET_TMPDIR, else the system temp directory.
+//
+// Messages and key-value data are small and are handled in memory, as is
+// DecryptSecretFull for payloads up to DefaultMaxInMemorySize.
 //
 // # Quick Start
 //
@@ -57,6 +64,10 @@
 //	// Decrypt a secret (as one of its recipients)
 //	result, _ := client.DecryptSecret(res.Secret.ID)
 //	fmt.Println(result.Message)
+//
+//	// Write a files secret of any size to disk
+//	_, written, _ := client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+//	fmt.Println(len(written.Files), "files")
 //
 // # Secret Management
 //

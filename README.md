@@ -55,7 +55,7 @@ client.RevokeRecipient(res.Secret.ID, "bob@example.com")
 sdk.EncryptOptions{
     Name:       "report-q4",
     Compress:   sdk.CompressZstd,  // zstd or none
-    Archive:    true,              // bundle as tar.zst (hides file metadata)
+    Archive:    true,              // bundle as one tar archive, zstd-compressed (hides file metadata)
     SkipHidden: true,
     TTL:        "7d",              // "30m", "24h", "7d"
     IPs:        []string{"10.0.0.0/8"},
@@ -67,11 +67,35 @@ sdk.EncryptOptions{
 
 ## Memory Model
 
-Protocol v4 encrypts in 1 MiB chunks, and `crypto.Seal` / `Opened.DecryptTo`
-stream. The high-level `Encrypt*` functions still build the payload in memory,
-and decrypt buffers the downloaded object so its digest is checked against the
-signed manifest before any plaintext is released. For very large payloads,
-consider file-size limits.
+Files stream, so memory stays flat at any size, up to 100 GiB a secret.
+
+- **Send.** `EncryptFile`, `EncryptFiles`, `EncryptDir` and `EncryptPaths` read
+  each file once, encode, compress and seal it chunk by chunk into a private
+  temporary file holding only ciphertext, then upload from that file.
+- **Receive.** `OpenSecret` downloads the ciphertext into a temporary file.
+  `WriteFiles` (or `DecryptToDir`) checks it against the signed manifest,
+  decrypts it once to check every file name, size and SHA-256 and an archive's
+  entries, then decrypts it again to write. A payload that fails a check
+  writes nothing.
+- **Disk.** Both sides need free space for the encrypted payload: set
+  `TempDir` in the options or `DEEPSECRET_TMPDIR`, else the system temp
+  directory is used. A send checks before it reads anything.
+- **In memory.** `EncryptText`, `EncryptData` and `EncryptBytes`, and
+  `DecryptSecretFull` for payloads up to `DefaultMaxInMemorySize` (256 MiB).
+
+```go
+// Write a files secret of any size to disk
+result, written, err := client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+
+// Or open first, then choose where it goes
+opened, err := client.OpenSecret(secretID, sdk.DecryptOptions{})
+defer opened.Close()
+if opened.Result.PayloadType == "files" {
+    written, err = opened.WriteFiles("./out", sdk.WriteOptions{Overwrite: false})
+} else {
+    decrypted, err := opened.Payload() // a message or key-value data
+}
+```
 
 ## Packages
 

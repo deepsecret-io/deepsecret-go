@@ -1466,6 +1466,8 @@ func TestExtractTar_RoundTripsXattrs(t *testing.T) {
 	}
 }
 
+// Extraction strips setuid by default, so an archive cannot plant a setuid
+// file, and keeps it with KeepSpecialModes.
 func TestExtractTar_RoundTripsSetuidBit(t *testing.T) {
 	tmpSrc := t.TempDir()
 	srcFile := filepath.Join(tmpSrc, "setuid.bin")
@@ -1496,10 +1498,18 @@ func TestExtractTar_RoundTripsSetuidBit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode()&os.ModeSetuid == 0 {
-		t.Errorf("setuid bit not preserved: mode = %s", info.Mode())
+	if info.Mode()&os.ModeSetuid != 0 {
+		t.Errorf("setuid bit kept by default: mode = %s", info.Mode())
 	}
 	if info.Mode().Perm() != 0o755 {
 		t.Errorf("perm bits = %o, want 0755", info.Mode().Perm())
+	}
+
+	kept := t.TempDir()
+	if _, err := ExtractTar(buf.Bytes(), kept, compress.None, &Limits{KeepSpecialModes: true}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(kept, "setuid.bin")); err != nil || info.Mode()&os.ModeSetuid == 0 {
+		t.Errorf("setuid bit not kept with KeepSpecialModes: %v, %v", info, err)
 	}
 }

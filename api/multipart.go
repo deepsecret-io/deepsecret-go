@@ -41,6 +41,12 @@ const (
 	// retried before the upload as a whole fails. Each retry uses fresh
 	// presigned URLs (the previous one may be stale or sign-mismatched).
 	multipartPartMaxRetries = 4
+
+	// maxPartBuffer is the largest part size the client buffers; a server
+	// asking for more is refused. maxUploadBuffers bounds all workers'
+	// buffers together, so fewer workers run when parts are large.
+	maxPartBuffer    = int64(512 << 20)
+	maxUploadBuffers = int64(1 << 30)
 )
 
 // ── Wire types ──────────────────────────────────────────────────────────────
@@ -214,7 +220,7 @@ func humanBytesLocal(b int64) string {
 // before recording the part, so a compromised or malicious client cannot
 // register an ETag that wasn't actually written.
 func (c *Client) MultipartUpload(revisionID string, data []byte, onProgress func(int64, int64)) error {
-	return c.MultipartUploadOpts(revisionID, data, MultipartUploadOptions{OnProgress: onProgress})
+	return c.MultipartUploadOpts(revisionID, bytes.NewReader(data), int64(len(data)), MultipartUploadOptions{OnProgress: onProgress})
 }
 
 // MultipartUploadOptions configures the multipart-upload helper.
@@ -231,15 +237,17 @@ type MultipartUploadOptions struct {
 // MultipartUploadWithDebug is the legacy callback-style entry. New callers
 // should prefer MultipartUploadOpts so they can also set Threads.
 func (c *Client) MultipartUploadWithDebug(revisionID string, data []byte, onProgress func(int64, int64), onDebug func(step, message string)) error {
-	return c.MultipartUploadOpts(revisionID, data, MultipartUploadOptions{OnProgress: onProgress, OnDebug: onDebug})
+	return c.MultipartUploadOpts(revisionID, bytes.NewReader(data), int64(len(data)), MultipartUploadOptions{OnProgress: onProgress, OnDebug: onDebug})
 }
 
-// MultipartUploadOpts uploads data via the multipart flow with explicit
-// concurrency, progress, and debug controls.
-func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts MultipartUploadOptions) error {
+// MultipartUploadOpts uploads the size bytes of src via the multipart flow
+// with explicit concurrency, progress, and debug controls. src is read
+// once to hash every part, then each part again as it is sent, so it can
+// be a file of any size: memory is one part-sized buffer per worker.
+func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSize int64, opts MultipartUploadOptions) error {
 	onProgress := opts.OnProgress
 	onDebug := opts.OnDebug
-	if len(data) == 0 {
+	if totalSize <= 0 {
 		return fmt.Errorf("multipart upload: empty data")
 	}
 
@@ -265,8 +273,11 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 	if init.PartSize < S3MinPartSize || init.PartSize > S3MaxPartSize {
 		return fmt.Errorf("multipart upload: server returned invalid part size %d", init.PartSize)
 	}
+	if init.PartSize > maxPartBuffer {
+		return fmt.Errorf("multipart upload: server part size %d is over the client's %d-byte buffer limit", init.PartSize, maxPartBuffer)
+	}
+	bufSize := min(init.PartSize, totalSize)
 
-	totalSize := int64(len(data))
 	expectedParts := int(totalSize / init.PartSize)
 	if totalSize%init.PartSize != 0 {
 		expectedParts++
@@ -284,21 +295,28 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 		return fmt.Errorf("multipart upload: %d parts exceeds S3 limit of %d", expectedParts, S3MaxParts)
 	}
 
-	// Pre-compute every part's slice + SHA256. Done up front so resume
-	// validation and parallel upload share the same authoritative table.
+	// Pre-compute every part's range, SHA256 and MD5 in one read of src.
+	// Done up front so resume validation and parallel upload share the
+	// same authoritative table.
 	parts := make([]multipartLocalPart, expectedParts)
-	for i := 0; i < expectedParts; i++ {
-		start := int64(i) * init.PartSize
-		end := start + init.PartSize
-		if end > totalSize {
-			end = totalSize
-		}
-		chunk := data[start:end]
-		h := sha256.Sum256(chunk)
-		parts[i] = multipartLocalPart{
-			Number: i + 1,
-			Data:   chunk,
-			SHA256: hex.EncodeToString(h[:]),
+	{
+		buf := make([]byte, bufSize)
+		for i := 0; i < expectedParts; i++ {
+			start := int64(i) * init.PartSize
+			size := min(init.PartSize, totalSize-start)
+			chunk := buf[:size]
+			if err := readFull(src, chunk, start); err != nil {
+				return fmt.Errorf("multipart upload: read part %d: %w", i+1, err)
+			}
+			sha := sha256.Sum256(chunk)
+			md := md5.Sum(chunk)
+			parts[i] = multipartLocalPart{
+				Number:     i + 1,
+				Offset:     start,
+				Size:       size,
+				SHA256:     hex.EncodeToString(sha[:]),
+				ContentMD5: base64.StdEncoding.EncodeToString(md[:]),
+			}
 		}
 	}
 
@@ -348,10 +366,10 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 	for i := range parts {
 		p := parts[i]
 		reg, ok := registered[p.Number]
-		if ok && reg.SHA256 == p.SHA256 && reg.Size == int64(len(p.Data)) {
+		if ok && reg.SHA256 == p.SHA256 && reg.Size == p.Size {
 			completedCh <- completedPart{Number: p.Number, Etag: reg.Etag}
 			skipped++
-			skippedBytes += int64(len(p.Data))
+			skippedBytes += p.Size
 			continue
 		}
 		work = append(work, i)
@@ -391,12 +409,14 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 		if concurrency > len(work) {
 			concurrency = len(work)
 		}
+		concurrency = max(1, min(concurrency, int(maxUploadBuffers/bufSize)))
 		debugf("multipart.upload", "starting %d worker(s), %d part(s) to upload", concurrency, len(work))
 		ctx := c.reqCtx()
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
+				buf := make([]byte, bufSize)
 				for idx := range workCh {
 					// Drain the channel quickly when the user hits Ctrl+C
 					// so we don't keep starting new HTTP attempts after
@@ -431,7 +451,15 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 						mu.Unlock()
 						onProgress(t, totalSize)
 					}
-					etag, putErr := c.uploadPartWithRetry(revisionID, p, chunkCb)
+					data := buf[:p.Size]
+					if err := readFull(src, data, p.Offset); err != nil {
+						select {
+						case errCh <- fmt.Errorf("read part %d: %w", p.Number, err):
+						default:
+						}
+						return
+					}
+					etag, putErr := c.uploadPartWithRetry(revisionID, p, data, chunkCb)
 					if putErr != nil {
 						debugf("multipart.upload", "worker=%d part=%d FAILED err=%v", workerID, p.Number, putErr)
 						select {
@@ -440,7 +468,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 						}
 						return
 					}
-					if regErr := c.registerPartWithRetry(revisionID, p.Number, etag, int64(len(p.Data)), p.SHA256); regErr != nil {
+					if regErr := c.registerPartWithRetry(revisionID, p.Number, etag, p.Size, p.SHA256); regErr != nil {
 						debugf("multipart.upload", "worker=%d part=%d register FAILED err=%v", workerID, p.Number, regErr)
 						select {
 						case errCh <- regErr:
@@ -454,7 +482,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 						etagShort = etagShort[:12]
 					}
 					debugf("multipart.upload", "part %d/%d uploaded — size=%s etag=%s in %s (worker=%d)",
-						p.Number, len(parts), humanBytesLocal(int64(len(p.Data))), etagShort,
+						p.Number, len(parts), humanBytesLocal(p.Size), etagShort,
 						elapsed.Round(time.Millisecond), workerID)
 					completedCh <- completedPart{Number: p.Number, Etag: etag}
 				}
@@ -486,12 +514,27 @@ func (c *Client) MultipartUploadOpts(revisionID string, data []byte, opts Multip
 	return nil
 }
 
-// multipartLocalPart pairs a part's payload bytes with metadata used for both
-// resume-validation and upload.
+// readFull fills p from src at off. A short read is an error, even when it
+// ends at EOF: the source is shorter than the declared size.
+func readFull(src io.ReaderAt, p []byte, off int64) error {
+	n, err := src.ReadAt(p, off)
+	if n == len(p) {
+		return nil
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+// multipartLocalPart is one part's range of the source with the hashes
+// used for both resume-validation and upload.
 type multipartLocalPart struct {
-	Number int
-	Data   []byte
-	SHA256 string
+	Number     int
+	Offset     int64
+	Size       int64
+	SHA256     string
+	ContentMD5 string // base64, sent as Content-MD5
 }
 
 // uploadPartWithRetry PUTs one part to a freshly-presigned URL, retrying on
@@ -503,10 +546,7 @@ type multipartLocalPart struct {
 // Non-retryable errors (4xx other than 429) are surfaced immediately.
 //
 // Returns the unquoted ETag from S3 on success.
-func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, onChunk func(int)) (string, error) {
-	md5Sum := md5.Sum(p.Data)
-	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
-
+func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, data []byte, onChunk func(int)) (string, error) {
 	ctx := c.reqCtx()
 	var lastErr error
 	for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
@@ -537,7 +577,7 @@ func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, on
 				onChunk(n)
 			}
 		}
-		etag, err := c.putPart(urlResp.URL, p.Data, contentMD5, attemptCb)
+		etag, err := c.putPart(urlResp.URL, data, p.ContentMD5, attemptCb)
 		if err != nil {
 			if onChunk != nil && attemptBytes > 0 {
 				onChunk(-int(attemptBytes))
@@ -663,7 +703,10 @@ func (c *Client) putPart(presignedURL string, data []byte, contentMD5 string, on
 	if onChunk != nil {
 		body = &progressReader{r: bytes.NewReader(data), cb: onChunk}
 	}
-	req, err := http.NewRequestWithContext(c.reqCtx(), "PUT", presignedURL, body)
+	// A per-request deadline: parts upload concurrently on one client.
+	ctx, cancel := context.WithTimeout(c.reqCtx(), presignTimeout(int64(len(data))))
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "PUT", presignedURL, body)
 	if err != nil {
 		return "", err
 	}
@@ -671,7 +714,6 @@ func (c *Client) putPart(presignedURL string, data []byte, contentMD5 string, on
 	req.Header.Set("Content-MD5", contentMD5)
 	req.ContentLength = int64(len(data))
 
-	c.presignClient.Timeout = presignTimeout(int64(len(data)))
 	resp, err := c.presignClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("PUT part: %w", err)

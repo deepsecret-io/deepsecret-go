@@ -42,17 +42,16 @@ const (
 	downloadPartMaxRetries = 4
 
 	// minDownloadChunkSize keeps per-request overhead under control by
-	// avoiding sub-MB ranges; smaller objects fall back to single-shot.
+	// avoiding sub-MB ranges.
 	minDownloadChunkSize = 1024 * 1024
 
-	// DefaultMaxDownloadBuffer caps the in-memory buffer the SDK is willing
-	// to pre-allocate for a single download. Mirrors the server-side
-	// CreateSecret upper bound (5 GiB) so a server-side trust boundary
-	// violation (compromised API returning a wildly inflated `size`) cannot
-	// trigger a multi-tens-of-GiB allocation that crashes the host.
-	// Callers may override via MultipartDownloadOptions.MaxBufferBytes; set
-	// to a smaller value on memory-constrained clients.
-	DefaultMaxDownloadBuffer = int64(5 * 1024 * 1024 * 1024)
+	// defaultDownloadPartSize is the range size when neither the caller nor
+	// the server suggests one.
+	defaultDownloadPartSize = 8 * 1024 * 1024
+
+	// maxDownloadPartSize caps a range, and so each worker's buffer,
+	// whatever the server suggests.
+	maxDownloadPartSize = 64 * 1024 * 1024
 )
 
 // MultipartDownloadOptions configures parallel Range downloads.
@@ -65,13 +64,6 @@ type MultipartDownloadOptions struct {
 	// value the API returned. Values below minDownloadChunkSize are clamped up.
 	PartSize int64
 
-	// MaxBufferBytes caps the in-memory buffer the SDK will pre-allocate
-	// for the assembled object. 0 = use DefaultMaxDownloadBuffer (5 GiB).
-	// Set lower on memory-constrained hosts (CI runners, edge devices).
-	// Defends against a server-side trust boundary violation where a
-	// compromised API claims a wildly inflated revision size.
-	MaxBufferBytes int64
-
 	// OnProgress is called with (transferredBytes, totalBytes) as parts complete.
 	OnProgress func(transferred, total int64)
 
@@ -80,53 +72,33 @@ type MultipartDownloadOptions struct {
 
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes.
 	// Allowed range is 1-30 (server clamps at 30). 0 = default
-	// (DefaultPresignExpiryMinutes, currently 30).
+	// (DefaultPresignExpiryMinutes, currently 30). A download that outlives
+	// it presigns again.
 	PresignExpiryMinutes int
 }
 
-// MultipartDownload fetches the entire object using N concurrent Range GETs.
-// totalSize MUST match the object's actual size or the caller's expectation:
-// it gates the byte budget and short-read detection.
-//
-// Resilience: each range is retried up to downloadPartMaxRetries times on
-// transient errors (5xx, transport drops, short reads). A single failed
-// range never blocks its peers. URL stays valid for the full presign TTL
-// (DefaultPresignExpiryMinutes, currently 30 min), so the entire fan-out
-// shares one signature.
-//
-// Security: the assembled bytes are still authenticated end-to-end by the
-// caller, which checks the payload digest against the signed manifest and
-// authenticates every chunk, so Range stitching does not bypass integrity. Range responses are size-bounded, so a compromised S3 cannot
-// over-read into adjacent objects' data.
-func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int64, opts MultipartDownloadOptions) ([]byte, error) {
-	if totalSize <= 0 {
-		return nil, fmt.Errorf("multipart download: invalid total size %d", totalSize)
-	}
-	maxBuf := opts.MaxBufferBytes
-	if maxBuf <= 0 {
-		maxBuf = DefaultMaxDownloadBuffer
-	}
-	if totalSize > maxBuf {
-		return nil, fmt.Errorf("multipart download: object size %d exceeds buffer cap %d (set MultipartDownloadOptions.MaxBufferBytes if intentional)", totalSize, maxBuf)
-	}
-	if partSize <= 0 {
-		if opts.PartSize > 0 {
-			partSize = opts.PartSize
-		} else {
-			partSize = 8 * 1024 * 1024
-		}
-	}
-	if partSize < minDownloadChunkSize {
-		partSize = minDownloadChunkSize
-	}
-	threads := opts.Threads
-	if threads <= 0 {
-		threads = DefaultDownloadConcurrency
-	}
-	if threads > MaxDownloadConcurrency {
-		threads = MaxDownloadConcurrency
-	}
+// errPresignRefused is a Range GET answered with 403: the presigned URL
+// expired or was revoked. The download presigns again and retries.
+var errPresignRefused = errors.New("presigned URL refused (403)")
 
+// DownloadToFile downloads a revision's stored object into dst, writing
+// each byte range at its offset, so memory stays at one range buffer per
+// thread whatever the object's size. size is what the caller expects, the
+// manifest's ciphertext_size: the download refuses an object the server
+// reports with any other size, before fetching anything.
+//
+// One presigned URL serves every range. It is presigned again when a range
+// is refused with 403, or when it is close to expiring, so a download can
+// run longer than the URL's lifetime.
+//
+// Security: dst holds ciphertext that the caller checks against the signed
+// manifest's digest before any plaintext is released, so Range stitching
+// does not bypass integrity. Range responses are size-bounded, so a
+// compromised S3 cannot over-read into adjacent objects' data.
+func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, opts MultipartDownloadOptions) error {
+	if size <= 0 {
+		return fmt.Errorf("download: invalid size %d", size)
+	}
 	debugf := func(step, format string, args ...any) {
 		if opts.OnDebug == nil {
 			return
@@ -134,38 +106,48 @@ func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int6
 		opts.OnDebug(step, fmt.Sprintf(format, args...))
 	}
 
-	// Compute ranges. The last part may be smaller than partSize.
+	urls := &presignedDownload{c: c, revisionID: revisionID, expiry: resolveExpiryMinutes(opts.PresignExpiryMinutes)}
+	plan, err := urls.renew("")
+	if err != nil {
+		return err
+	}
+	if plan.Size > 0 && plan.Size != size {
+		return fmt.Errorf("download: the server reports %d bytes, the signed manifest says %d", plan.Size, size)
+	}
+
+	partSize := opts.PartSize
+	if partSize <= 0 {
+		partSize = plan.PartSize
+	}
+	if partSize <= 0 {
+		partSize = defaultDownloadPartSize
+	}
+	partSize = min(max(partSize, minDownloadChunkSize), maxDownloadPartSize, size)
+	threads := opts.Threads
+	if threads <= 0 {
+		threads = DefaultDownloadConcurrency
+	}
+	threads = min(threads, MaxDownloadConcurrency)
+
 	type span struct {
 		idx        int
 		start, end int64 // [start, end] inclusive (HTTP Range semantics)
 	}
 	var spans []span
-	for start, idx := int64(0), 0; start < totalSize; idx++ {
-		end := start + partSize - 1
-		if end >= totalSize {
-			end = totalSize - 1
-		}
+	for start, idx := int64(0), 0; start < size; idx++ {
+		end := min(start+partSize, size) - 1
 		spans = append(spans, span{idx: idx, start: start, end: end})
 		start = end + 1
 	}
-	if len(spans) == 1 {
-		// One span = no benefit from parallelism. Caller should have used
-		// the single-shot path; we still service it correctly here.
-		threads = 1
-	}
-	if threads > len(spans) {
-		threads = len(spans)
-	}
+	threads = min(threads, len(spans))
 
-	debugf("plan", "object=%s", humanBytesLocal(totalSize))
+	debugf("plan", "object=%s", humanBytesLocal(size))
 	debugf("plan", "parts=%d", len(spans))
 	debugf("plan", "part_size=%s", humanBytesLocal(partSize))
 	debugf("plan", "threads=%d", threads)
 
-	buf := make([]byte, totalSize)
 	var transferred int64
 	var transferredMu sync.Mutex
-
 	workCh := make(chan span, len(spans))
 	for _, s := range spans {
 		workCh <- s
@@ -173,43 +155,45 @@ func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int6
 	close(workCh)
 
 	errCh := make(chan error, threads)
+	failed := make(chan struct{})
+	var failOnce sync.Once
+	fail := func(err error) {
+		failOnce.Do(func() {
+			errCh <- err
+			close(failed)
+		})
+	}
 	var wg sync.WaitGroup
 	ctx := c.reqCtx()
 	for w := 0; w < threads; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			buf := make([]byte, partSize)
 			for s := range workCh {
 				select {
 				case <-ctx.Done():
-					// User hit Ctrl+C (or a parent context fired). Stop
-					// pulling new ranges and surface the cancel as the
-					// upload error so the caller doesn't see a partial
-					// success.
-					select {
-					case errCh <- ctx.Err():
-					default:
-					}
+					fail(ctx.Err())
 					return
-				case <-errCh:
-					// Another worker already failed; don't pile on with
-					// more requests; fast-exit. The first error wins.
+				case <-failed:
 					return
 				default:
 				}
-				if err := c.downloadRange(presignedURL, s.start, s.end, buf[s.start:s.end+1], debugf, workerID, s.idx); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
+				part := buf[:s.end-s.start+1]
+				if err := c.downloadRange(urls, s.start, s.end, part, debugf, workerID, s.idx); err != nil {
+					fail(err)
+					return
+				}
+				if _, err := dst.WriteAt(part, s.start); err != nil {
+					fail(fmt.Errorf("write range %d-%d: %w", s.start, s.end, err))
 					return
 				}
 				if opts.OnProgress != nil {
 					transferredMu.Lock()
-					transferred += s.end - s.start + 1
+					transferred += int64(len(part))
 					t := transferred
 					transferredMu.Unlock()
-					opts.OnProgress(t, totalSize)
+					opts.OnProgress(t, size)
 				}
 			}
 		}(w)
@@ -217,15 +201,63 @@ func (c *Client) MultipartDownload(presignedURL string, totalSize, partSize int6
 	wg.Wait()
 	close(errCh)
 	if err, ok := <-errCh; ok && err != nil {
-		return nil, err
+		return err
 	}
-	debugf("done", "got=%d bytes", totalSize)
-	return buf, nil
+	debugf("done", "got=%d bytes", size)
+	return nil
 }
 
-// downloadRange fetches one byte range into the supplied destination slice,
-// retrying on transient errors. dst MUST already be sized to len = end-start+1.
-func (c *Client) downloadRange(presignedURL string, start, end int64, dst []byte, debugf func(step, format string, args ...any), workerID, partIdx int) error {
+// presignedDownload holds the presigned URL a download shares, and renews
+// it once for every worker that finds it expired.
+type presignedDownload struct {
+	c          *Client
+	revisionID string
+	expiry     int // minutes
+
+	mu      sync.Mutex
+	url     string
+	renewAt time.Time
+}
+
+// current returns the URL to use, renewing it first when it is close to
+// expiring.
+func (p *presignedDownload) current() (string, error) {
+	p.mu.Lock()
+	url, renewAt := p.url, p.renewAt
+	p.mu.Unlock()
+	if time.Now().Before(renewAt) {
+		return url, nil
+	}
+	plan, err := p.renew(url)
+	if err != nil {
+		return "", err
+	}
+	return plan.URL, nil
+}
+
+// renew presigns again unless another worker already replaced stale.
+func (p *presignedDownload) renew(stale string) (*PresignDownloadPlan, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.url != "" && p.url != stale && time.Now().Before(p.renewAt) {
+		return &PresignDownloadPlan{URL: p.url}, nil
+	}
+	plan, err := p.c.presignDownloadPlan(p.revisionID, p.expiry)
+	if err != nil {
+		return nil, err
+	}
+	// Renew two minutes before expiry, or at three quarters of a short
+	// lifetime.
+	lifetime := time.Duration(p.expiry) * time.Minute
+	margin := min(2*time.Minute, lifetime/4)
+	p.url, p.renewAt = plan.URL, time.Now().Add(lifetime-margin)
+	return plan, nil
+}
+
+// downloadRange fetches one byte range into dst, retrying on transient
+// errors and presigning again when the URL is refused. dst MUST already be
+// sized to len = end-start+1.
+func (c *Client) downloadRange(urls *presignedDownload, start, end int64, dst []byte, debugf func(step, format string, args ...any), workerID, partIdx int) error {
 	expected := end - start + 1
 	if int64(len(dst)) != expected {
 		return fmt.Errorf("downloadRange: dst size %d != expected %d", len(dst), expected)
@@ -233,19 +265,38 @@ func (c *Client) downloadRange(presignedURL string, start, end int64, dst []byte
 
 	ctx := c.reqCtx()
 	var lastErr error
+	renewed := false
 	for attempt := 0; attempt <= downloadPartMaxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if attempt > 0 {
-			if err := retryBackoff(ctx, attempt); err != nil {
-				return err
+			// A freshly presigned URL is retried at once; anything else
+			// backs off first.
+			if !renewed {
+				if err := retryBackoff(ctx, attempt); err != nil {
+					return err
+				}
 			}
 			debugf("retry", "worker=%d part=%d attempt=%d range=%d-%d err=%v", workerID, partIdx, attempt, start, end, lastErr)
 		}
+		renewed = false
+		url, err := urls.current()
+		if err != nil {
+			return err
+		}
 		t0 := time.Now()
-		if err := c.doRangeGET(presignedURL, start, end, dst); err != nil {
-			if !isDownloadRetryable(err) {
+		if err := c.doRangeGET(url, start, end, dst); err != nil {
+			// A range that ran out its own deadline is retried; a
+			// cancelled download is not.
+			stalled := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+			if errors.Is(err, errPresignRefused) {
+				debugf("presign", "range %d-%d refused, presigning again", start, end)
+				if _, rerr := urls.renew(url); rerr != nil {
+					return rerr
+				}
+				renewed = true
+			} else if !stalled && !isDownloadRetryable(err) {
 				return err
 			}
 			lastErr = err
@@ -261,13 +312,15 @@ func (c *Client) downloadRange(presignedURL string, start, end int64, dst []byte
 // dst is filled exactly len(dst) bytes or an error is returned. We use a
 // fresh request per attempt so retries don't see stale connection state.
 func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) error {
-	req, err := http.NewRequestWithContext(c.reqCtx(), "GET", presignedURL, nil)
+	// A per-request deadline, so a stalled range fails and is retried.
+	ctx, cancel := context.WithTimeout(c.reqCtx(), presignTimeout(int64(len(dst))))
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
-	c.presignClient.Timeout = presignTimeout(int64(len(dst)))
 	resp, err := c.presignClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("Range GET: %w", err)
@@ -277,16 +330,14 @@ func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) e
 	switch resp.StatusCode {
 	case http.StatusPartialContent: // 206: what we expect
 	case http.StatusOK:
-		// Server returned the whole object instead of honoring Range. We
-		// can still satisfy this single-range case if the slice fits, but
-		// it defeats parallelism; surface as a transient so the next
-		// attempt can be cleaner. Falling back silently would mask a
-		// misconfigured backend.
-		body, _ := io.ReadAll(resp.Body)
-		_ = body
+		// Server returned the whole object instead of honoring Range.
+		// Surface as a transient so the next attempt can be cleaner.
+		// Falling back silently would mask a misconfigured backend.
 		return fmt.Errorf("server ignored Range and returned full object (status 200)")
+	case http.StatusForbidden:
+		return errPresignRefused
 	default:
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode >= 500 {
 			return fmt.Errorf("Range GET transient (status %d): %s", resp.StatusCode, string(body))
 		}
@@ -324,67 +375,4 @@ func isDownloadRetryable(err error) bool {
 	// Unwrapped errors from doRangeGET (transport blips, server-ignored-Range,
 	// transient 5xx) are all retryable.
 	return true
-}
-
-// PresignDownloadParallel resolves the presigned URL plus size hints, picks a
-// strategy based on size and the supplied options, and returns the fully
-// assembled bytes.
-//
-// Strategy:
-//   - object < ~2 × DefaultPartSize OR Threads == 1: single-shot Range-resume
-//     via the existing getFromPresignedURL path (already retry-resilient).
-//   - otherwise: parallel multipart download with Threads concurrent Range GETs.
-//
-// onProgress, if provided, is called with (transferred, total).
-func (c *Client) PresignDownloadParallel(revisionID string, opts MultipartDownloadOptions) ([]byte, error) {
-	plan, err := c.presignDownloadPlan(revisionID, resolveExpiryMinutes(opts.PresignExpiryMinutes))
-	if err != nil {
-		return nil, err
-	}
-	maxBuf := opts.MaxBufferBytes
-	if maxBuf <= 0 {
-		maxBuf = DefaultMaxDownloadBuffer
-	}
-	// Reject obviously-wrong sizes from the server before the single-shot
-	// path also tries to allocate. The MultipartDownload fast-path enforces
-	// the same cap, but the single-shot path uses io.ReadAll which would
-	// happily fill memory until OOM. This is the trust-boundary defense
-	// covering the rare case where a compromised API claims a wildly
-	// inflated revision size.
-	if plan.Size > 0 && plan.Size > maxBuf {
-		return nil, fmt.Errorf("download: server-declared size %d exceeds buffer cap %d (set MultipartDownloadOptions.MaxBufferBytes if intentional)", plan.Size, maxBuf)
-	}
-	debugf := func(step, format string, args ...any) {
-		if opts.OnDebug == nil {
-			return
-		}
-		opts.OnDebug(step, fmt.Sprintf(format, args...))
-	}
-
-	threads := opts.Threads
-	if threads <= 0 {
-		threads = DefaultDownloadConcurrency
-	}
-	partSize := opts.PartSize
-	if partSize <= 0 {
-		partSize = plan.PartSize
-	}
-
-	// Size unknown or below the parallelism threshold → single-shot.
-	threshold := int64(2 * 1024 * 1024) // 2 MiB
-	if partSize > 0 {
-		threshold = 2 * partSize
-	}
-	if plan.Size <= 0 || plan.Size < threshold || threads <= 1 {
-		debugf("download", "mode=single-shot")
-		debugf("download", "size=%s", humanBytesLocal(plan.Size))
-		debugf("download", "threshold=%s", humanBytesLocal(threshold))
-		return c.getFromPresignedURL(plan.URL, opts.OnProgress)
-	}
-
-	debugf("download", "mode=parallel")
-	debugf("download", "size=%s", humanBytesLocal(plan.Size))
-	debugf("download", "part_size=%s", humanBytesLocal(partSize))
-	debugf("download", "threads=%d", threads)
-	return c.MultipartDownload(plan.URL, plan.Size, partSize, opts)
 }

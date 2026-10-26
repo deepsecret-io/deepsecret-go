@@ -150,6 +150,11 @@ func (c *Client) SetRootContext(ctx context.Context) {
 	c.ctxMu.Unlock()
 }
 
+// Context returns the root context set with SetRootContext, or background.
+// Long local work, such as sealing or decrypting a large payload, checks it
+// so a cancel stops it too.
+func (c *Client) Context() context.Context { return c.reqCtx() }
+
 // reqCtx returns the current root context, defaulting to background if none
 // was set. Cheap read-locked access on the hot path.
 func (c *Client) reqCtx() context.Context {
@@ -605,6 +610,26 @@ func (c *Client) PresignUpload(orgID, objectKey string, data []byte, expiryMinut
 	return c.uploadToPresignedURL(url, data)
 }
 
+// PresignUploadFrom uploads the size bytes of src to a presigned PUT URL
+// for objectKey, reading src once for the Content-MD5 and again for each
+// attempt, so it can be a file. onProgress is optional.
+//
+// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
+func (c *Client) PresignUploadFrom(orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int) error {
+	h := md5.New()
+	if _, err := io.Copy(h, io.NewSectionReader(src, 0, size)); err != nil {
+		return fmt.Errorf("read payload: %w", err)
+	}
+	contentMD5 := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	url, err := c.presignUploadURL(orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+	if err != nil {
+		return err
+	}
+	return c.putToPresignedURL(url, func() (io.Reader, error) {
+		return io.NewSectionReader(src, 0, size), nil
+	}, size, contentMD5, onProgress)
+}
+
 // PresignDownload gets a presigned GET URL and downloads data into memory.
 // For large downloads, use [PresignDownloadReader] to stream.
 //
@@ -685,36 +710,40 @@ func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Read
 			body = &progressCallbackReader{r: body, onProgress: onProgress, total: size}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "PUT", presignedURL, body)
-		if err != nil {
+		// A per-attempt deadline rather than the shared client's Timeout,
+		// which concurrent transfers would race on.
+		retry, err := func() (bool, error) {
+			attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(attemptCtx, "PUT", presignedURL, body)
+			if err != nil {
+				return false, err
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+			req.Header.Set("Content-MD5", contentMD5)
+			// Matches the IfNoneMatch signed into the presigned URL by the
+			// backend. Must be sent verbatim or S3 returns SignatureDoesNotMatch.
+			req.Header.Set("If-None-Match", "*")
+			req.ContentLength = size
+
+			resp, err := c.presignClient.Do(req)
+			if err != nil {
+				return true, fmt.Errorf("upload: %w", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				return resp.StatusCode >= 500, fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, string(respBody))
+			}
+			return false, nil
+		}()
+		if err == nil {
+			return nil
+		}
+		if !retry {
 			return err
 		}
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("Content-MD5", contentMD5)
-		// Matches the IfNoneMatch signed into the presigned URL by the
-		// backend. Must be sent verbatim or S3 returns SignatureDoesNotMatch.
-		req.Header.Set("If-None-Match", "*")
-		req.ContentLength = size
-
-		c.presignClient.Timeout = timeout
-		resp, err := c.presignClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("upload: %w", err)
-			continue
-		}
-		if resp.StatusCode >= 500 {
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			lastErr = fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, string(respBody))
-			continue
-		}
-		if resp.StatusCode >= 300 {
-			respBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, string(respBody))
-		}
-		resp.Body.Close()
-		return nil
+		lastErr = err
 	}
 	return fmt.Errorf("upload failed after %d retries: %w", maxRetries, lastErr)
 }
@@ -804,9 +833,8 @@ func (c *Client) downloadFromPresignedURL(presignedURL string) ([]byte, error) {
 // are decrypted, so a Range-resumed body is no less secure than a single-shot
 // one.
 func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64, int64)) ([]byte, error) {
-	c.presignClient.Timeout = 10 * time.Minute
-
-	ctx := c.reqCtx()
+	ctx, cancel := context.WithTimeout(c.reqCtx(), 10*time.Minute)
+	defer cancel()
 	var buf bytes.Buffer
 	var totalSize int64 = -1 // unknown until first response
 

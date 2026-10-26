@@ -11,10 +11,20 @@ import (
 )
 
 // DefaultMaxPayloadSize is the default client-side preflight cap on the
-// total uncompressed input bytes. 50 GiB matches the Organization tier's
-// MaxUploadBytes server-side limit; callers can override per-call via
+// total uncompressed input bytes. 100 GiB matches the largest secret the
+// API takes (the Organization plan); callers can override per-call via
 // EncryptOptions.MaxPayloadSize.
-const DefaultMaxPayloadSize int64 = 50 * 1024 * 1024 * 1024
+const DefaultMaxPayloadSize int64 = 100 << 30
+
+// DefaultMaxDownloadSize is the largest stored payload a decrypt downloads
+// unless DecryptOptions.MaxDownloadSize says otherwise: a 100 GiB secret
+// plus its encryption overhead.
+const DefaultMaxDownloadSize int64 = 101 << 30
+
+// DefaultMaxInMemorySize is the largest stored payload DecryptSecretFull and
+// OpenedSecret.Payload hold in memory. Larger file payloads are written
+// to disk with OpenedSecret.WriteFiles or DecryptToDir.
+const DefaultMaxInMemorySize int64 = 256 << 20
 
 // MaxRecipientsPerSend is the most recipients one send may have. The API
 // enforces the same cap; the protocol itself allows crypto.MaxRecipients.
@@ -76,10 +86,14 @@ type EncryptOptions struct {
 	RevokeMissing bool
 
 	// MaxPayloadSize limits the total uncompressed payload size in bytes.
-	// The SDK builds and seals the payload in memory, so set this to
-	// prevent accidental OOM with large inputs. Zero means use
-	// DefaultMaxPayloadSize.
+	// Zero means use DefaultMaxPayloadSize.
 	MaxPayloadSize int64
+
+	// TempDir is where the send keeps its temporary ciphertext file, in a
+	// private directory it removes when done. Empty means
+	// $DEEPSECRET_TMPDIR, else the system temp directory. It needs free
+	// space for the encrypted payload; the send checks before reading.
+	TempDir string
 
 	// OnUploadProgress is called during ciphertext upload with bytes transferred
 	// and total bytes. Use this for progress UI. Optional.
@@ -90,7 +104,7 @@ type EncryptOptions struct {
 	// Wire it to your CLI's debug logger. Optional.
 	OnDebug func(step, message string)
 
-	// AutoArchive bundles files into a tar.zst archive when the file count
+	// AutoArchive bundles files into a tar archive when the file count
 	// exceeds the tier's MaxFilesPerSecret limit. When true, the SDK fetches
 	// tier info and auto-archives if needed.
 	AutoArchive bool
@@ -117,12 +131,6 @@ type EncryptOptions struct {
 	// the upload. Allowed range is 1-30 (server clamps at 30). 0 = default
 	// (DefaultPresignExpiryMinutes, currently 30).
 	PresignExpiryMinutes int
-
-	// archiveOriginalSize is set internally by encryptArchive to pass the
-	// total original uncompressed file size into encryptAndSend for accurate
-	// server-side compression metadata. Not intended for external use.
-	archiveOriginalSize   int64
-	archiveCompressedSize int64
 }
 
 // Recipient is one recipient of a revision: their email and the
@@ -171,13 +179,21 @@ type DecryptOptions struct {
 	Password string
 
 	// DownloadThreads sets the maximum number of parallel Range GETs the SDK
-	// uses for downloading the payload. 0 = SDK default (4). 1 = force
-	// single-stream download. Values are clamped to a sane upper bound by
-	// the SDK. Larger values trade more sockets and memory for faster
-	// transfer on high-RTT or high-bandwidth links; the entire payload is
-	// buffered in memory regardless of value, since its digest is verified
-	// against the signed manifest before any plaintext is released.
+	// uses for downloading the payload. 0 = SDK default (4). 1 = one range
+	// at a time. Values are clamped to a sane upper bound by the SDK.
+	// Larger values trade more sockets and memory (one range buffer each)
+	// for faster transfer on high-RTT or high-bandwidth links.
 	DownloadThreads int
+
+	// TempDir is where the download keeps the ciphertext, in a private
+	// directory removed on Close: its digest is verified against the signed
+	// manifest before any plaintext is released. Empty means
+	// $DEEPSECRET_TMPDIR, else the system temp directory.
+	TempDir string
+
+	// MaxDownloadSize refuses a stored payload larger than this many bytes
+	// before downloading it. Zero means DefaultMaxDownloadSize.
+	MaxDownloadSize int64
 
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes for
 	// the download. Allowed range is 1-30 (server clamps at 30). 0 = default

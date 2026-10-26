@@ -4,7 +4,10 @@
 package sdk
 
 import (
+	"bytes"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,10 +15,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/crypto"
@@ -58,10 +64,28 @@ type fakeAPI struct {
 	actors  map[string]*fakeActor // by email
 	secrets map[string]*fakeSecret
 	revs    map[string]*fakeRevision
-	objects map[string][]byte
+	objects string // directory holding stored objects, one file each
 	creates int
 	puts    int
 	lastReq createBody
+
+	// Multipart: a create at or above multipartAt bytes answers
+	// is_multipart with partSize parts.
+	multipartAt int64
+	partSize    int64
+	uploads     map[string]*fakeUpload // by revision id
+
+	// Downloads: the part size the presign suggests, and how many range
+	// GETs a presigned URL serves before it is refused with 403 (0: no
+	// limit). presigns counts download presigns.
+	downloadPartSize int64
+	urlUses          int
+	presigns         int
+	tokens           map[string]int // uses left, by token
+}
+
+type fakeUpload struct {
+	registered map[int]map[string]any
 }
 
 type createBody struct {
@@ -74,7 +98,16 @@ type createBody struct {
 	CipherSuite     string `json:"cipher_suite"`
 	KeyFingerprint  string `json:"key_fingerprint"`
 	Manifest        []byte `json:"manifest"`
-	Recipients      []struct {
+	PayloadType     string `json:"payload_type"`
+	FilesCount      int    `json:"files_count"`
+	Compressed      bool   `json:"compressed"`
+	Compression     string `json:"compression"`
+	FilesMeta       []struct {
+		Name   string `json:"name"`
+		Size   int64  `json:"size"`
+		SHA256 string `json:"sha256"`
+	} `json:"files_meta"`
+	Recipients []struct {
 		RecipientID    string `json:"recipient_id"`
 		RecipientOrgID string `json:"recipient_org_id"`
 		KeyFingerprint string `json:"key_fingerprint"`
@@ -90,7 +123,8 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	f := &fakeAPI{t: t, actors: map[string]*fakeActor{}, secrets: map[string]*fakeSecret{},
-		revs: map[string]*fakeRevision{}, objects: map[string][]byte{}}
+		revs: map[string]*fakeRevision{}, objects: t.TempDir(), multipartAt: 1 << 62,
+		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}}
 	for i, email := range emails {
 		kp, err := crypto.GenerateKeyPair()
 		if err != nil {
@@ -113,6 +147,12 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("POST /api/v1/orgs/{org}/secrets", f.create)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
 	mux.HandleFunc("PUT /s3/{key}", f.putObject)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/init", f.multipartInit)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/part-url", f.multipartPartURL)
+	mux.HandleFunc("PUT /s3part/{id}/{n}", f.putPart)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/parts", f.registerPart)
+	mux.HandleFunc("GET /api/v1/secrets/revisions/{id}/multipart/status", f.multipartStatus)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/complete", f.multipartComplete)
 	mux.HandleFunc("GET /s3/{key}", f.getObject)
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/confirm", func(w http.ResponseWriter, r *http.Request) { ok(w, map[string]string{"status": "uploaded"}) })
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/presign", f.presignDownload)
@@ -270,9 +310,13 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 	rev.secretID = s.id
 	s.revisions = append(s.revisions, rev)
 	f.revs[rev.id] = rev
+	revision := map[string]any{"id": rev.id, "is_multipart": false}
+	if req.Size >= f.multipartAt {
+		revision["is_multipart"], revision["multipart_part_size"] = true, f.partSize
+	}
 	ok(w, map[string]any{
 		"secret":   map[string]string{"id": s.id, "name": s.name},
-		"revision": map[string]any{"id": rev.id, "is_multipart": false},
+		"revision": revision,
 		"revoked":  revoked,
 	})
 }
@@ -294,18 +338,154 @@ func (f *fakeAPI) presignUpload(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]string{"url": f.srv.URL + "/s3/" + body.Key})
 }
 
+// object returns a stored object's bytes.
+func (f *fakeAPI) object(key string) []byte {
+	data, _ := os.ReadFile(filepath.Join(f.objects, key))
+	return data
+}
+
+func (f *fakeAPI) objectSize(key string) int64 {
+	info, err := os.Stat(filepath.Join(f.objects, key))
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 func (f *fakeAPI) putObject(w http.ResponseWriter, r *http.Request) {
-	data, _ := io.ReadAll(r.Body)
+	if !md5Matches(r) {
+		fail(w, http.StatusBadRequest, "BadDigest")
+		return
+	}
+	out, err := os.Create(filepath.Join(f.objects, r.PathValue("key")))
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	defer out.Close()
+	io.Copy(out, r.Body)
 	f.mu.Lock()
-	f.objects[r.PathValue("key")] = data
 	f.puts++
 	f.mu.Unlock()
 }
 
+// md5Matches checks the Content-MD5 the client sent against the body, as
+// S3 does, and leaves the body readable.
+func md5Matches(r *http.Request) bool {
+	data, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	sum := md5.Sum(data)
+	return r.Header.Get("Content-MD5") == base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// getObject serves an object with Range support, as S3 does. A presigned
+// URL whose token has served its uses is refused with 403.
 func (f *fakeAPI) getObject(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	if tok := r.URL.Query().Get("t"); f.urlUses > 0 {
+		if f.tokens[tok] <= 0 {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		f.tokens[tok]--
+	}
+	f.mu.Unlock()
+	obj, err := os.Open(filepath.Join(f.objects, r.PathValue("key")))
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	defer obj.Close()
+	http.ServeContent(w, r, "", time.Time{}, obj)
+}
+
+func (f *fakeAPI) multipartInit(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
 	defer f.mu.Unlock()
-	w.Write(f.objects[r.PathValue("key")])
+	id := r.PathValue("id")
+	if f.uploads[id] == nil {
+		f.uploads[id] = &fakeUpload{registered: map[int]map[string]any{}}
+	}
+	ok(w, map[string]any{"upload_id": "up-" + id, "part_size": f.partSize,
+		"max_part_number": int((f.lastReq.Size + f.partSize - 1) / f.partSize), "expires_at": time.Now().Add(time.Hour)})
+}
+
+func (f *fakeAPI) multipartPartURL(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PartNumber int `json:"part_number"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	ok(w, map[string]any{"url": fmt.Sprintf("%s/s3part/%s/%d", f.srv.URL, r.PathValue("id"), body.PartNumber), "expires_in": 900})
+}
+
+// putPart streams a part to disk, checking its Content-MD5 as S3 does.
+func (f *fakeAPI) putPart(w http.ResponseWriter, r *http.Request) {
+	path := filepath.Join(f.objects, r.PathValue("id")+".part"+r.PathValue("n"))
+	out, err := os.Create(path)
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	h := md5.New()
+	_, err = io.Copy(io.MultiWriter(out, h), r.Body)
+	out.Close()
+	sum := h.Sum(nil)
+	if err != nil || r.Header.Get("Content-MD5") != base64.StdEncoding.EncodeToString(sum) {
+		os.Remove(path)
+		fail(w, http.StatusBadRequest, "BadDigest")
+		return
+	}
+	f.mu.Lock()
+	f.puts++
+	f.mu.Unlock()
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+}
+
+func (f *fakeAPI) registerPart(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	f.mu.Lock()
+	f.uploads[r.PathValue("id")].registered[int(body["part_number"].(float64))] = body
+	f.mu.Unlock()
+	ok(w, map[string]string{"status": "registered"})
+}
+
+func (f *fakeAPI) multipartStatus(w http.ResponseWriter, r *http.Request) {
+	ok(w, map[string]any{"parts": []any{}})
+}
+
+func (f *fakeAPI) multipartComplete(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Parts []struct {
+			PartNumber int `json:"part_number"`
+		} `json:"parts"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := r.PathValue("id")
+	up := f.uploads[id]
+	out, err := os.Create(filepath.Join(f.objects, id))
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	defer out.Close()
+	for i, p := range body.Parts {
+		if p.PartNumber != i+1 || up.registered[p.PartNumber] == nil {
+			fail(w, 400, "parts must be registered and contiguous")
+			return
+		}
+		part, err := os.Open(filepath.Join(f.objects, fmt.Sprintf("%s.part%d", id, p.PartNumber)))
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+		io.Copy(out, part)
+		part.Close()
+	}
+	ok(w, map[string]string{"status": "completed"})
 }
 
 func (f *fakeAPI) presignDownload(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +496,10 @@ func (f *fakeAPI) presignDownload(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "no access to this revision")
 		return
 	}
-	ok(w, map[string]any{"url": f.srv.URL + "/s3/" + rev.id, "size": len(f.objects[rev.id])})
+	f.presigns++
+	tok := fmt.Sprintf("tok%d", f.presigns)
+	f.tokens[tok] = f.urlUses
+	ok(w, map[string]any{"url": f.srv.URL + "/s3/" + rev.id + "?t=" + tok, "size": f.objectSize(rev.id), "part_size": f.downloadPartSize})
 }
 
 func (f *fakeAPI) manifest(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +603,7 @@ func TestSendOnceToManyRecipients(t *testing.T) {
 	if !slices.Equal(res.Recipients, want) || res.SenderFingerprint != alice.fp {
 		t.Fatalf("result recipients %+v, sender %s", res.Recipients, res.SenderFingerprint)
 	}
-	stored := f.objects[res.Secret.RevisionID]
+	stored := f.object(res.Secret.RevisionID)
 	if res.EncryptedSize != int64(len(stored)) || len(res.Revoked) != 0 {
 		t.Fatalf("size %d, stored %d, revoked %v", res.EncryptedSize, len(stored), res.Revoked)
 	}

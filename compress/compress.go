@@ -40,6 +40,54 @@ func NewCompressWriter(w io.Writer, algo Algorithm) (io.WriteCloser, error) {
 	}
 }
 
+// BestCompressionMaxSize is the largest input [NewCompressWriterFor]
+// compresses at zstd's best level. Above it, the default level keeps pace
+// with a network upload: the best level runs at tens of MB/s.
+const BestCompressionMaxSize = 1 << 30
+
+// NewCompressWriterFor is [NewCompressWriter] for an input of about
+// inputSize bytes: inputs up to [BestCompressionMaxSize] use the best
+// compression level, larger ones the default level.
+func NewCompressWriterFor(w io.Writer, algo Algorithm, inputSize int64) (io.WriteCloser, error) {
+	if algo == Zstd && inputSize > BestCompressionMaxSize {
+		return zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	}
+	return NewCompressWriter(w, algo)
+}
+
+// CompressedSize returns how many bytes data compresses to with algo, at
+// zstd's default level on one goroutine: a cheap estimate of whether
+// compressing is worth it, for a sample of a larger input.
+func CompressedSize(data []byte, algo Algorithm) (int64, error) {
+	if algo == None {
+		return int64(len(data)), nil
+	}
+	if algo != Zstd {
+		return 0, fmt.Errorf("unsupported compression algorithm: %s", algo)
+	}
+	var n countingDiscard
+	w, err := zstd.NewWriter(&n, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		return 0, err
+	}
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return 0, err
+	}
+	if err := w.Close(); err != nil {
+		return 0, err
+	}
+	return int64(n), nil
+}
+
+// countingDiscard counts and discards what is written to it.
+type countingDiscard int64
+
+func (c *countingDiscard) Write(p []byte) (int, error) {
+	*c += countingDiscard(len(p))
+	return len(p), nil
+}
+
 // NewDecompressReader returns a ReadCloser that decompresses data from r.
 // The caller MUST call Close when done reading.
 //
