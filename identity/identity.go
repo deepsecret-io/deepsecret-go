@@ -28,6 +28,10 @@ type Subscription struct {
 	Status     string  `json:"status"`
 	ExpiresAt  *string `json:"expires_at"`
 	CanceledAt *string `json:"canceled_at"`
+	// TrialEndsAt is the workspace's free trial end (RFC 3339), nil when it
+	// has none. Status stays "inactive" during a trial with no
+	// subscription; the trial gives access until this time.
+	TrialEndsAt *string `json:"trial_ends_at"`
 }
 
 // Actor is the identity block from /api/me.
