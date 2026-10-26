@@ -586,6 +586,9 @@ func ValidateRecipients(emails []string) error {
 // ciphertext goes to a private temporary file, and the upload reads it from
 // there.
 func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOptions) (*EncryptResult, error) {
+	if opt.LocalFile != "" {
+		return c.encryptToFile(recipients, p, opt)
+	}
 	debugf := func(step, format string, args ...any) {
 		if opt.OnDebug == nil {
 			return
@@ -632,24 +635,9 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	// any policy violation surfaces as an HTTP error from the server.
 	_ = opt.ValidateTier
 
-	var kp *crypto.KeyPair
-	var senderFP string
-	if opt.Identity != "" {
-		// Loaded line below carries the actual fingerprint.
-		kp, err = crypto.LoadKeyPair(opt.Identity, opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("load sender identity %s: %w", crypto.ShortFingerprint(opt.Identity), err)
-		}
-		senderFP, err = crypto.Fingerprint(kp)
-		if err != nil {
-			return nil, fmt.Errorf("compute fingerprint: %w", err)
-		}
-	} else {
-		// Loaded line below carries the actual fingerprint.
-		kp, senderFP, err = identity.LoadPrimaryIdentity(c.api, opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("load sender identity: %w", err)
-		}
+	kp, senderFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	if err != nil {
+		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
 	debugf("identity", "sender fingerprint=%s", crypto.ShortFingerprint(senderFP))
 	debugf("verify", "sender identity loaded (X25519+Ed25519, ML-KEM-768+ML-DSA-65)")
@@ -659,14 +647,9 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	pubs := make([]*crypto.PublicKeys, len(recipients))
 	actorIDs := make([]string, len(recipients))
 	for i, email := range recipients {
-		keys, err := identity.GetRecipientKeys(c.api, email)
+		keys, err := c.recipientKeys(email)
 		if err != nil {
-			return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
-		}
-		if keys.Fingerprint == "" {
-			if keys.Fingerprint, err = crypto.FingerprintFromPubs(keys.ED25519, keys.X25519, keys.MLKEM768, keys.MLDSA65); err != nil {
-				return nil, fmt.Errorf("resolve recipient %s: compute fingerprint: %w", email, err)
-			}
+			return nil, err
 		}
 		actorID, err := identity.ResolveRecipientID(c.api, email)
 		if err != nil {
@@ -678,40 +661,24 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	}
 	debugf("verify", "recipient public keys resolved from server (%d)", len(recipients))
 
-	// Compression. An archive is always zstd-compressed: the tar inside it
-	// is not. Other payloads are compressed when asked to and when a sample
-	// of them shrinks by at least 5%.
-	algo := compress.None
-	switch {
-	case p.archived:
-		algo = compress.Zstd
-		debugf("compress", "algorithm=zstd (archive)")
-	case opt.Compress != "" && opt.Compress != compress.None:
-		worth, err := worthCompressing(p, opt.Compress)
-		if err != nil {
-			return nil, fmt.Errorf("read payload: %w", err)
-		}
-		if worth {
-			algo = opt.Compress
-			debugf("compress", "algorithm=%s", algo)
-		} else {
-			debugf("compress", "skipped (a sample does not shrink by 5%%)")
-		}
+	algo, err := chooseCompression(p, opt.Compress, debugf)
+	if err != nil {
+		return nil, err
 	}
 
 	// Seal once: one payload, a fresh content key, a wrap per recipient and
 	// the signed manifest. The revision id is bound into all of them, so it
 	// is chosen here, before the create call.
+	revisionID := uuid.New().String()
 	sp := newMemSpool(0)
 	if !p.inMemory {
-		if sp, err = newSpool(opt.TempDir, spoolNeed(p.size)); err != nil {
+		if sp, err = newSendSpool(opt, revisionID, spoolNeed(p.size)); err != nil {
 			return nil, err
 		}
 		debugf("encrypt", "temporary ciphertext=%s", sp.dir)
 	}
 	defer sp.Close()
 
-	revisionID := uuid.New().String()
 	tEnc := time.Now()
 	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
 		RevisionID:  revisionID,
@@ -725,10 +692,9 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	encElapsed := time.Since(tEnc)
 	m := sealed.Manifest
 	digestHex := hex.EncodeToString(m.PayloadDigest)
-	compressionRatio := 0.0
+	compressionLabel, compressionRatio, originalSize := compressionSummary(p, algo, m, written)
 	if algo != compress.None && written > 0 {
-		compressionRatio = float64(m.PlaintextSize) / float64(written) * 100
-		debugf("compress", "ratio=%.1f%%", compressionRatio)
+		debugf("compress", "ratio=%.1f%%", float64(m.PlaintextSize)/float64(written)*100)
 	}
 	debugf("encrypt", "input=%s", humanBytes(written))
 	debugf("encrypt", "payload=%s", humanBytes(m.CiphertextSize))
@@ -789,18 +755,6 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		FilesMeta:       p.files,
 	}
 
-	compressionLabel := ""
-	originalSize := written
-	switch {
-	case p.archived:
-		compressionLabel = "tar+zstd"
-		originalSize = p.originalSize
-		if originalSize > 0 {
-			compressionRatio = float64(m.PlaintextSize) / float64(originalSize) * 100
-		}
-	case algo != compress.None:
-		compressionLabel = string(algo)
-	}
 	if compressionLabel != "" {
 		req.Compressed = true
 		req.Compression = compressionLabel
@@ -872,13 +826,17 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		debugf("upload", "payload=%s", humanBytes(size))
 		debugf("upload", "parts=%d", expectedParts)
 		debugf("upload", "part_size=%s", humanBytes(secret.MultipartPartSize))
+		pending, err := c.startUpload(sp, secret, revisionID, size)
+		if err != nil {
+			return nil, err
+		}
 		tUp := time.Now()
 		if err := c.api.MultipartUploadOpts(revisionID, sp, size, api.MultipartUploadOptions{
 			Threads:    opt.UploadThreads,
 			OnProgress: opt.OnUploadProgress,
 			OnDebug:    opt.OnDebug,
 		}); err != nil {
-			return nil, fmt.Errorf("multipart upload: %w", err)
+			return nil, uploadFailed(sp, pending, err)
 		}
 		upElapsed := time.Since(tUp)
 		debugf("upload", "elapsed=%s", upElapsed.Round(time.Millisecond))
@@ -923,6 +881,85 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		result.ArchiveEntryCount = p.archiveEntries
 	}
 	return result, nil
+}
+
+// loadIdentity loads the local key pair with the fingerprint (or prefix)
+// fp, or the primary identity registered on the server when fp is empty,
+// and returns it with its full fingerprint.
+func (c *Client) loadIdentity(fp, password string) (*crypto.KeyPair, string, error) {
+	if fp == "" {
+		return identity.LoadPrimaryIdentity(c.api, password)
+	}
+	kp, err := crypto.LoadKeyPair(fp, password)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s: %w", crypto.ShortFingerprint(fp), err)
+	}
+	full, err := crypto.Fingerprint(kp)
+	if err != nil {
+		return nil, "", fmt.Errorf("compute fingerprint: %w", err)
+	}
+	return kp, full, nil
+}
+
+// recipientKeys fetches a recipient's primary public keys, verified against
+// their self-signature, with the fingerprint computed when the server sent
+// none.
+func (c *Client) recipientKeys(email string) (*crypto.PublicKeys, error) {
+	keys, err := identity.GetRecipientKeys(c.api, email)
+	if err != nil {
+		return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
+	}
+	if keys.Fingerprint == "" {
+		if keys.Fingerprint, err = crypto.FingerprintFromPubs(keys.ED25519, keys.X25519, keys.MLKEM768, keys.MLDSA65); err != nil {
+			return nil, fmt.Errorf("resolve recipient %s: compute fingerprint: %w", email, err)
+		}
+	}
+	return keys, nil
+}
+
+// chooseCompression picks how p is compressed. An archive is always
+// zstd-compressed: the tar inside it is not. Other payloads are compressed
+// with want when it is set and a sample of them shrinks by at least 5%.
+func chooseCompression(p *plaintext, want compress.Algorithm, debugf func(step, format string, args ...any)) (compress.Algorithm, error) {
+	switch {
+	case p.archived:
+		debugf("compress", "algorithm=zstd (archive)")
+		return compress.Zstd, nil
+	case want == "" || want == compress.None:
+		return compress.None, nil
+	}
+	worth, err := worthCompressing(p, want)
+	if err != nil {
+		return "", fmt.Errorf("read payload: %w", err)
+	}
+	if !worth {
+		debugf("compress", "skipped (a sample does not shrink by 5%%)")
+		return compress.None, nil
+	}
+	debugf("compress", "algorithm=%s", want)
+	return want, nil
+}
+
+// compressionSummary describes a sealed payload's compression: its label
+// ("tar+zstd", "zstd" or ""), the compressed size as a percentage of the
+// original, and the original size. written is what p wrote before
+// compression.
+func compressionSummary(p *plaintext, algo compress.Algorithm, m *crypto.Manifest, written int64) (string, float64, int64) {
+	switch {
+	case p.archived:
+		ratio := 0.0
+		if p.originalSize > 0 {
+			ratio = float64(m.PlaintextSize) / float64(p.originalSize) * 100
+		}
+		return "tar+zstd", ratio, p.originalSize
+	case algo != compress.None:
+		ratio := 0.0
+		if written > 0 {
+			ratio = float64(m.PlaintextSize) / float64(written) * 100
+		}
+		return string(algo), ratio, written
+	}
+	return "", 0, written
 }
 
 // pluralSuffix returns "s" when n != 1.

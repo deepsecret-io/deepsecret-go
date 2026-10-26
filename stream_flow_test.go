@@ -177,8 +177,8 @@ func TestStreamMultipartRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Secret.IsMultipart || len(f.uploads[res.Secret.RevisionID].registered) != 3 {
-		t.Fatalf("multipart %v with %d parts", res.Secret.IsMultipart, len(f.uploads[res.Secret.RevisionID].registered))
+	if !res.Secret.IsMultipart || len(f.uploads[res.Secret.RevisionID].parts) != 3 {
+		t.Fatalf("multipart %v with %d parts", res.Secret.IsMultipart, len(f.uploads[res.Secret.RevisionID].parts))
 	}
 	if res.Compressed {
 		t.Fatal("random data was compressed")
@@ -192,11 +192,12 @@ func TestStreamMultipartRoundTrip(t *testing.T) {
 }
 
 // A download that outlives its presigned URL presigns again and finishes.
+// The 20 MiB object downloads in three 8 MiB ranges.
 func TestDownloadRenewsRefusedURL(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	f.downloadPartSize, f.urlUses = 1<<20, 2
+	f.downloadPartSize, f.urlUses = 1<<20, 1
 	src := filepath.Join(t.TempDir(), "six.bin")
-	data := randomBytes(t, 6<<20)
+	data := randomBytes(t, 20<<20)
 	writeFile(t, src, data, 0o600)
 	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
 	if err != nil {
@@ -209,7 +210,7 @@ func TestDownloadRenewsRefusedURL(t *testing.T) {
 	}
 	assertFile(t, filepath.Join(out, "six.bin"), data, 0)
 	if f.presigns < 3 {
-		t.Fatalf("7 ranges with 2 uses per URL took %d presigns", f.presigns)
+		t.Fatalf("3 ranges with 1 use per URL took %d presigns", f.presigns)
 	}
 }
 

@@ -153,25 +153,9 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	debugf("fetch", "sender_id=%s", secretInfo.SenderID)
 
 	// Load recipient identity (explicit fingerprint or server-registered primary)
-	var kp *crypto.KeyPair
-	var localFP string
-	if opt.Identity != "" {
-		debugf("identity", "source=local keypair")
-		debugf("identity", "fingerprint_prefix=%s", crypto.ShortFingerprint(opt.Identity))
-		kp, err = crypto.LoadKeyPair(opt.Identity, opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("load identity %s: %w", crypto.ShortFingerprint(opt.Identity), err)
-		}
-		localFP, err = crypto.Fingerprint(kp)
-		if err != nil {
-			return nil, fmt.Errorf("compute fingerprint: %w", err)
-		}
-	} else {
-		debugf("identity", "source=primary identity")
-		kp, localFP, err = identity.LoadPrimaryIdentity(c.api, opt.Password)
-		if err != nil {
-			return nil, fmt.Errorf("load identity: %w", err)
-		}
+	kp, localFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	if err != nil {
+		return nil, fmt.Errorf("load identity: %w", err)
 	}
 	debugf("identity", "recipient fingerprint=%s", crypto.ShortFingerprint(localFP))
 

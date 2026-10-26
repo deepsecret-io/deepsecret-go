@@ -118,8 +118,16 @@ func (e *APIError) Is(target error) bool {
 // Client manages authentication and HTTP communication with the DeepSecret API.
 type Client struct {
 	baseURL    string
-	apiKey     string
 	httpClient *http.Client
+
+	// apiKey is the credential: an API key, or "bearer:" and a session
+	// token, which the client refreshes before it expires (session.go).
+	// Guarded by authMu; refreshMu makes concurrent refreshes one.
+	apiKey    string
+	session   *SessionStore
+	authMu    sync.Mutex
+	refreshMu sync.Mutex
+
 	// presignClient is a separate client used for object-storage presign
 	// uploads/downloads. It carries no auth headers (the presigned URL is the
 	// authentication) and rejects every redirect: S3 PUT/GET should never
@@ -381,13 +389,32 @@ func (c *Client) Delete(path string, body any) (*Response, error) {
 	return c.do("DELETE", path, body)
 }
 
+// do sends an API request. A session token close to expiry is refreshed
+// first, and a request refused with 401 is sent once more if the session
+// could be renewed: a 401 comes from authentication, before the handler
+// runs, so the retry cannot repeat an action.
 func (c *Client) do(method, path string, body any) (*Response, error) {
-	var bodyReader io.Reader
+	var data []byte
 	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if data, err = json.Marshal(body); err != nil {
 			return nil, fmt.Errorf("marshal body: %w", err)
 		}
+	}
+	key := c.freshCredential()
+	resp, err := c.send(method, path, data, key)
+	if isBearer(key) && errors.Is(err, ErrUnauthorized) && c.renewSession(key) == nil {
+		if renewed := c.credential(); renewed != key {
+			return c.send(method, path, data, renewed)
+		}
+	}
+	return resp, err
+}
+
+// send makes one API request authenticated with key.
+func (c *Client) send(method, path string, data []byte, key string) (*Response, error) {
+	var bodyReader io.Reader
+	if data != nil {
 		bodyReader = bytes.NewReader(data)
 	}
 
@@ -395,10 +422,10 @@ func (c *Client) do(method, path string, body any) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.HasPrefix(c.apiKey, "bearer:") {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimPrefix(c.apiKey, "bearer:"))
+	if token, ok := strings.CutPrefix(key, "bearer:"); ok {
+		req.Header.Set("Authorization", "Bearer "+token)
 	} else {
-		req.Header.Set("DS-API-KEY", c.apiKey)
+		req.Header.Set("DS-API-KEY", key)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -656,17 +683,24 @@ func secureJitter() float64 {
 	return float64(v)/float64(1<<53)*2 - 1
 }
 
+// maxBackoff caps the wait before any retry.
+const maxBackoff = time.Minute
+
+// backoffUnit scales retry waits; tests shorten it.
+var backoffUnit = time.Second
+
 // retryBackoff sleeps for exponential backoff with jitter before a retry.
-// base = 2^attempt seconds, jitter = ±25% sourced from crypto/rand.
+// base = 2^attempt seconds up to maxBackoff, jitter = ±25% sourced from
+// crypto/rand.
 // Returns ctx.Err() if the context is cancelled during the sleep so Ctrl+C
 // unblocks an in-progress upload/download retry within a few ms instead of
-// waiting up to ~16s for the timer to elapse.
+// waiting for the timer to elapse.
 func retryBackoff(ctx context.Context, attempt int) error {
-	base := math.Pow(2, float64(attempt))
+	base := math.Min(math.Pow(2, float64(attempt)), maxBackoff.Seconds())
 	jitter := base * 0.25 * secureJitter()
-	d := time.Duration((base + jitter) * float64(time.Second))
-	if d < 100*time.Millisecond {
-		d = 100 * time.Millisecond
+	d := min(time.Duration((base+jitter)*float64(backoffUnit)), maxBackoff)
+	if d < backoffUnit/10 {
+		d = backoffUnit / 10
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()

@@ -97,6 +97,39 @@ if opened.Result.PayloadType == "files" {
 }
 ```
 
+## Large Transfers
+
+Uploads above the server's multipart threshold go in parts (8 MiB, 32 MiB
+from 1 GiB, 64 MiB from 16 GiB). Parts stream between the file and the
+network, so memory does not grow with part size or threads.
+
+- **Threads adapt.** A transfer starts with 4 connections and doubles them
+  while throughput rises by more than 10%, steps back when it does not, and
+  halves them when requests fail or are throttled. `UploadThreads` and
+  `DownloadThreads` fix the number instead.
+- **Retries.** Each part is tried 8 times with backoff up to a minute; a
+  part that moves no bytes for 90 seconds is cancelled and retried. Part
+  URLs come 100 per API call and are presigned again when storage refuses
+  them.
+- **Resume.** With `EncryptOptions.ResumeDir` set, a large send keeps its
+  ciphertext in `<ResumeDir>/<revision id>/` until the upload finishes. A
+  failed or cancelled upload returns an `*UploadInterruptedError`;
+  `ResumeUpload` finishes it later, keeping the parts storage holds.
+  `ListPendingUploads` and `DiscardPendingUpload` manage them.
+- **Sessions.** A client authenticated with a `bearer:` session token
+  refreshes it before its one hour expiry. The server revokes the old
+  token, so set a `SessionStore` to save each new one.
+
+```go
+client.SetSessionStore(sdk.SessionStore{Load: loadToken, Save: saveToken})
+
+_, err := client.EncryptFile(to, "backup.tar", sdk.EncryptOptions{ResumeDir: dir})
+var interrupted *sdk.UploadInterruptedError
+if errors.As(err, &interrupted) {
+    _, err = client.ResumeUpload(dir, interrupted.Upload.RevisionID, sdk.ResumeOptions{})
+}
+```
+
 ## Packages
 
 ### `sdk/crypto`: Cryptographic Primitives

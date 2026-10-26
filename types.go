@@ -121,16 +121,31 @@ type EncryptOptions struct {
 	// If the primary key is encrypted and this is empty, encryption will fail.
 	Password string
 
-	// UploadThreads sets the maximum number of parallel part PUTs the SDK
-	// uses for multipart upload. 0 = SDK default (4). 1 = serial. Values
-	// are clamped to a sane upper bound. Trades sockets and concurrent
-	// memory pressure for faster transfer on high-bandwidth links.
+	// UploadThreads fixes the number of parallel part PUTs of a multipart
+	// upload, at most 32. 0 adapts it to the link: the upload starts with
+	// 4 and adds connections while they raise throughput. 1 = serial.
 	UploadThreads int
+
+	// ResumeDir keeps the ciphertext of a large (multipart) send in a
+	// folder named after its revision under this directory, so an upload
+	// that fails or is cancelled can finish later with ResumeUpload; the
+	// send then returns an UploadInterruptedError. Empty means a temporary
+	// directory removed when the send ends, and no resume.
+	ResumeDir string
 
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes for
 	// the upload. Allowed range is 1-30 (server clamps at 30). 0 = default
 	// (DefaultPresignExpiryMinutes, currently 30).
 	PresignExpiryMinutes int
+
+	// LocalFile writes the sealed secret to this file instead of sending
+	// it: nothing is uploaded and no secret is created. Recipients' public
+	// keys still come from the API, and they open the file with
+	// OpenLocalFile. Name, TTL, IPs and RevokeMissing do not apply. The
+	// file is written next to its final path and renamed into place, and
+	// an existing file is refused unless LocalOverwrite is set.
+	LocalFile      string
+	LocalOverwrite bool
 }
 
 // Recipient is one recipient of a revision: their email and the
@@ -144,7 +159,8 @@ type Recipient struct {
 // send encrypts the payload once for every recipient, so the sizes are
 // those of the single stored payload.
 type EncryptResult struct {
-	Secret            secrets.Secret
+	Secret            secrets.Secret // empty for a local file
+	LocalFile         string         // the file written, for EncryptOptions.LocalFile
 	EncryptedSize     int64
 	SenderFingerprint string
 	Recipients        []Recipient       // everyone the revision was sealed for, in the order given
@@ -207,8 +223,9 @@ type DecryptResult struct {
 	Decrypted            *payload.Decrypted
 	RevisionID           string // UUID of the revision that was decrypted (resolved if Revision was empty)
 	SenderFingerprint    string
+	SenderEmail          string      // for a local file: the sender, whose registered key signed the manifest
 	RecipientFingerprint string      // the caller's own key, which the wrap was made for
-	Recipients           []Recipient // every recipient the sender signed for; Email is the server's label for each fingerprint
+	Recipients           []Recipient // every recipient the sender signed for; Email is the server's (or a local file's) label for each fingerprint
 	Compressed           bool
 	Compression          string
 	PayloadType          string

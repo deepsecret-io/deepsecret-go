@@ -24,6 +24,9 @@ type spool struct {
 	file *os.File // nil in memory
 	buf  []byte
 	size int64
+
+	resumable bool // under ResumeDir, named after the revision (resume.go)
+	keep      bool // Close leaves the directory, for a resume
 }
 
 // newSpool creates a private directory (0700) under base, or under
@@ -107,13 +110,17 @@ func (s *spool) reader(size int64) *io.SectionReader {
 	return io.NewSectionReader(s, 0, size)
 }
 
-// Close closes the file and removes the directory with it.
+// Close closes the file and removes the directory with it, unless the
+// spool is kept for a resume.
 func (s *spool) Close() error {
 	if s.file == nil {
 		s.buf = nil
 		return nil
 	}
 	s.file.Close()
+	if s.keep {
+		return nil
+	}
 	return os.RemoveAll(s.dir)
 }
 

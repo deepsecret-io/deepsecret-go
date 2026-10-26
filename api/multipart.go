@@ -4,10 +4,9 @@
 package api
 
 import (
-	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,8 +14,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,21 +32,18 @@ const (
 	// S3MaxParts is the maximum number of parts in a single multipart upload.
 	S3MaxParts = 10000
 
-	// multipartUploadConcurrency caps in-flight part uploads. S3 throughput
-	// is dominated by parallelism; 4 is a conservative default that avoids
-	// saturating residential uplinks.
-	multipartUploadConcurrency = 4
+	// MaxUploadThreads caps concurrent part PUTs. Uploads adapt below it
+	// (adaptive.go) unless the caller fixes the number.
+	MaxUploadThreads = 32
 
-	// multipartPartMaxRetries is how many times a single failed part PUT is
-	// retried before the upload as a whole fails. Each retry uses fresh
-	// presigned URLs (the previous one may be stale or sign-mismatched).
-	multipartPartMaxRetries = 4
+	// multipartAttempts is how many times a part PUT, or an API call of
+	// the upload, is tried before the upload fails. With backoff capped at
+	// a minute, a part rides out a few minutes of outage.
+	multipartAttempts = 8
 
-	// maxPartBuffer is the largest part size the client buffers; a server
-	// asking for more is refused. maxUploadBuffers bounds all workers'
-	// buffers together, so fewer workers run when parts are large.
-	maxPartBuffer    = int64(512 << 20)
-	maxUploadBuffers = int64(1 << 30)
+	// partURLBatch is how many part URLs one API call presigns: the part a
+	// worker needs and the ones queued after it.
+	partURLBatch = 100
 )
 
 // ── Wire types ──────────────────────────────────────────────────────────────
@@ -59,22 +56,28 @@ type MultipartInitResponse struct {
 	ExpiresAt     time.Time `json:"expires_at"`
 }
 
-// MultipartPartURLResponse is returned by POST /multipart/part-url.
-type MultipartPartURLResponse struct {
-	URL       string `json:"url"`
-	ExpiresIn int    `json:"expires_in"`
+// MultipartPartURLsResponse is returned by POST /multipart/part-urls: one
+// URL per requested part, each signing the part's exact size.
+type MultipartPartURLsResponse struct {
+	Parts     []MultipartPartURL `json:"parts"`
+	ExpiresIn int                `json:"expires_in"` // seconds
 }
 
-// MultipartPartStatus is one already-registered part as reported by /status.
+// MultipartPartURL is the presigned upload URL of one part.
+type MultipartPartURL struct {
+	PartNumber int    `json:"part_number"`
+	URL        string `json:"url"`
+}
+
+// MultipartPartStatus is one part that storage holds.
 type MultipartPartStatus struct {
-	PartNumber int       `json:"part_number"`
-	Etag       string    `json:"etag"`
-	Size       int64     `json:"size"`
-	SHA256     string    `json:"sha256"`
-	UploadedAt time.Time `json:"uploaded_at"`
+	PartNumber int    `json:"part_number"`
+	Etag       string `json:"etag"`
+	Size       int64  `json:"size"`
 }
 
-// MultipartStatus is returned by GET /multipart/status.
+// MultipartStatus is returned by GET /multipart/status. Parts are what
+// storage holds for the upload.
 type MultipartStatus struct {
 	UploadID      string                `json:"upload_id"`
 	State         string                `json:"state"`
@@ -106,35 +109,19 @@ func (c *Client) MultipartInit(revisionID string) (*MultipartInitResponse, error
 	return &out, nil
 }
 
-// MultipartPartURL fetches a presigned UploadPart URL for a single part.
-func (c *Client) MultipartPartURL(revisionID string, partNumber int) (*MultipartPartURLResponse, error) {
-	resp, err := c.Post("/api/v1/secrets/revisions/"+revisionID+"/multipart/part-url", map[string]any{
-		"part_number": partNumber,
+// MultipartPartURLs presigns upload URLs for up to 100 distinct parts.
+func (c *Client) MultipartPartURLs(revisionID string, partNumbers []int) (*MultipartPartURLsResponse, error) {
+	resp, err := c.Post("/api/v1/secrets/revisions/"+revisionID+"/multipart/part-urls", map[string]any{
+		"part_numbers": partNumbers,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("multipart part-url: %w", err)
+		return nil, fmt.Errorf("multipart part-urls: %w", err)
 	}
-	var out MultipartPartURLResponse
+	var out MultipartPartURLsResponse
 	if err := json.Unmarshal(resp.Data, &out); err != nil {
-		return nil, fmt.Errorf("parse part-url: %w", err)
+		return nil, fmt.Errorf("parse part-urls: %w", err)
 	}
 	return &out, nil
-}
-
-// MultipartRegisterPart records a successfully uploaded part with the server.
-// The server cross-checks the declared ETag against S3 ListParts before
-// persisting.
-func (c *Client) MultipartRegisterPart(revisionID string, partNumber int, etag string, size int64, sha256Hex string) error {
-	_, err := c.Post("/api/v1/secrets/revisions/"+revisionID+"/multipart/parts", map[string]any{
-		"part_number": partNumber,
-		"etag":        etag,
-		"size":        size,
-		"sha256":      sha256Hex,
-	})
-	if err != nil {
-		return fmt.Errorf("multipart register part %d: %w", partNumber, err)
-	}
-	return nil
 }
 
 // MultipartComplete finalizes the upload. Parts must be ordered ascending and
@@ -163,7 +150,7 @@ func (c *Client) MultipartAbort(revisionID string) error {
 	return nil
 }
 
-// MultipartStatus loads the current multipart upload state and registered parts.
+// MultipartStatus loads the upload's state and the parts storage holds.
 func (c *Client) MultipartStatus(revisionID string) (*MultipartStatus, error) {
 	resp, err := c.Get("/api/v1/secrets/revisions/" + revisionID + "/multipart/status")
 	if err != nil {
@@ -177,7 +164,7 @@ func (c *Client) MultipartStatus(revisionID string) (*MultipartStatus, error) {
 }
 
 // humanBytesLocal renders a byte count in IEC units for debug log lines.
-// Tiny duplicate of the helper in the parent sdk package — sdk/api can't
+// Tiny duplicate of the helper in the parent sdk package: sdk/api can't
 // import sdk (would create a cycle).
 func humanBytesLocal(b int64) string {
 	if b <= 0 {
@@ -202,434 +189,472 @@ func humanBytesLocal(b int64) string {
 
 // ── High-level helper ──────────────────────────────────────────────────────
 
-// MultipartUpload uploads `data` to a revision using the multipart flow:
-// init -> per-part PUT (parallel, with retry) -> register -> complete.
-//
-// Resumability: if the revision is already partially uploaded, MultipartUpload
-// queries /multipart/status, validates each already-registered part's SHA256
-// against the local data, and skips re-uploading those parts. A part with a
-// mismatched SHA256 is treated as corrupt and re-uploaded.
-//
-// On any unrecoverable failure the upload is left in 'in_progress' so a later
-// call can resume; the orphan-cleanup cron eventually aborts it server-side
-// if it stays stale beyond the configured TTL.
-//
-// Security: SHA256 is computed over each *ciphertext* chunk and submitted to
-// the server alongside the S3 ETag (which is MD5 — collision-prone for
-// adversarial inputs). The server cross-checks the ETag against S3 ListParts
-// before recording the part, so a compromised or malicious client cannot
-// register an ETag that wasn't actually written.
-func (c *Client) MultipartUpload(revisionID string, data []byte, onProgress func(int64, int64)) error {
-	return c.MultipartUploadOpts(revisionID, bytes.NewReader(data), int64(len(data)), MultipartUploadOptions{OnProgress: onProgress})
-}
-
 // MultipartUploadOptions configures the multipart-upload helper.
 type MultipartUploadOptions struct {
-	// Threads bounds in-flight part uploads. 0 = default (multipartUploadConcurrency).
-	// Clamped to [1, 32].
+	// Threads fixes the number of concurrent part PUTs, at most
+	// MaxUploadThreads. 0 adapts it to the link (adaptive.go).
 	Threads int
-	// OnProgress is called with (transferredBytes, totalBytes).
+	// OnProgress is called with (transferredBytes, totalBytes) as bytes
+	// go out, one call at a time. The count drops back when a failed part
+	// is retried.
 	OnProgress func(int64, int64)
 	// OnDebug is called with structured debug events.
 	OnDebug func(step, message string)
 }
 
-// MultipartUploadWithDebug is the legacy callback-style entry. New callers
-// should prefer MultipartUploadOpts so they can also set Threads.
-func (c *Client) MultipartUploadWithDebug(revisionID string, data []byte, onProgress func(int64, int64), onDebug func(step, message string)) error {
-	return c.MultipartUploadOpts(revisionID, bytes.NewReader(data), int64(len(data)), MultipartUploadOptions{OnProgress: onProgress, OnDebug: onDebug})
+// uploadPart is one part's range of the source.
+type uploadPart struct {
+	Number int
+	Offset int64
+	Size   int64
 }
 
-// MultipartUploadOpts uploads the size bytes of src via the multipart flow
-// with explicit concurrency, progress, and debug controls. src is read
-// once to hash every part, then each part again as it is sent, so it can
-// be a file of any size: memory is one part-sized buffer per worker.
+// MultipartUploadOpts uploads the size bytes of src to the revision through
+// the multipart flow: init, part URLs a hundred at a time, parallel part
+// PUTs, complete. The server reads the uploaded parts from storage, so no
+// part is registered on its own.
+//
+// It resumes. Parts that storage already holds from an earlier attempt are
+// kept when they have the right size and, when storage reports an MD5
+// ETag (S3 and R2 do for these uploads), the same bytes as src; the rest
+// are sent. A failed upload stays in progress for a later call to resume,
+// until the server's orphan cleanup aborts it after a day without
+// activity.
+//
+// Parts stream from src to the network, read once for their Content-MD5
+// and again as they are sent, so src can be a file of any size and memory
+// does not grow with the part size or the number of threads.
 func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSize int64, opts MultipartUploadOptions) error {
-	onProgress := opts.OnProgress
-	onDebug := opts.OnDebug
 	if totalSize <= 0 {
 		return fmt.Errorf("multipart upload: empty data")
 	}
-
 	debugf := func(step, format string, args ...any) {
-		if onDebug == nil {
-			return
+		if opts.OnDebug != nil {
+			opts.OnDebug(step, fmt.Sprintf(format, args...))
 		}
-		onDebug(step, fmt.Sprintf(format, args...))
 	}
+	ctx, cancel := context.WithCancelCause(c.reqCtx())
+	defer cancel(nil)
 
-	init, err := c.MultipartInit(revisionID)
-	if err != nil {
+	var init *MultipartInitResponse
+	if err := c.retryAPI(ctx, func() (err error) {
+		init, err = c.MultipartInit(revisionID)
+		return err
+	}); err != nil {
 		return err
 	}
-	uidShort := init.UploadID
-	if len(uidShort) > 12 {
-		uidShort = uidShort[:12] + "…"
-	}
-	debugf("multipart.init", "upload_id=%s parts=%d × %s expires=%s",
-		uidShort, init.MaxPartNumber, humanBytesLocal(init.PartSize),
-		init.ExpiresAt.Format("15:04:05"))
-
+	debugf("multipart.init", "parts=%d × %s", init.MaxPartNumber, humanBytesLocal(init.PartSize))
 	if init.PartSize < S3MinPartSize || init.PartSize > S3MaxPartSize {
 		return fmt.Errorf("multipart upload: server returned invalid part size %d", init.PartSize)
 	}
-	if init.PartSize > maxPartBuffer {
-		return fmt.Errorf("multipart upload: server part size %d is over the client's %d-byte buffer limit", init.PartSize, maxPartBuffer)
+	count := int((totalSize + init.PartSize - 1) / init.PartSize)
+	if count != init.MaxPartNumber {
+		// The revision's declared size does not match the data: refuse
+		// rather than upload garbage.
+		return fmt.Errorf("multipart upload: data size %d yields %d parts but server expects %d (revision size mismatch)", totalSize, count, init.MaxPartNumber)
 	}
-	bufSize := min(init.PartSize, totalSize)
-
-	expectedParts := int(totalSize / init.PartSize)
-	if totalSize%init.PartSize != 0 {
-		expectedParts++
+	if count > S3MaxParts {
+		return fmt.Errorf("multipart upload: %d parts exceeds S3 limit of %d", count, S3MaxParts)
 	}
-	if expectedParts < 1 {
-		expectedParts = 1
-	}
-	if expectedParts != init.MaxPartNumber {
-		// Server's ceil(rev.Size/part_size) must equal what we just computed.
-		// A mismatch means the revision's declared size doesn't match the
-		// data we're uploading — refuse rather than upload garbage.
-		return fmt.Errorf("multipart upload: data size %d yields %d parts but server expects %d (revision size mismatch)", totalSize, expectedParts, init.MaxPartNumber)
-	}
-	if expectedParts > S3MaxParts {
-		return fmt.Errorf("multipart upload: %d parts exceeds S3 limit of %d", expectedParts, S3MaxParts)
-	}
-
-	// Pre-compute every part's range, SHA256 and MD5 in one read of src.
-	// Done up front so resume validation and parallel upload share the
-	// same authoritative table.
-	parts := make([]multipartLocalPart, expectedParts)
-	{
-		buf := make([]byte, bufSize)
-		for i := 0; i < expectedParts; i++ {
-			start := int64(i) * init.PartSize
-			size := min(init.PartSize, totalSize-start)
-			chunk := buf[:size]
-			if err := readFull(src, chunk, start); err != nil {
-				return fmt.Errorf("multipart upload: read part %d: %w", i+1, err)
-			}
-			sha := sha256.Sum256(chunk)
-			md := md5.Sum(chunk)
-			parts[i] = multipartLocalPart{
-				Number:     i + 1,
-				Offset:     start,
-				Size:       size,
-				SHA256:     hex.EncodeToString(sha[:]),
-				ContentMD5: base64.StdEncoding.EncodeToString(md[:]),
-			}
-		}
-	}
-
-	// Resumability: ask the server which parts are already registered, drop
-	// matches by SHA256 from the work list. Retry transient + 429 errors so
-	// a brief rate-limit hit at the start doesn't cost us the resume window.
-	var status *MultipartStatus
-	{
-		statusCtx := c.reqCtx()
-		var statusErr error
-		for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
-			if err := statusCtx.Err(); err != nil {
-				return err
-			}
-			if attempt > 0 {
-				if err := multipartBackoff(statusCtx, attempt, statusErr); err != nil {
-					return err
-				}
-			}
-			status, statusErr = c.MultipartStatus(revisionID)
-			if statusErr == nil {
-				break
-			}
-			if !isMultipartRetryableErr(statusErr) {
-				break
-			}
-		}
-		if status == nil {
-			status = &MultipartStatus{}
-		}
-	}
-	registered := make(map[int]MultipartPartStatus, len(status.Parts))
-	for _, p := range status.Parts {
-		registered[p.PartNumber] = p
-	}
-
-	type completedPart struct {
-		Number int
-		Etag   string
-	}
-	completedCh := make(chan completedPart, expectedParts)
-
-	// Seed already-registered+verified parts into the completed channel.
-	skipped := 0
-	var skippedBytes int64
-	work := make([]int, 0, expectedParts)
+	parts := make([]uploadPart, count)
 	for i := range parts {
-		p := parts[i]
-		reg, ok := registered[p.Number]
-		if ok && reg.SHA256 == p.SHA256 && reg.Size == p.Size {
-			completedCh <- completedPart{Number: p.Number, Etag: reg.Etag}
-			skipped++
-			skippedBytes += p.Size
-			continue
+		off := int64(i) * init.PartSize
+		parts[i] = uploadPart{Number: i + 1, Offset: off, Size: min(init.PartSize, totalSize-off)}
+	}
+
+	// Parts from an earlier attempt.
+	var status *MultipartStatus
+	if err := c.retryAPI(ctx, func() (err error) {
+		status, err = c.MultipartStatus(revisionID)
+		return err
+	}); err != nil {
+		return err
+	}
+	etags, kept, err := keepStoredParts(ctx, src, parts, status.Parts)
+	if err != nil {
+		return fmt.Errorf("multipart upload: %w", err)
+	}
+	var work []int
+	for i := range parts {
+		if etags[i] == "" {
+			work = append(work, i)
 		}
-		work = append(work, i)
+	}
+	if kept > 0 {
+		debugf("multipart.resume", "kept %d part(s) already in storage (%s); uploading %d", count-len(work), humanBytesLocal(kept), len(work))
 	}
 
-	if onProgress != nil {
-		onProgress(skippedBytes, totalSize)
+	var sent atomic.Int64
+	sent.Store(kept)
+	if opts.OnProgress != nil {
+		opts.OnProgress(kept, totalSize)
 	}
-	if skipped > 0 {
-		debugf("multipart.resume", "skipped %d already-registered parts (%d bytes); uploading %d remaining", skipped, skippedBytes, len(work))
-	}
-
 	if len(work) > 0 {
-		// Bounded parallelism. Workers pull part indices off `workCh` and
-		// write completed parts onto `completedCh`. First error short-circuits.
-		workCh := make(chan int, len(work))
-		for _, idx := range work {
-			workCh <- idx
+		lim := newLimiter(ctx, opts.Threads, min(MaxUploadThreads, len(work)))
+		debugf("multipart.threads", "start=%d max=%d", lim.current(), lim.max)
+		go lim.tune(ctx, func(threads int, rate float64) {
+			debugf("multipart.threads", "threads=%d at %s/s", threads, humanBytesLocal(int64(rate)))
+		})
+		var progressMu sync.Mutex
+		progress := func(n int) {
+			lim.add(n)
+			t := min(max(sent.Add(int64(n)), 0), totalSize)
+			if opts.OnProgress != nil {
+				progressMu.Lock()
+				opts.OnProgress(t, totalSize)
+				progressMu.Unlock()
+			}
 		}
-		close(workCh)
-
+		queue := &partQueue{parts: parts, items: work}
+		urls := &partURLCache{c: c, revisionID: revisionID, queue: queue, urls: map[int]cachedURL{}}
 		var wg sync.WaitGroup
-		errCh := make(chan error, multipartUploadConcurrency)
-
-		var mu sync.Mutex
-		var transferred int64 = skippedBytes
-
-		concurrency := multipartUploadConcurrency
-		if opts.Threads > 0 {
-			concurrency = opts.Threads
-		}
-		// Cap at a sane ceiling to avoid runaway socket pressure even if a
-		// caller passes something silly like 1000.
-		if concurrency > 32 {
-			concurrency = 32
-		}
-		if concurrency > len(work) {
-			concurrency = len(work)
-		}
-		concurrency = max(1, min(concurrency, int(maxUploadBuffers/bufSize)))
-		debugf("multipart.upload", "starting %d worker(s), %d part(s) to upload", concurrency, len(work))
-		ctx := c.reqCtx()
-		for i := 0; i < concurrency; i++ {
+		for range lim.max {
 			wg.Add(1)
-			go func(workerID int) {
+			go func() {
 				defer wg.Done()
-				buf := make([]byte, bufSize)
-				for idx := range workCh {
-					// Drain the channel quickly when the user hits Ctrl+C
-					// so we don't keep starting new HTTP attempts after
-					// the cancellation signal arrives.
-					select {
-					case <-ctx.Done():
-						select {
-						case errCh <- ctx.Err():
-						default:
-						}
+				for {
+					if lim.acquire(ctx) != nil {
 						return
-					default:
+					}
+					idx, ok := queue.pop()
+					if !ok {
+						lim.release()
+						return
 					}
 					p := parts[idx]
 					t0 := time.Now()
-					// Stream-level progress: ticks as bytes flow over the
-					// wire (every TCP chunk), not just when a whole part
-					// lands. Negative deltas appear on retry rewinds.
-					chunkCb := func(n int) {
-						if onProgress == nil {
-							return
-						}
-						mu.Lock()
-						transferred += int64(n)
-						if transferred < skippedBytes {
-							transferred = skippedBytes
-						}
-						if transferred > totalSize {
-							transferred = totalSize
-						}
-						t := transferred
-						mu.Unlock()
-						onProgress(t, totalSize)
+					sum, err := partMD5(src, p)
+					if err == nil {
+						etags[idx], err = c.uploadPart(ctx, urls, lim, p, src, base64.StdEncoding.EncodeToString(sum), progress)
 					}
-					data := buf[:p.Size]
-					if err := readFull(src, data, p.Offset); err != nil {
-						select {
-						case errCh <- fmt.Errorf("read part %d: %w", p.Number, err):
-						default:
-						}
+					lim.release()
+					if err != nil {
+						cancel(fmt.Errorf("part %d: %w", p.Number, err))
 						return
 					}
-					etag, putErr := c.uploadPartWithRetry(revisionID, p, data, chunkCb)
-					if putErr != nil {
-						debugf("multipart.upload", "worker=%d part=%d FAILED err=%v", workerID, p.Number, putErr)
-						select {
-						case errCh <- putErr:
-						default:
-						}
-						return
-					}
-					if regErr := c.registerPartWithRetry(revisionID, p.Number, etag, p.Size, p.SHA256); regErr != nil {
-						debugf("multipart.upload", "worker=%d part=%d register FAILED err=%v", workerID, p.Number, regErr)
-						select {
-						case errCh <- regErr:
-						default:
-						}
-						return
-					}
-					elapsed := time.Since(t0)
-					etagShort := etag
-					if len(etagShort) > 12 {
-						etagShort = etagShort[:12]
-					}
-					debugf("multipart.upload", "part %d/%d uploaded — size=%s etag=%s in %s (worker=%d)",
-						p.Number, len(parts), humanBytesLocal(p.Size), etagShort,
-						elapsed.Round(time.Millisecond), workerID)
-					completedCh <- completedPart{Number: p.Number, Etag: etag}
+					debugf("multipart.upload", "part %d/%d size=%s in %s", p.Number, count, humanBytesLocal(p.Size), time.Since(t0).Round(time.Millisecond))
 				}
-			}(i)
+			}()
 		}
 		wg.Wait()
-		close(errCh)
-		if err, ok := <-errCh; ok && err != nil {
-			return fmt.Errorf("multipart upload: %w", err)
+		if ctx.Err() != nil {
+			return fmt.Errorf("multipart upload: %w", context.Cause(ctx))
 		}
 	}
 
-	close(completedCh)
-
-	final := make([]MultipartPartStatus, 0, expectedParts)
-	for cp := range completedCh {
-		final = append(final, MultipartPartStatus{PartNumber: cp.Number, Etag: cp.Etag})
+	final := make([]MultipartPartStatus, count)
+	for i, p := range parts {
+		final[i] = MultipartPartStatus{PartNumber: p.Number, Etag: etags[i], Size: p.Size}
 	}
-	if len(final) != expectedParts {
-		return fmt.Errorf("multipart upload: expected %d completed parts, got %d", expectedParts, len(final))
-	}
-	sort.Slice(final, func(i, j int) bool { return final[i].PartNumber < final[j].PartNumber })
-
 	tComp := time.Now()
-	if err := c.MultipartComplete(revisionID, final); err != nil {
+	if err := c.retryAPI(ctx, func() error { return c.MultipartComplete(revisionID, final) }); err != nil {
 		return err
 	}
-	debugf("multipart.complete", "finalized %d parts in %s", len(final), time.Since(tComp).Round(time.Millisecond))
+	debugf("multipart.complete", "finalized %d parts in %s", count, time.Since(tComp).Round(time.Millisecond))
 	return nil
 }
 
-// readFull fills p from src at off. A short read is an error, even when it
-// ends at EOF: the source is shorter than the declared size.
-func readFull(src io.ReaderAt, p []byte, off int64) error {
-	n, err := src.ReadAt(p, off)
-	if n == len(p) {
-		return nil
+// keepStoredParts decides which of the parts storage already holds can
+// stay, returning their ETags by part index and their total size. A stored
+// part stays when it has the part's size and, when its ETag is an MD5 of
+// the part, the same bytes as src: checking means reading those parts of
+// src again, which is cheap next to uploading them.
+func keepStoredParts(ctx context.Context, src io.ReaderAt, parts []uploadPart, stored []MultipartPartStatus) ([]string, int64, error) {
+	etags := make([]string, len(parts))
+	var candidates []int
+	byNumber := make(map[int]MultipartPartStatus, len(stored))
+	for _, s := range stored {
+		byNumber[s.PartNumber] = s
 	}
-	if err == nil || errors.Is(err, io.EOF) {
+	for i, p := range parts {
+		if s, ok := byNumber[p.Number]; ok && s.Size == p.Size && s.Etag != "" {
+			candidates = append(candidates, i)
+		}
+	}
+	var (
+		mu      sync.Mutex
+		firstEr error
+		wg      sync.WaitGroup
+		next    atomic.Int64
+	)
+	for range min(4, len(candidates)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				k := int(next.Add(1)) - 1
+				if k >= len(candidates) || ctx.Err() != nil {
+					return
+				}
+				i := candidates[k]
+				p := parts[i]
+				etag := strings.ToLower(strings.Trim(byNumber[p.Number].Etag, `"`))
+				if isMD5Hex(etag) {
+					sum, err := partMD5(src, p)
+					if err != nil {
+						mu.Lock()
+						firstEr = cmp.Or(firstEr, err)
+						mu.Unlock()
+						return
+					}
+					if hex.EncodeToString(sum) != etag {
+						continue
+					}
+				}
+				etags[i] = etag
+			}
+		}()
+	}
+	wg.Wait()
+	if firstEr != nil {
+		return nil, 0, firstEr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	var kept int64
+	for i, e := range etags {
+		if e != "" {
+			kept += parts[i].Size
+		}
+	}
+	return etags, kept, nil
+}
+
+func isMD5Hex(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+// partMD5 reads part p of src and returns its MD5. A source shorter than
+// the declared size is an error.
+func partMD5(src io.ReaderAt, p uploadPart) ([]byte, error) {
+	h := md5.New()
+	n, err := io.Copy(h, io.NewSectionReader(src, p.Offset, p.Size))
+	if err == nil && n != p.Size {
 		err = io.ErrUnexpectedEOF
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read part %d: %w", p.Number, err)
+	}
+	return h.Sum(nil), nil
+}
+
+// partQueue hands out the parts left to upload, in order.
+type partQueue struct {
+	mu    sync.Mutex
+	parts []uploadPart
+	items []int // indexes into parts
+	next  int
+}
+
+func (q *partQueue) pop() (int, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.next >= len(q.items) {
+		return 0, false
+	}
+	q.next++
+	return q.items[q.next-1], true
+}
+
+// near returns the numbers of the last back parts handed out, which may be
+// in flight, and of up to ahead parts not handed out yet.
+func (q *partQueue) near(back, ahead int) []int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	window := q.items[max(0, q.next-back):min(len(q.items), q.next+ahead)]
+	out := make([]int, len(window))
+	for i, idx := range window {
+		out[i] = q.parts[idx].Number
+	}
+	return out
+}
+
+// partURLCache holds presigned part URLs. A miss presigns the part with
+// the parts in flight and queued after it, so an upload makes one API call
+// per hundred parts rather than one per part.
+type partURLCache struct {
+	c          *Client
+	revisionID string
+	queue      *partQueue
+
+	mu   sync.Mutex
+	urls map[int]cachedURL
+
+	fetchMu sync.Mutex // one batch request at a time
+}
+
+type cachedURL struct {
+	url     string
+	renewAt time.Time
+}
+
+func (u *partURLCache) lookup(n int) (string, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	e, ok := u.urls[n]
+	if !ok || !time.Now().Before(e.renewAt) {
+		return "", false
+	}
+	return e.url, true
+}
+
+// get returns a URL for part n, presigning a batch when n has none or its
+// URL is about to expire.
+func (u *partURLCache) get(ctx context.Context, n int) (string, error) {
+	if url, ok := u.lookup(n); ok {
+		return url, nil
+	}
+	u.fetchMu.Lock()
+	defer u.fetchMu.Unlock()
+	if url, ok := u.lookup(n); ok {
+		return url, nil
+	}
+	numbers := []int{n}
+	for _, m := range u.queue.near(MaxUploadThreads, 2*partURLBatch) {
+		if len(numbers) == partURLBatch {
+			break
+		}
+		if _, fresh := u.lookup(m); !fresh && m != n {
+			numbers = append(numbers, m)
+		}
+	}
+	var resp *MultipartPartURLsResponse
+	if err := u.c.retryAPI(ctx, func() (err error) {
+		resp, err = u.c.MultipartPartURLs(u.revisionID, numbers)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	// Renew 30 seconds before expiry: storage checks the expiry when a
+	// request starts, so a long PUT on a URL near its end still completes.
+	lifetime := time.Duration(resp.ExpiresIn) * time.Second
+	renewAt := time.Now().Add(lifetime - min(30*time.Second, lifetime/4))
+	asked := make(map[int]bool, len(numbers))
+	for _, m := range numbers {
+		asked[m] = true
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for _, p := range resp.Parts {
+		if asked[p.PartNumber] && p.URL != "" {
+			u.urls[p.PartNumber] = cachedURL{url: p.URL, renewAt: renewAt}
+		}
+	}
+	e, ok := u.urls[n]
+	if !ok {
+		return "", fmt.Errorf("the server did not presign part %d", n)
+	}
+	return e.url, nil
+}
+
+// drop forgets url for part n, after storage refused it.
+func (u *partURLCache) drop(n int, url string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.urls[n].url == url {
+		delete(u.urls, n)
+	}
+}
+
+// retryAPI runs an API call of the upload, retrying transient failures.
+func (c *Client) retryAPI(ctx context.Context, call func() error) error {
+	var err error
+	for attempt := 0; attempt < multipartAttempts; attempt++ {
+		if attempt > 0 {
+			if berr := multipartBackoff(ctx, attempt, err); berr != nil {
+				return berr
+			}
+		}
+		if err = call(); err == nil || !isMultipartRetryableErr(err) {
+			return err
+		}
 	}
 	return err
 }
 
-// multipartLocalPart is one part's range of the source with the hashes
-// used for both resume-validation and upload.
-type multipartLocalPart struct {
-	Number     int
-	Offset     int64
-	Size       int64
-	SHA256     string
-	ContentMD5 string // base64, sent as Content-MD5
-}
-
-// uploadPartWithRetry PUTs one part to a freshly-presigned URL, retrying on
-// transient transport / 5xx / 429 errors. Each retry asks for a *new*
-// presigned URL so a stale one (e.g. expired during long backoff) doesn't
-// poison the retry. On 429 the limiter's Retry-After is honored if present;
-// otherwise the standard exponential-jittered backoff applies.
-//
-// Non-retryable errors (4xx other than 429) are surfaced immediately.
-//
-// Returns the unquoted ETag from S3 on success.
-func (c *Client) uploadPartWithRetry(revisionID string, p multipartLocalPart, data []byte, onChunk func(int)) (string, error) {
-	ctx := c.reqCtx()
+// uploadPart PUTs one part, retrying transient failures with backoff. A
+// URL storage refuses (403, usually expired) is presigned again and
+// retried at once; refused again, the upload fails, since a fresh URL
+// being refused is not an expiry. Returns the part's unquoted ETag.
+func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limiter, p uploadPart, src io.ReaderAt, contentMD5 string, onChunk func(int)) (string, error) {
 	var lastErr error
-	for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
+	refused := false
+	for attempt := 0; attempt < multipartAttempts; attempt++ {
+		if attempt > 0 && !refused {
+			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
+				return "", err
+			}
+		}
+		url, err := urls.get(ctx, p.Number)
+		if err != nil {
 			return "", err
 		}
-		if attempt > 0 {
-			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
-				return "", err
-			}
-		}
-		urlResp, err := c.MultipartPartURL(revisionID, p.Number)
-		if err != nil {
-			if !isMultipartRetryableErr(err) {
-				return "", err
-			}
-			lastErr = err
-			continue
-		}
-
-		// Per-attempt counter so a mid-stream failure can rewind the
-		// caller's progress bar before the retry begins re-streaming.
-		// Without this, a partial upload's bytes would be counted twice.
-		var attemptBytes int64
-		attemptCb := func(n int) {
-			attemptBytes += int64(n)
-			if onChunk != nil {
-				onChunk(n)
-			}
-		}
-		etag, err := c.putPart(urlResp.URL, data, p.ContentMD5, attemptCb)
-		if err != nil {
-			if onChunk != nil && attemptBytes > 0 {
-				onChunk(-int(attemptBytes))
-			}
-			if !isMultipartRetryableErr(err) {
-				return "", err
-			}
-			lastErr = err
-			continue
-		}
-		return etag, nil
-	}
-	return "", fmt.Errorf("after %d attempts: %w", multipartPartMaxRetries, lastErr)
-}
-
-// registerPartWithRetry wraps MultipartRegisterPart so the same 429-aware
-// backoff that protects part-url protects the registration call. Without
-// this, a /multipart/parts call that hits the rate limit fails the whole
-// upload even though the part itself was successfully PUT to S3.
-func (c *Client) registerPartWithRetry(revisionID string, partNumber int, etag string, size int64, sha256Hex string) error {
-	ctx := c.reqCtx()
-	var lastErr error
-	for attempt := 0; attempt <= multipartPartMaxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if attempt > 0 {
-			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
-				return err
-			}
-		}
-		err := c.MultipartRegisterPart(revisionID, partNumber, etag, size, sha256Hex)
+		var moved atomic.Int64
+		etag, err := c.putPart(ctx, url, io.NewSectionReader(src, p.Offset, p.Size), p.Size, contentMD5, func(n int) {
+			moved.Add(int64(n))
+			onChunk(n)
+		})
 		if err == nil {
-			return nil
+			return etag, nil
 		}
-		if !isMultipartRetryableErr(err) {
-			return err
+		// Take back the progress of the failed attempt.
+		if n := moved.Load(); n > 0 {
+			onChunk(-int(n))
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		switch {
+		case errors.Is(err, errPresignRefused):
+			if refused {
+				return "", fmt.Errorf("a freshly presigned URL was refused: %w", err)
+			}
+			urls.drop(p.Number, url)
+			refused = true
+		case isPartRetryable(err):
+			lim.failed()
+			refused = false
+		default:
+			return "", err
 		}
 		lastErr = err
 	}
-	return fmt.Errorf("register part %d after %d attempts: %w", partNumber, multipartPartMaxRetries, lastErr)
+	return "", fmt.Errorf("after %d attempts: %w", multipartAttempts, lastErr)
 }
 
-// isMultipartRetryableErr reports whether err is worth retrying. We retry on:
-//   - transport errors (no APIError wrapped) — likely network blip.
-//   - 5xx server errors.
-//   - 429 rate-limit responses.
-// Context cancellation (Ctrl+C, parent deadline) is NOT retryable — surfacing
-// it immediately lets the user's interrupt take effect without burning the
-// retry budget on requests that are guaranteed to fail.
-// Everything else (auth, validation, conflict) is fatal and surfaced
-// immediately so we don't burn the whole retry budget on a permanent failure.
+// storageError is a part PUT that storage answered with an error status.
+type storageError struct {
+	status int
+	body   string
+}
+
+func (e *storageError) Error() string {
+	return fmt.Sprintf("PUT part failed (status %d): %s", e.status, e.body)
+}
+
+// isPartRetryable reports whether a failed part PUT is worth retrying:
+// transport errors, stalls, storage 5xx and throttling, and the request
+// timeout S3 reports as a 400.
+func isPartRetryable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return errors.Is(err, errStalled)
+	}
+	var se *storageError
+	if errors.As(err, &se) {
+		return se.status >= 500 || se.status == http.StatusTooManyRequests ||
+			(se.status == http.StatusBadRequest && strings.Contains(se.body, "RequestTimeout"))
+	}
+	return true
+}
+
+// isMultipartRetryableErr reports whether an API call of the upload is
+// worth retrying: transport errors, 5xx and 429. Cancellation and every
+// other API error (auth, validation, conflict) fail at once.
 func isMultipartRetryableErr(err error) bool {
 	if err == nil {
 		return false
@@ -641,32 +666,19 @@ func isMultipartRetryableErr(err error) bool {
 	if !errors.As(err, &apiErr) {
 		return true
 	}
-	if apiErr.StatusCode >= 500 {
-		return true
-	}
-	if apiErr.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-	return false
+	return apiErr.StatusCode >= 500 || apiErr.StatusCode == http.StatusTooManyRequests
 }
 
-// multipartBackoff sleeps before the next retry. If the most recent error was
-// a 429 with a Retry-After hint, honor it (clamped); otherwise fall back to
-// the standard exponential-jittered backoff. Returns ctx.Err() if the
-// context is cancelled during the sleep so a Ctrl+C during an upload retry
-// unblocks immediately instead of holding the worker for the full backoff.
+// multipartBackoff sleeps before the next retry. A 429's Retry-After is
+// honored, up to a minute; otherwise the exponential backoff applies.
+// Returns ctx.Err() if the context ends during the sleep.
 func multipartBackoff(ctx context.Context, attempt int, lastErr error) error {
 	var apiErr *APIError
 	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > 0 {
-		d := apiErr.RetryAfter
-		// Clamp at 30s so a misbehaving server can't stall us indefinitely.
-		if d > 30*time.Second {
-			d = 30 * time.Second
-		}
-		// Add a small jitter (±10%) so a fleet of clients hitting the same
-		// 429 don't all retry on the same wall-clock instant.
-		j := float64(d) * 0.1 * secureJitter()
-		timer := time.NewTimer(d + time.Duration(j))
+		d := min(apiErr.RetryAfter, maxBackoff)
+		// ±10% jitter so clients hitting the same 429 spread out.
+		d += time.Duration(float64(d) * 0.1 * secureJitter())
+		timer := time.NewTimer(d)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
@@ -678,13 +690,9 @@ func multipartBackoff(ctx context.Context, attempt int, lastErr error) error {
 	return retryBackoff(ctx, attempt)
 }
 
-// putPart PUTs a single part to the presigned URL and returns the ETag.
-// The presign client refuses redirects, so a 30x is fatal.
 // progressReader wraps an io.Reader and invokes cb with the byte count of
-// each successful Read. Lets putPart stream a multipart chunk to S3 while
-// the caller updates a transferred-bytes counter on every TCP chunk, so
-// the CLI's progress bar advances during long part uploads instead of
-// jumping in 8-MiB increments only when each part completes.
+// each successful Read, so progress and throughput follow the bytes on the
+// wire rather than whole parts.
 type progressReader struct {
 	r  io.Reader
 	cb func(int)
@@ -698,45 +706,43 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (c *Client) putPart(presignedURL string, data []byte, contentMD5 string, onChunk func(int)) (string, error) {
-	var body io.Reader = bytes.NewReader(data)
-	if onChunk != nil {
-		body = &progressReader{r: bytes.NewReader(data), cb: onChunk}
-	}
-	// A per-request deadline: parts upload concurrently on one client.
-	ctx, cancel := context.WithTimeout(c.reqCtx(), presignTimeout(int64(len(data))))
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "PUT", presignedURL, body)
+// putPart PUTs one part to its presigned URL and returns the ETag. There is
+// no overall deadline: a slow part keeps going as long as bytes move, and
+// one that stalls for stallTimeout is cancelled. The presign client
+// refuses redirects, so a 30x is fatal.
+func (c *Client) putPart(ctx context.Context, presignedURL string, data io.Reader, size int64, contentMD5 string, onChunk func(int)) (string, error) {
+	guard := newStallGuard(ctx)
+	defer guard.stop()
+	body := &progressReader{r: data, cb: func(n int) {
+		guard.moved()
+		onChunk(n)
+	}}
+	req, err := http.NewRequestWithContext(guard.ctx, "PUT", presignedURL, body)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Content-MD5", contentMD5)
-	req.ContentLength = int64(len(data))
+	req.ContentLength = size
 
 	resp, err := c.presignClient.Do(req)
 	if err != nil {
+		if guard.stalled() {
+			return "", fmt.Errorf("PUT part: %w", errStalled)
+		}
 		return "", fmt.Errorf("PUT part: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode >= 500 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("PUT part transient (status %d): %s", resp.StatusCode, string(body))
+	if resp.StatusCode == http.StatusForbidden {
+		return "", errPresignRefused
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("PUT part failed (status %d): %s", resp.StatusCode, string(body))
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", &storageError{status: resp.StatusCode, body: string(msg)}
 	}
-
-	etag := resp.Header.Get("ETag")
+	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
 	if etag == "" {
-		return "", fmt.Errorf("PUT part: S3 returned no ETag")
-	}
-	// S3 wraps ETags in quotes; strip them so the value matches what
-	// ListParts returns server-side and what /multipart/parts expects.
-	if len(etag) >= 2 && etag[0] == '"' && etag[len(etag)-1] == '"' {
-		etag = etag[1 : len(etag)-1]
+		return "", fmt.Errorf("PUT part: storage returned no ETag")
 	}
 	return etag, nil
 }

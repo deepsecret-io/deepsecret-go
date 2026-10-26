@@ -46,6 +46,18 @@ func (c *Client) BaseURL() string { return c.api.BaseURL() }
 // CLIs typically wire `signal.NotifyContext(...)` here.
 func (c *Client) SetRootContext(ctx context.Context) { c.api.SetRootContext(ctx) }
 
+// SessionStore keeps a login session's token where the next run finds it;
+// see [Client.SetSessionStore].
+type SessionStore = api.SessionStore
+
+// SetSessionStore makes a client authenticated with "bearer:" and a session
+// token save each token it refreshes. The client refreshes the token
+// shortly before it expires, so long transfers outlive its one-hour
+// lifetime; the server revokes the old token, which is why it must be
+// saved. When the token is refused, the client loads the stored one, in
+// case another process refreshed the session first.
+func (c *Client) SetSessionStore(s SessionStore) { c.api.SetSessionStore(s) }
+
 // ── Identity ─────────────────────────────────────────────────────────────────
 
 // Logout revokes the Bearer token this client authenticates with, so a

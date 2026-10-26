@@ -11,60 +11,63 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // ── Parallel Range download ─────────────────────────────────────────────────
 //
-// One presigned GET URL is requested up front. We fan out N concurrent
+// One presigned GET URL is requested up front. We fan out concurrent
 // `Range: bytes=A-B` requests against that single URL; S3 supports Range
-// natively on every GET, so no server-side change is required.
+// natively on every GET, so no server-side change is required. How many
+// run at once adapts to the link (adaptive.go).
 //
 // Per-part retry is independent: a stalled part doesn't block its peers,
 // and a transient failure on one byte range only re-fetches that range
 // instead of restarting the whole download.
 
 const (
-	// DefaultDownloadConcurrency is what callers get when they don't pass
-	// an explicit thread count. 4 is a conservative default: high enough
-	// to mask per-stream slow starts on long-RTT links, low enough to be
-	// polite to free-tier S3-compatible backends.
-	DefaultDownloadConcurrency = 4
-
-	// MaxDownloadConcurrency caps the parallelism a caller can request.
-	// 64 is well below the open-fd / TCP-stream-per-host limits on every
-	// supported OS, and well above the point of diminishing returns for
-	// any realistic backbone.
+	// MaxDownloadConcurrency caps concurrent Range GETs. 64 is well below
+	// the open-fd / TCP-stream-per-host limits on every supported OS, and
+	// well above the point of diminishing returns for any realistic
+	// backbone.
 	MaxDownloadConcurrency = 64
-
-	// downloadPartMaxRetries is how many times one byte range is retried
-	// before the whole download fails.
-	downloadPartMaxRetries = 4
 
 	// minDownloadChunkSize keeps per-request overhead under control by
 	// avoiding sub-MB ranges.
 	minDownloadChunkSize = 1024 * 1024
 
-	// defaultDownloadPartSize is the range size when neither the caller nor
-	// the server suggests one.
-	defaultDownloadPartSize = 8 * 1024 * 1024
-
-	// maxDownloadPartSize caps a range, and so each worker's buffer,
-	// whatever the server suggests.
+	// maxDownloadPartSize caps a range whatever the server suggests.
 	maxDownloadPartSize = 64 * 1024 * 1024
 )
 
+// downloadPartSize is the range size for an object of size bytes: larger
+// objects get larger ranges, which means fewer requests and better
+// throughput per connection, as uploads get larger parts.
+func downloadPartSize(size int64) int64 {
+	switch {
+	case size >= 16<<30:
+		return 64 << 20
+	case size >= 1<<30:
+		return 32 << 20
+	default:
+		return 8 << 20
+	}
+}
+
 // MultipartDownloadOptions configures parallel Range downloads.
 type MultipartDownloadOptions struct {
-	// Threads is the maximum number of concurrent Range GETs. 0 means use
-	// DefaultDownloadConcurrency. Values are clamped to [1, MaxDownloadConcurrency].
+	// Threads fixes the number of concurrent Range GETs, at most
+	// MaxDownloadConcurrency. 0 adapts it to the link.
 	Threads int
 
-	// PartSize overrides the server-suggested part size. 0 means use the
-	// value the API returned. Values below minDownloadChunkSize are clamped up.
+	// PartSize overrides the range size. 0 picks it from the object's
+	// size, or the server's suggestion when that is larger. Values below
+	// minDownloadChunkSize are clamped up.
 	PartSize int64
 
-	// OnProgress is called with (transferredBytes, totalBytes) as parts complete.
+	// OnProgress is called with (transferredBytes, totalBytes) as ranges
+	// complete, one call at a time.
 	OnProgress func(transferred, total int64)
 
 	// OnDebug is called with structured debug events. Optional.
@@ -117,17 +120,9 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 
 	partSize := opts.PartSize
 	if partSize <= 0 {
-		partSize = plan.PartSize
-	}
-	if partSize <= 0 {
-		partSize = defaultDownloadPartSize
+		partSize = max(downloadPartSize(size), plan.PartSize)
 	}
 	partSize = min(max(partSize, minDownloadChunkSize), maxDownloadPartSize, size)
-	threads := opts.Threads
-	if threads <= 0 {
-		threads = DefaultDownloadConcurrency
-	}
-	threads = min(threads, MaxDownloadConcurrency)
 
 	type span struct {
 		idx        int
@@ -139,69 +134,54 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 		spans = append(spans, span{idx: idx, start: start, end: end})
 		start = end + 1
 	}
-	threads = min(threads, len(spans))
+
+	ctx, cancel := context.WithCancelCause(c.reqCtx())
+	defer cancel(nil)
+	lim := newLimiter(ctx, opts.Threads, min(MaxDownloadConcurrency, len(spans)))
+	go lim.tune(ctx, func(threads int, rate float64) {
+		debugf("threads", "threads=%d at %s/s", threads, humanBytesLocal(int64(rate)))
+	})
 
 	debugf("plan", "object=%s", humanBytesLocal(size))
 	debugf("plan", "parts=%d", len(spans))
 	debugf("plan", "part_size=%s", humanBytesLocal(partSize))
-	debugf("plan", "threads=%d", threads)
+	debugf("plan", "threads=%d max=%d", lim.current(), lim.max)
 
-	var transferred int64
-	var transferredMu sync.Mutex
-	workCh := make(chan span, len(spans))
-	for _, s := range spans {
-		workCh <- s
-	}
-	close(workCh)
-
-	errCh := make(chan error, threads)
-	failed := make(chan struct{})
-	var failOnce sync.Once
-	fail := func(err error) {
-		failOnce.Do(func() {
-			errCh <- err
-			close(failed)
-		})
-	}
+	var transferred atomic.Int64
+	var next atomic.Int64
+	var progressMu sync.Mutex
 	var wg sync.WaitGroup
-	ctx := c.reqCtx()
-	for w := 0; w < threads; w++ {
+	for range lim.max {
 		wg.Add(1)
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
-			buf := make([]byte, partSize)
-			for s := range workCh {
-				select {
-				case <-ctx.Done():
-					fail(ctx.Err())
-					return
-				case <-failed:
-					return
-				default:
-				}
-				part := buf[:s.end-s.start+1]
-				if err := c.downloadRange(urls, s.start, s.end, part, debugf, workerID, s.idx); err != nil {
-					fail(err)
+			for {
+				if lim.acquire(ctx) != nil {
 					return
 				}
-				if _, err := dst.WriteAt(part, s.start); err != nil {
-					fail(fmt.Errorf("write range %d-%d: %w", s.start, s.end, err))
+				k := int(next.Add(1)) - 1
+				if k >= len(spans) {
+					lim.release()
+					return
+				}
+				s := spans[k]
+				err := c.downloadRange(ctx, urls, lim, s.start, s.end, dst, debugf, s.idx)
+				lim.release()
+				if err != nil {
+					cancel(err)
 					return
 				}
 				if opts.OnProgress != nil {
-					transferredMu.Lock()
-					transferred += int64(len(part))
-					t := transferred
-					transferredMu.Unlock()
-					opts.OnProgress(t, size)
+					progressMu.Lock()
+					opts.OnProgress(transferred.Add(s.end-s.start+1), size)
+					progressMu.Unlock()
 				}
 			}
-		}(w)
+		}()
 	}
 	wg.Wait()
-	close(errCh)
-	if err, ok := <-errCh; ok && err != nil {
-		return err
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 	debugf("done", "got=%d bytes", size)
 	return nil
@@ -254,19 +234,15 @@ func (p *presignedDownload) renew(stale string) (*PresignDownloadPlan, error) {
 	return plan, nil
 }
 
-// downloadRange fetches one byte range into dst, retrying on transient
-// errors and presigning again when the URL is refused. dst MUST already be
-// sized to len = end-start+1.
-func (c *Client) downloadRange(urls *presignedDownload, start, end int64, dst []byte, debugf func(step, format string, args ...any), workerID, partIdx int) error {
+// downloadRange fetches one byte range into dst at its offset, retrying on
+// transient errors and presigning again when the URL is refused. A retry
+// overwrites what a failed attempt wrote.
+func (c *Client) downloadRange(ctx context.Context, urls *presignedDownload, lim *limiter, start, end int64, dst io.WriterAt, debugf func(step, format string, args ...any), partIdx int) error {
 	expected := end - start + 1
-	if int64(len(dst)) != expected {
-		return fmt.Errorf("downloadRange: dst size %d != expected %d", len(dst), expected)
-	}
 
-	ctx := c.reqCtx()
 	var lastErr error
 	renewed := false
-	for attempt := 0; attempt <= downloadPartMaxRetries; attempt++ {
+	for attempt := 0; attempt < multipartAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -278,7 +254,7 @@ func (c *Client) downloadRange(urls *presignedDownload, start, end int64, dst []
 					return err
 				}
 			}
-			debugf("retry", "worker=%d part=%d attempt=%d range=%d-%d err=%v", workerID, partIdx, attempt, start, end, lastErr)
+			debugf("retry", "part=%d attempt=%d range=%d-%d err=%v", partIdx, attempt, start, end, lastErr)
 		}
 		renewed = false
 		url, err := urls.current()
@@ -286,36 +262,41 @@ func (c *Client) downloadRange(urls *presignedDownload, start, end int64, dst []
 			return err
 		}
 		t0 := time.Now()
-		if err := c.doRangeGET(url, start, end, dst); err != nil {
-			// A range that ran out its own deadline is retried; a
-			// cancelled download is not.
-			stalled := errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil
+		if err := c.doRangeGET(ctx, url, start, end, dst, lim.add); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if errors.Is(err, errPresignRefused) {
 				debugf("presign", "range %d-%d refused, presigning again", start, end)
 				if _, rerr := urls.renew(url); rerr != nil {
 					return rerr
 				}
 				renewed = true
-			} else if !stalled && !isDownloadRetryable(err) {
+			} else if isDownloadRetryable(err) {
+				lim.failed()
+			} else {
 				return err
 			}
 			lastErr = err
 			continue
 		}
-		debugf("range", "part %d range=%d-%d size=%s in %s (worker=%d)", partIdx+1, start, end, humanBytesLocal(expected), time.Since(t0).Round(time.Millisecond), workerID)
+		debugf("range", "part %d range=%d-%d size=%s in %s", partIdx+1, start, end, humanBytesLocal(expected), time.Since(t0).Round(time.Millisecond))
 		return nil
 	}
-	return fmt.Errorf("range %d-%d after %d attempts: %w", start, end, downloadPartMaxRetries, lastErr)
+	return fmt.Errorf("range %d-%d after %d attempts: %w", start, end, multipartAttempts, lastErr)
 }
 
-// doRangeGET performs a single Range request and writes the bytes into dst.
-// dst is filled exactly len(dst) bytes or an error is returned. We use a
-// fresh request per attempt so retries don't see stale connection state.
-func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) error {
-	// A per-request deadline, so a stalled range fails and is retried.
-	ctx, cancel := context.WithTimeout(c.reqCtx(), presignTimeout(int64(len(dst))))
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
+// doRangeGET performs a single Range request and streams the bytes into
+// dst at start, so memory does not grow with the range size. It writes
+// exactly end-start+1 bytes or returns an error. We use a fresh request per
+// attempt so retries don't see stale connection state. onBytes sees the
+// bytes as they arrive. A range that moves no bytes for stallTimeout is
+// cancelled; a slow one that keeps moving is not.
+func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end int64, dst io.WriterAt, onBytes func(int)) error {
+	expected := end - start + 1
+	guard := newStallGuard(ctx)
+	defer guard.stop()
+	req, err := http.NewRequestWithContext(guard.ctx, "GET", presignedURL, nil)
 	if err != nil {
 		return err
 	}
@@ -323,6 +304,9 @@ func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) e
 
 	resp, err := c.presignClient.Do(req)
 	if err != nil {
+		if guard.stalled() {
+			return fmt.Errorf("Range GET: %w", errStalled)
+		}
 		return fmt.Errorf("Range GET: %w", err)
 	}
 	defer resp.Body.Close()
@@ -347,22 +331,62 @@ func (c *Client) doRangeGET(presignedURL string, start, end int64, dst []byte) e
 	// Strict: the response must report Content-Length matching the requested
 	// span. A short read here is a serious enough signal to surface.
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		if n, err := strconv.ParseInt(cl, 10, 64); err == nil && n != int64(len(dst)) {
-			return fmt.Errorf("Range GET length mismatch: got %d, want %d", n, len(dst))
+		if n, err := strconv.ParseInt(cl, 10, 64); err == nil && n != expected {
+			return fmt.Errorf("Range GET length mismatch: got %d, want %d", n, expected)
 		}
 	}
 
-	if _, err := io.ReadFull(resp.Body, dst); err != nil {
-		return fmt.Errorf("Range GET body: %w", err)
+	body := &progressReader{r: resp.Body, cb: func(n int) {
+		guard.moved()
+		onBytes(n)
+	}}
+	out := &writeTracker{w: io.NewOffsetWriter(dst, start)}
+	n, err := io.CopyN(out, body, expected)
+	switch {
+	case out.err != nil:
+		return &writeError{err: out.err}
+	case err != nil && guard.stalled():
+		return fmt.Errorf("Range GET body: %w", errStalled)
+	case err != nil:
+		return fmt.Errorf("Range GET body (%d of %d bytes): %w", n, expected, err)
 	}
 	return nil
 }
+
+// writeTracker remembers a failed write, so a full disk is told apart from
+// a dropped connection.
+type writeTracker struct {
+	w   io.Writer
+	err error
+}
+
+func (t *writeTracker) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if err != nil {
+		t.err = err
+	}
+	return n, err
+}
+
+// writeError is a range that arrived but could not be written: not worth
+// retrying.
+type writeError struct{ err error }
+
+func (e *writeError) Error() string { return "write download: " + e.err.Error() }
+func (e *writeError) Unwrap() error { return e.err }
 
 // isDownloadRetryable distinguishes transient network/server failures from
 // hard errors that won't get better on retry. Context cancellation is NOT
 // retryable so Ctrl+C surfaces immediately without burning the retry budget.
 func isDownloadRetryable(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, errStalled) {
+		return true
+	}
+	var we *writeError
+	if errors.As(err, &we) {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

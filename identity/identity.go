@@ -8,6 +8,8 @@ package identity
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
+
 	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/crypto"
 )
@@ -358,8 +360,15 @@ func ResolveSenderED25519(c *api.Client, actorID, fingerprint string) (string, e
 	if err := json.Unmarshal(resp.Data, &actor); err != nil {
 		return "", fmt.Errorf("parse actor: %w", err)
 	}
+	return ResolveSenderED25519ByEmail(c, actor.Email, fingerprint)
+}
 
-	keysResp, err := c.Get("/api/v1/identities/actor/" + actor.Email)
+// ResolveSenderED25519ByEmail is ResolveSenderED25519 for a sender known by
+// email: it returns the Ed25519 key of the sender's registered key with
+// fingerprint (the primary one when fingerprint is empty), after verifying
+// that key bundle's self-signature.
+func ResolveSenderED25519ByEmail(c *api.Client, email, fingerprint string) (string, error) {
+	keysResp, err := c.Get("/api/v1/identities/actor/" + url.PathEscape(email))
 	if err != nil {
 		return "", err
 	}

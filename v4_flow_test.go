@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -74,6 +75,7 @@ type fakeAPI struct {
 	multipartAt int64
 	partSize    int64
 	uploads     map[string]*fakeUpload // by revision id
+	refusePart  int                    // storage refuses this part's PUTs
 
 	// Downloads: the part size the presign suggests, and how many range
 	// GETs a presigned URL serves before it is refused with 403 (0: no
@@ -84,8 +86,14 @@ type fakeAPI struct {
 	tokens           map[string]int // uses left, by token
 }
 
+// fakeUpload is a multipart upload: the parts storage holds.
 type fakeUpload struct {
-	registered map[int]map[string]any
+	parts map[int]fakePart
+}
+
+type fakePart struct {
+	etag string
+	size int64
 }
 
 type createBody struct {
@@ -148,11 +156,16 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
 	mux.HandleFunc("PUT /s3/{key}", f.putObject)
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/init", f.multipartInit)
-	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/part-url", f.multipartPartURL)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/part-urls", f.multipartPartURLs)
 	mux.HandleFunc("PUT /s3part/{id}/{n}", f.putPart)
-	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/parts", f.registerPart)
 	mux.HandleFunc("GET /api/v1/secrets/revisions/{id}/multipart/status", f.multipartStatus)
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/complete", f.multipartComplete)
+	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/multipart/abort", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		delete(f.uploads, r.PathValue("id"))
+		f.mu.Unlock()
+		ok(w, map[string]string{"status": "aborted"})
+	})
 	mux.HandleFunc("GET /s3/{key}", f.getObject)
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/confirm", func(w http.ResponseWriter, r *http.Request) { ok(w, map[string]string{"status": "uploaded"}) })
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/presign", f.presignDownload)
@@ -222,6 +235,10 @@ func (f *fakeAPI) ownKeys(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeAPI) publicKeys(w http.ResponseWriter, r *http.Request) {
 	a := f.actors[r.PathValue("email")]
+	if a == nil {
+		fail(w, http.StatusNotFound, "Actor not found")
+		return
+	}
 	edSig, mldsaSig, err := crypto.SignKeyBundle(a.kp)
 	if err != nil {
 		fail(w, 500, err.Error())
@@ -405,22 +422,39 @@ func (f *fakeAPI) multipartInit(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	id := r.PathValue("id")
 	if f.uploads[id] == nil {
-		f.uploads[id] = &fakeUpload{registered: map[int]map[string]any{}}
+		f.uploads[id] = &fakeUpload{parts: map[int]fakePart{}}
 	}
 	ok(w, map[string]any{"upload_id": "up-" + id, "part_size": f.partSize,
 		"max_part_number": int((f.lastReq.Size + f.partSize - 1) / f.partSize), "expires_at": time.Now().Add(time.Hour)})
 }
 
-func (f *fakeAPI) multipartPartURL(w http.ResponseWriter, r *http.Request) {
+func (f *fakeAPI) multipartPartURLs(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		PartNumber int `json:"part_number"`
+		PartNumbers []int `json:"part_numbers"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
-	ok(w, map[string]any{"url": fmt.Sprintf("%s/s3part/%s/%d", f.srv.URL, r.PathValue("id"), body.PartNumber), "expires_in": 900})
+	if len(body.PartNumbers) == 0 || len(body.PartNumbers) > 100 {
+		fail(w, 400, "part_numbers must list 1 to 100 parts")
+		return
+	}
+	parts := make([]map[string]any, len(body.PartNumbers))
+	for i, n := range body.PartNumbers {
+		parts[i] = map[string]any{"part_number": n, "url": fmt.Sprintf("%s/s3part/%s/%d", f.srv.URL, r.PathValue("id"), n)}
+	}
+	ok(w, map[string]any{"parts": parts, "expires_in": 1800})
 }
 
 // putPart streams a part to disk, checking its Content-MD5 as S3 does.
 func (f *fakeAPI) putPart(w http.ResponseWriter, r *http.Request) {
+	n, _ := strconv.Atoi(r.PathValue("n"))
+	f.mu.Lock()
+	up := f.uploads[r.PathValue("id")]
+	refused := f.refusePart == n
+	f.mu.Unlock()
+	if refused {
+		fail(w, http.StatusBadRequest, "InvalidPart")
+		return
+	}
 	path := filepath.Join(f.objects, r.PathValue("id")+".part"+r.PathValue("n"))
 	out, err := os.Create(path)
 	if err != nil {
@@ -436,29 +470,34 @@ func (f *fakeAPI) putPart(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "BadDigest")
 		return
 	}
+	info, _ := os.Stat(path)
 	f.mu.Lock()
 	f.puts++
+	up.parts[n] = fakePart{etag: hex.EncodeToString(sum), size: info.Size()}
 	f.mu.Unlock()
-	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum)+`"`)
 }
 
-func (f *fakeAPI) registerPart(w http.ResponseWriter, r *http.Request) {
-	var body map[string]any
-	json.NewDecoder(r.Body).Decode(&body)
-	f.mu.Lock()
-	f.uploads[r.PathValue("id")].registered[int(body["part_number"].(float64))] = body
-	f.mu.Unlock()
-	ok(w, map[string]string{"status": "registered"})
-}
-
+// multipartStatus lists the parts storage holds, as the API does.
 func (f *fakeAPI) multipartStatus(w http.ResponseWriter, r *http.Request) {
-	ok(w, map[string]any{"parts": []any{}})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parts := []map[string]any{}
+	if up := f.uploads[r.PathValue("id")]; up != nil {
+		for n, p := range up.parts {
+			parts = append(parts, map[string]any{"part_number": n, "etag": p.etag, "size": p.size})
+		}
+	}
+	ok(w, map[string]any{"state": "in_progress", "parts": parts})
 }
 
+// multipartComplete assembles the parts, which must all be in storage with
+// the ETags the client sends.
 func (f *fakeAPI) multipartComplete(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Parts []struct {
-			PartNumber int `json:"part_number"`
+			PartNumber int    `json:"part_number"`
+			Etag       string `json:"etag"`
 		} `json:"parts"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
@@ -473,8 +512,8 @@ func (f *fakeAPI) multipartComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer out.Close()
 	for i, p := range body.Parts {
-		if p.PartNumber != i+1 || up.registered[p.PartNumber] == nil {
-			fail(w, 400, "parts must be registered and contiguous")
+		if stored, held := up.parts[p.PartNumber]; p.PartNumber != i+1 || !held || stored.etag != p.Etag {
+			fail(w, 400, "parts must be in storage and contiguous")
 			return
 		}
 		part, err := os.Open(filepath.Join(f.objects, fmt.Sprintf("%s.part%d", id, p.PartNumber)))
