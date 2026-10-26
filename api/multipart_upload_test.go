@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -63,7 +64,37 @@ type uploadServer struct {
 	expireFirst bool        // storage refuses the first batch's URLs
 	fail        map[int]int // part -> PUTs to fail with 503
 	stall       map[int]int // part -> PUTs that hang without reading
+	link        *sharedLink // when set, every PUT body is read through it
 }
+
+// sharedLink paces reads so that all requests together move rate bytes a
+// second, like one uplink shared by every part in flight.
+type sharedLink struct {
+	mu   sync.Mutex
+	rate float64
+	next time.Time
+}
+
+func (l *sharedLink) Read(r io.Reader, b []byte) (int, error) {
+	n, err := r.Read(b[:min(len(b), 32<<10)])
+	l.mu.Lock()
+	now := time.Now()
+	if l.next.Before(now) {
+		l.next = now
+	}
+	l.next = l.next.Add(time.Duration(float64(n) / l.rate * float64(time.Second)))
+	wait := time.Until(l.next)
+	l.mu.Unlock()
+	time.Sleep(wait)
+	return n, err
+}
+
+type linkReader struct {
+	r    io.Reader
+	link *sharedLink
+}
+
+func (r linkReader) Read(b []byte) (int, error) { return r.link.Read(r.r, b) }
 
 // locked runs f holding the server's lock, for reading what it recorded.
 func (u *uploadServer) locked(f func()) {
@@ -189,7 +220,14 @@ func (u *uploadServer) servePart(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	data, _ := io.ReadAll(r.Body)
+	var body io.Reader = r.Body
+	if u.link != nil {
+		body = linkReader{r.Body, u.link}
+	}
+	data, err := io.ReadAll(body)
+	if err != nil || int64(len(data)) != r.ContentLength {
+		return // the client gave up mid-part: storage keeps nothing of it
+	}
 	if refuse {
 		w.WriteHeader(http.StatusForbidden)
 		fmt.Fprint(w, "<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>")
@@ -351,4 +389,90 @@ func TestUpload_RefusesASizeMismatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
 		t.Fatalf("err %v", err)
 	}
+}
+
+// Before moving data an upload reports its plan: the parts, the threads,
+// how part URLs are fetched, and how it retries.
+func TestUpload_ReportsItsPlan(t *testing.T) {
+	const part = S3MinPartSize
+	u := newUploadServer(t, 3*part, part)
+	plans := map[string]string{}
+	opts := MultipartUploadOptions{OnDebug: func(step, msg string) {
+		if step == "plan" {
+			key, rest, _ := strings.Cut(msg, ": ")
+			plans[key] = rest
+		}
+	}}
+	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, opts); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"upload":    "multipart, 15.00 MiB in 3 part(s) of 5.00 MiB",
+		"threads":   "adaptive: start 1, 3 after 5s if each part finishes within 1m at the measured rate, up to 3 (limit 32, at most one per part)",
+		"part URLs": "100 per request",
+		"retries":   "8 attempts per request, waits doubling from 2s up to 1m; a request that moves no bytes for 1m30s restarts",
+	} {
+		if !strings.HasPrefix(plans[key], want) {
+			t.Errorf("plan %q: got %q, want it to start with %q", key, plans[key], want)
+		}
+	}
+
+	plans = map[string]string{}
+	opts.Threads = 2
+	u2 := newUploadServer(t, 3*part, part)
+	if err := u2.client(t).MultipartUploadOpts("rev-1", patternSource{u2.size}, u2.size, opts); err != nil {
+		t.Fatal(err)
+	}
+	if plans["threads"] != "fixed at 2 (requested)" {
+		t.Errorf("fixed threads plan: %q", plans["threads"])
+	}
+}
+
+// On a slow link, parts finish one after another rather than all sharing
+// the link and none finishing, so an upload interrupted after moving five
+// parts' worth of data keeps most of it, and resuming sends only the rest.
+func TestUpload_SlowLinkKeepsFinishedPartsForResume(t *testing.T) {
+	const part = S3MinPartSize
+	win, limit := adaptiveWindow, partTimeLimit
+	// A part alone takes 500ms on this link; a minute is to the real
+	// link's 32 seconds a part what 800ms is here.
+	adaptiveWindow, partTimeLimit = 100*time.Millisecond, 800*time.Millisecond
+	t.Cleanup(func() { adaptiveWindow, partTimeLimit = win, limit })
+
+	u := newUploadServer(t, 8*part, part)
+	u.link = &sharedLink{rate: 10 << 20}
+	src := patternSource{u.size}
+	c := u.client(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	c.SetRootContext(ctx)
+	if err := c.MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{}); err == nil {
+		t.Fatal("the upload finished before the interrupt; slow the link")
+	}
+	var kept []int
+	u.locked(func() {
+		for n := 1; n <= 8; n++ {
+			if _, ok := u.stored[n]; ok {
+				kept = append(kept, n)
+			}
+		}
+	})
+	if len(kept) < 3 {
+		t.Fatalf("after moving 5 parts' worth of data, storage kept parts %v, want at least 3", kept)
+	}
+
+	c.SetRootContext(context.Background())
+	if err := c.MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	u.locked(func() {
+		for _, n := range kept {
+			if u.puts[n] != 1 {
+				t.Errorf("kept part %d was sent %d times", n, u.puts[n])
+			}
+		}
+		if len(u.completed) != 8 {
+			t.Fatalf("completed %d parts, want 8", len(u.completed))
+		}
+	})
 }

@@ -237,9 +237,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 
 	// Download the ciphertext into the spool.
 	debugf("download", "revision=%s", targetRevID)
-	if sp.dir != "" {
-		debugf("download", "temporary ciphertext=%s", sp.dir)
-	}
+	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(m.CiphertextSize)))
 	t0 := time.Now()
 	if err := c.api.DownloadToFile(targetRevID, sp, m.CiphertextSize, api.MultipartDownloadOptions{
 		Threads:              opt.DownloadThreads,

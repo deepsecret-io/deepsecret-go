@@ -44,6 +44,10 @@ const (
 	// partURLBatch is how many part URLs one API call presigns: the part a
 	// worker needs and the ones queued after it.
 	partURLBatch = 100
+
+	// partURLRenewMargin is how long before a part URL expires it is
+	// fetched again.
+	partURLRenewMargin = 30 * time.Second
 )
 
 // ── Wire types ──────────────────────────────────────────────────────────────
@@ -243,7 +247,6 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	}); err != nil {
 		return err
 	}
-	debugf("multipart.init", "parts=%d × %s", init.MaxPartNumber, humanBytesLocal(init.PartSize))
 	if init.PartSize < S3MinPartSize || init.PartSize > S3MaxPartSize {
 		return fmt.Errorf("multipart upload: server returned invalid part size %d", init.PartSize)
 	}
@@ -280,8 +283,10 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 			work = append(work, i)
 		}
 	}
+	debugf("plan", "upload: multipart, %s in %d part(s) of %s (the server sizes parts: %s)",
+		humanBytesLocal(totalSize), count, humanBytesLocal(init.PartSize), PieceSizeRule)
 	if kept > 0 {
-		debugf("multipart.resume", "kept %d part(s) already in storage (%s); uploading %d", count-len(work), humanBytesLocal(kept), len(work))
+		debugf("plan", "resume: %d part(s) (%s) already in storage are kept; %d to upload", count-len(work), humanBytesLocal(kept), len(work))
 	}
 
 	var sent atomic.Int64
@@ -290,10 +295,12 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 		opts.OnProgress(kept, totalSize)
 	}
 	if len(work) > 0 {
-		lim := newLimiter(ctx, opts.Threads, min(MaxUploadThreads, len(work)))
-		debugf("multipart.threads", "start=%d max=%d", lim.current(), lim.max)
-		go lim.tune(ctx, func(threads int, rate float64) {
-			debugf("multipart.threads", "threads=%d at %s/s", threads, humanBytesLocal(int64(rate)))
+		lim := newLimiter(ctx, opts.Threads, min(MaxUploadThreads, len(work)), init.PartSize)
+		debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxUploadThreads, "part"))
+		debugf("plan", "part URLs: %d per request, fetched again %s before they expire or when storage refuses one", partURLBatch, roundDuration(partURLRenewMargin))
+		debugf("plan", "retries: %s", retryPlan())
+		go lim.tune(ctx, func(from, to int, rate float64, reason string) {
+			debugf("threads", "%s", threadsChange(from, to, rate, reason))
 		})
 		var progressMu sync.Mutex
 		progress := func(n int) {
@@ -533,7 +540,7 @@ func (u *partURLCache) get(ctx context.Context, n int) (string, error) {
 	// Renew 30 seconds before expiry: storage checks the expiry when a
 	// request starts, so a long PUT on a URL near its end still completes.
 	lifetime := time.Duration(resp.ExpiresIn) * time.Second
-	renewAt := time.Now().Add(lifetime - min(30*time.Second, lifetime/4))
+	renewAt := time.Now().Add(lifetime - min(partURLRenewMargin, lifetime/4))
 	asked := make(map[int]bool, len(numbers))
 	for _, m := range numbers {
 		asked[m] = true
@@ -627,14 +634,18 @@ func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limite
 	return "", fmt.Errorf("after %d attempts: %w", multipartAttempts, lastErr)
 }
 
-// storageError is a part PUT that storage answered with an error status.
+// storageError is a part PUT that storage answered with an error: its
+// status and error code, never the body, which can echo signatures.
 type storageError struct {
 	status int
-	body   string
+	code   string
 }
 
 func (e *storageError) Error() string {
-	return fmt.Sprintf("PUT part failed (status %d): %s", e.status, e.body)
+	if e.code != "" {
+		return fmt.Sprintf("PUT part failed (status %d, %s)", e.status, e.code)
+	}
+	return fmt.Sprintf("PUT part failed (status %d)", e.status)
 }
 
 // isPartRetryable reports whether a failed part PUT is worth retrying:
@@ -647,7 +658,7 @@ func isPartRetryable(err error) bool {
 	var se *storageError
 	if errors.As(err, &se) {
 		return se.status >= 500 || se.status == http.StatusTooManyRequests ||
-			(se.status == http.StatusBadRequest && strings.Contains(se.body, "RequestTimeout"))
+			(se.status == http.StatusBadRequest && se.code == "RequestTimeout")
 	}
 	return true
 }
@@ -725,7 +736,7 @@ func (c *Client) putPart(ctx context.Context, presignedURL string, data io.Reade
 	req.Header.Set("Content-MD5", contentMD5)
 	req.ContentLength = size
 
-	resp, err := c.presignClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		if guard.stalled() {
 			return "", fmt.Errorf("PUT part: %w", errStalled)
@@ -738,7 +749,7 @@ func (c *Client) putPart(ctx context.Context, presignedURL string, data io.Reade
 	}
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", &storageError{status: resp.StatusCode, body: string(msg)}
+		return "", &storageError{status: resp.StatusCode, code: storageErrorCode(msg)}
 	}
 	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
 	if etag == "" {

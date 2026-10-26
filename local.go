@@ -135,7 +135,12 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	}
 	debugf("encrypt", "payload type=%s", p.payloadType)
 	debugf("encrypt", "plaintext size=%s", humanBytes(p.size))
-	debugf("local", "file=%s", out)
+	need := spoolNeed(p.size)
+	if free, ok := freeDiskBytes(dir); ok {
+		debugf("plan", "local file: %s, sealed into a private file beside it and renamed when complete; needs %s, %s free", out, humanBytes(need), humanBytes(free))
+	} else {
+		debugf("plan", "local file: %s, sealed into a private file beside it and renamed when complete; needs %s", out, humanBytes(need))
+	}
 
 	// The sender's email goes in the file, so the recipient's client can
 	// check the signing key against the keys that account registered.
@@ -159,6 +164,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	if err != nil {
 		return nil, err
 	}
+	debugf("plan", "encryption: %s", encryptionPlan(len(pubs)))
 
 	// Seal into a private file beside the destination, renamed into place
 	// once complete, so a failure never leaves a partial file under it.
@@ -349,6 +355,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		opened.Close()
 		return nil, err
 	}
+	debugf("plan", "local file: the %s payload is copied before it is checked, so the file cannot change under the checks, to %s", humanBytes(payloadSize), sp.plan(m.CiphertextSize))
 	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf}
 	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
 	if opt.OnDownloadProgress != nil {

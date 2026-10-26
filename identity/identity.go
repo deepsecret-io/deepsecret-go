@@ -214,7 +214,7 @@ func LoadPrimaryIdentity(c *api.Client, password string) (*crypto.KeyPair, strin
 
 // GetRecipientKeys fetches a recipient's primary public keys by email.
 func GetRecipientKeys(c *api.Client, email string) (*crypto.PublicKeys, error) {
-	resp, err := c.Get("/api/v1/identities/actor/" + email)
+	resp, err := c.Get("/api/v1/identities/actor/" + url.PathEscape(email))
 	if err != nil {
 		return nil, fmt.Errorf("lookup recipient keys: %w", err)
 	}
@@ -313,7 +313,7 @@ func ListGroups(c *api.Client, orgID string) ([]GroupInfo, error) {
 
 // ResolveRecipientID fetches the actor ID for an email.
 func ResolveRecipientID(c *api.Client, email string) (string, error) {
-	resp, err := c.Get("/api/v1/actors/email/" + email)
+	resp, err := c.Get("/api/v1/actors/email/" + url.PathEscape(email))
 	if err != nil {
 		return "", fmt.Errorf("lookup recipient: %w", err)
 	}
@@ -350,7 +350,7 @@ func verifySignedBundle(k signedKeyBundle) error {
 // before its Ed25519 component is returned, so a compromised identities
 // endpoint cannot substitute an attacker key into the sender path.
 func ResolveSenderED25519(c *api.Client, actorID, fingerprint string) (string, error) {
-	resp, err := c.Get("/api/v1/actors/" + actorID)
+	resp, err := c.Get("/api/v1/actors/" + url.PathEscape(actorID))
 	if err != nil {
 		return "", err
 	}

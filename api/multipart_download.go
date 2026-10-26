@@ -137,15 +137,19 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 
 	ctx, cancel := context.WithCancelCause(c.reqCtx())
 	defer cancel(nil)
-	lim := newLimiter(ctx, opts.Threads, min(MaxDownloadConcurrency, len(spans)))
-	go lim.tune(ctx, func(threads int, rate float64) {
-		debugf("threads", "threads=%d at %s/s", threads, humanBytesLocal(int64(rate)))
+	lim := newLimiter(ctx, opts.Threads, min(MaxDownloadConcurrency, len(spans)), 0)
+	rule := PieceSizeRule
+	if opts.PartSize > 0 {
+		rule = "requested"
+	}
+	debugf("plan", "download: %s in %d range(s) of %s (%s)", humanBytesLocal(size), len(spans), humanBytesLocal(partSize), rule)
+	debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxDownloadConcurrency, "range"))
+	debugf("plan", "URL: one presigned URL for every range, valid %dm, presigned again %s before it expires or when storage refuses it",
+		urls.expiry, roundDuration(urls.renewMargin()))
+	debugf("plan", "retries: %s", retryPlan())
+	go lim.tune(ctx, func(from, to int, rate float64, reason string) {
+		debugf("threads", "%s", threadsChange(from, to, rate, reason))
 	})
-
-	debugf("plan", "object=%s", humanBytesLocal(size))
-	debugf("plan", "parts=%d", len(spans))
-	debugf("plan", "part_size=%s", humanBytesLocal(partSize))
-	debugf("plan", "threads=%d max=%d", lim.current(), lim.max)
 
 	var transferred atomic.Int64
 	var next atomic.Int64
@@ -226,12 +230,15 @@ func (p *presignedDownload) renew(stale string) (*PresignDownloadPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Renew two minutes before expiry, or at three quarters of a short
-	// lifetime.
 	lifetime := time.Duration(p.expiry) * time.Minute
-	margin := min(2*time.Minute, lifetime/4)
-	p.url, p.renewAt = plan.URL, time.Now().Add(lifetime-margin)
+	p.url, p.renewAt = plan.URL, time.Now().Add(lifetime-p.renewMargin())
 	return plan, nil
+}
+
+// renewMargin is how long before the URL expires it is presigned again:
+// two minutes, or a quarter of a short lifetime.
+func (p *presignedDownload) renewMargin() time.Duration {
+	return min(2*time.Minute, time.Duration(p.expiry)*time.Minute/4)
 }
 
 // downloadRange fetches one byte range into dst at its offset, retrying on
@@ -302,7 +309,7 @@ func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
-	resp, err := c.presignClient.Do(req)
+	resp, err := c.doPresigned(req)
 	if err != nil {
 		if guard.stalled() {
 			return fmt.Errorf("Range GET: %w", errStalled)
@@ -323,9 +330,9 @@ func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode >= 500 {
-			return fmt.Errorf("Range GET transient (status %d): %s", resp.StatusCode, string(body))
+			return errors.New(storageFailure("Range GET transient", resp.StatusCode, body))
 		}
-		return fmt.Errorf("Range GET failed (status %d): %s", resp.StatusCode, string(body))
+		return errors.New(storageFailure("Range GET failed", resp.StatusCode, body))
 	}
 
 	// Strict: the response must report Content-Length matching the requested

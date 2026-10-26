@@ -103,10 +103,14 @@ Uploads above the server's multipart threshold go in parts (8 MiB, 32 MiB
 from 1 GiB, 64 MiB from 16 GiB). Parts stream between the file and the
 network, so memory does not grow with part size or threads.
 
-- **Threads adapt.** A transfer starts with 4 connections and doubles them
-  while throughput rises by more than 10%, steps back when it does not, and
-  halves them when requests fail or are throttled. `UploadThreads` and
-  `DownloadThreads` fix the number instead.
+- **Threads adapt.** A transfer doubles its connections while throughput
+  rises by more than 10%, steps back when it does not, and halves them when
+  requests fail or are throttled. A download starts with 4. An upload starts
+  with one part and never runs more parts than finish within a minute at
+  the measured rate: storage keeps only finished parts, so on a slow link
+  they go one after another and an interrupted upload keeps nearly all it
+  sent. On a fast link it takes 4 after five seconds and climbs as a download
+  does. `UploadThreads` and `DownloadThreads` fix the number instead.
 - **Retries.** Each part is tried 8 times with backoff up to a minute; a
   part that moves no bytes for 90 seconds is cancelled and retried. Part
   URLs come 100 per API call and are presigned again when storage refuses

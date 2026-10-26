@@ -174,3 +174,19 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	}
 	return c.r.Read(p)
 }
+
+// plan describes where the spool keeps the ciphertext, and the free space
+// the filesystem reports against what it needs, for a debug "plan" event.
+func (s *spool) plan(need int64) string {
+	if s.file == nil {
+		return "in memory (small payload)"
+	}
+	where := s.dir + " (private, removed when done)"
+	if s.resumable {
+		where = s.dir + " (private, kept until the upload finishes so it can resume)"
+	}
+	if free, ok := freeDiskBytes(s.dir); ok {
+		where += fmt.Sprintf("; needs %s, %s free", humanBytes(need), humanBytes(free))
+	}
+	return where
+}

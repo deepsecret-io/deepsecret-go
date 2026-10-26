@@ -442,7 +442,7 @@ func (c *Client) send(method, path string, data []byte, key string) (*Response, 
 
 	var apiResp Response
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, fmt.Errorf("decode response (status %d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("decode response (status %d): %s", resp.StatusCode, printableExcerpt(respBody, 200))
 	}
 
 	if resp.StatusCode == http.StatusServiceUnavailable && apiResp.Maintenance {
@@ -613,14 +613,14 @@ func (c *Client) PresignDownloadReader(revisionID string, expiryMinutes int) (io
 	if gerr != nil {
 		return nil, 0, gerr
 	}
-	httpResp, err := c.presignClient.Do(getReq)
+	httpResp, err := c.doPresigned(getReq)
 	if err != nil {
 		return nil, 0, fmt.Errorf("download: %w", err)
 	}
 	if httpResp.StatusCode >= 300 {
-		body, _ := io.ReadAll(httpResp.Body)
+		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		httpResp.Body.Close()
-		return nil, 0, fmt.Errorf("download failed (status %d): %s", httpResp.StatusCode, string(body))
+		return nil, 0, errors.New(storageFailure("download failed", httpResp.StatusCode, body))
 	}
 	return httpResp.Body, httpResp.ContentLength, nil
 }
@@ -760,14 +760,14 @@ func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Read
 			req.Header.Set("If-None-Match", "*")
 			req.ContentLength = size
 
-			resp, err := c.presignClient.Do(req)
+			resp, err := c.doPresigned(req)
 			if err != nil {
 				return true, fmt.Errorf("upload: %w", err)
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode >= 300 {
 				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				return resp.StatusCode >= 500, fmt.Errorf("upload failed (status %d): %s", resp.StatusCode, string(respBody))
+				return resp.StatusCode >= 500, errors.New(storageFailure("upload failed", resp.StatusCode, respBody))
 			}
 			return false, nil
 		}()
@@ -895,21 +895,21 @@ func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64,
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeStart))
 		}
 
-		resp, err := c.presignClient.Do(req)
+		resp, err := c.doPresigned(req)
 		if err != nil {
 			lastErr = fmt.Errorf("download: %w", err)
 			continue
 		}
 		if resp.StatusCode >= 500 {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			lastErr = fmt.Errorf("download failed (status %d): %s", resp.StatusCode, string(body))
+			lastErr = errors.New(storageFailure("download failed", resp.StatusCode, body))
 			continue
 		}
 		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusPartialContent {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			return nil, fmt.Errorf("download failed (status %d): %s", resp.StatusCode, string(body))
+			return nil, errors.New(storageFailure("download failed", resp.StatusCode, body))
 		}
 
 		// Pin total size from the first non-Range response. ContentLength on

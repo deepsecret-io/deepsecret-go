@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -569,7 +570,9 @@ func ValidateRecipients(emails []string) error {
 		if email == "" {
 			return fmt.Errorf("recipient email is required")
 		}
-		if !strings.Contains(email, "@") || !strings.Contains(email, ".") {
+		// It goes into API paths and onto screens, so nothing that could
+		// change a path or a terminal passes: see plausibleEmail.
+		if !plausibleEmail(email) || !strings.Contains(email[strings.LastIndexByte(email, '@'):], ".") {
 			return fmt.Errorf("invalid recipient email %q", email)
 		}
 		key := strings.ToLower(email)
@@ -675,9 +678,10 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		if sp, err = newSendSpool(opt, revisionID, spoolNeed(p.size)); err != nil {
 			return nil, err
 		}
-		debugf("encrypt", "temporary ciphertext=%s", sp.dir)
 	}
 	defer sp.Close()
+	debugf("plan", "encryption: %s", encryptionPlan(len(pubs)))
+	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(p.size)))
 
 	tEnc := time.Now()
 	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
@@ -701,10 +705,6 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	debugf("encrypt", "manifest=%s", humanBytes(int64(len(sealed.ManifestData))))
 	debugf("encrypt", "elapsed=%s", encElapsed.Round(time.Millisecond))
 	debugf("encrypt", "rate=%s", formatRate(written, encElapsed))
-	debugf("verify", "content key=fresh per revision, wrapped for %d recipient%s", len(sealed.Wraps), pluralSuffix(len(sealed.Wraps)))
-	debugf("verify", "key encapsulation=HPKE (X25519 + ML-KEM-768), fresh context per wrap")
-	debugf("verify", "payload cipher=AES-256-GCM in 1 MiB chunks (AEAD)")
-	debugf("verify", "signing=Ed25519 + ML-DSA-65 over the manifest (hybrid post-quantum)")
 	debugf("verify", "manifest binds the payload digest and every recipient's wrap")
 	debugf("verify", "payload sha256=%s…", digestHex[:12])
 
@@ -818,14 +818,6 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	// temporary file.
 	size := m.CiphertextSize
 	if secret.IsMultipart {
-		expectedParts := size / secret.MultipartPartSize
-		if size%secret.MultipartPartSize != 0 {
-			expectedParts++
-		}
-		debugf("upload", "mode=multipart")
-		debugf("upload", "payload=%s", humanBytes(size))
-		debugf("upload", "parts=%d", expectedParts)
-		debugf("upload", "part_size=%s", humanBytes(secret.MultipartPartSize))
 		pending, err := c.startUpload(sp, secret, revisionID, size)
 		if err != nil {
 			return nil, err
@@ -843,8 +835,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		debugf("upload", "rate=%s", formatRate(size, upElapsed))
 		debugf("verify", "server completed multipart upload (HEAD-verified size)")
 	} else {
-		debugf("upload", "mode=single-PUT")
-		debugf("upload", "payload=%s", humanBytes(size))
+		debugf("plan", "upload: %s", api.SinglePutPlan(size, opt.PresignExpiryMinutes))
 		tUp := time.Now()
 		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes); err != nil {
 			return nil, fmt.Errorf("upload: %w", err)
@@ -923,9 +914,10 @@ func (c *Client) recipientKeys(email string) (*crypto.PublicKeys, error) {
 func chooseCompression(p *plaintext, want compress.Algorithm, debugf func(step, format string, args ...any)) (compress.Algorithm, error) {
 	switch {
 	case p.archived:
-		debugf("compress", "algorithm=zstd (archive)")
+		debugf("plan", "compression: zstd (an archive is always compressed)")
 		return compress.Zstd, nil
 	case want == "" || want == compress.None:
+		debugf("plan", "compression: none (not requested)")
 		return compress.None, nil
 	}
 	worth, err := worthCompressing(p, want)
@@ -933,11 +925,17 @@ func chooseCompression(p *plaintext, want compress.Algorithm, debugf func(step, 
 		return "", fmt.Errorf("read payload: %w", err)
 	}
 	if !worth {
-		debugf("compress", "skipped (a sample does not shrink by 5%%)")
+		debugf("plan", "compression: none (a sample of the payload did not shrink by 5%%)")
 		return compress.None, nil
 	}
-	debugf("compress", "algorithm=%s", want)
+	debugf("plan", "compression: %s (a sample of the payload shrank by at least 5%%)", want)
 	return want, nil
+}
+
+// encryptionPlan describes how a payload is sealed for n recipients.
+func encryptionPlan(n int) string {
+	return fmt.Sprintf("AES-256-GCM in %s chunks under a fresh content key, wrapped for %d recipient%s with HPKE (X25519 + ML-KEM-768); manifest signed with Ed25519 + ML-DSA-65",
+		humanBytes(crypto.ChunkSize), n, pluralSuffix(n))
 }
 
 // compressionSummary describes a sealed payload's compression: its label
@@ -985,8 +983,8 @@ func parseTTL(s string) (int, error) {
 
 	unit := s[len(s)-1]
 	numStr := s[:len(s)-1]
-	var n int
-	if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil || n <= 0 {
+	n, err := strconv.Atoi(numStr)
+	if err != nil || n <= 0 || n > 1_000_000 || numStr[0] == '+' {
 		return 0, fmt.Errorf("invalid TTL %q: number must be a positive integer", s)
 	}
 

@@ -755,3 +755,38 @@ func TestRevokeRecipient(t *testing.T) {
 		t.Fatalf("revoke the last recipient: %+v, %v", r, err)
 	}
 }
+
+// A TTL is a whole positive number of minutes, hours or days; nothing
+// else is read as one.
+func TestParseTTL(t *testing.T) {
+	for in, want := range map[string]int{"30m": 1800, "24h": 86400, "7d": 604800, " 2m ": 120} {
+		if got, err := parseTTL(in); err != nil || got != want {
+			t.Errorf("parseTTL(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "h", "1.5h", "0m", "-5m", "+5m", "5s", "5", "1e3m", "9999999d"} {
+		if _, err := parseTTL(in); err == nil {
+			t.Errorf("parseTTL(%q) accepted", in)
+		}
+	}
+}
+
+// A recipient email goes into API paths and onto screens: anything that
+// could change a path, a header or a terminal is refused.
+func TestValidateRecipientsRefusesHostileEmails(t *testing.T) {
+	for _, ok := range []string{"alice@example.com", "o'brien+tag@example.co.uk", "ünï@exämple.com"} {
+		if err := ValidateRecipients([]string{ok}); err != nil {
+			t.Errorf("%q refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"a b@example.com", "alice@example.com\r\nX-Injected: 1", "../../actors/me@x.io",
+		"a/b@example.com", "a?b@example.com", "a#b@example.com", "a%2f@example.com",
+		"a\x1b[31m@example.com", "a‮@example.com", "a\u009b@example.com",
+		"alice@localhost", "alice@", "@example.com", strings.Repeat("a", 250) + "@example.com",
+	} {
+		if err := ValidateRecipients([]string{bad}); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
