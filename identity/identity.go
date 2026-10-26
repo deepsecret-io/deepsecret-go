@@ -360,14 +360,14 @@ func ResolveSenderED25519(c *api.Client, actorID, fingerprint string) (string, e
 	if err := json.Unmarshal(resp.Data, &actor); err != nil {
 		return "", fmt.Errorf("parse actor: %w", err)
 	}
-	return ResolveSenderED25519ByEmail(c, actor.Email, fingerprint)
+	return ResolveED25519ByEmail(c, actor.Email, fingerprint)
 }
 
-// ResolveSenderED25519ByEmail is ResolveSenderED25519 for a sender known by
-// email: it returns the Ed25519 key of the sender's registered key with
-// fingerprint (the primary one when fingerprint is empty), after verifying
-// that key bundle's self-signature.
-func ResolveSenderED25519ByEmail(c *api.Client, email, fingerprint string) (string, error) {
+// ResolveED25519ByEmail is ResolveSenderED25519 for someone known by email:
+// it returns the Ed25519 key of their registered key with fingerprint (the
+// primary one when fingerprint is empty), after verifying that key
+// bundle's self-signature, and fails when they registered no such key.
+func ResolveED25519ByEmail(c *api.Client, email, fingerprint string) (string, error) {
 	keysResp, err := c.Get("/api/v1/identities/actor/" + url.PathEscape(email))
 	if err != nil {
 		return "", err

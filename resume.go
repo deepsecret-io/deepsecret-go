@@ -83,6 +83,9 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 	if err := os.MkdirAll(opt.ResumeDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create upload folder: %w", err)
 	}
+	if err := checkPrivateDir(opt.ResumeDir); err != nil {
+		return nil, fmt.Errorf("upload folder: %w", err)
+	}
 	pruneAbandoned(opt.ResumeDir)
 	if err := checkFreeSpace(opt.ResumeDir, need, "the encrypted payload", "free some space or use another ResumeDir"); err != nil {
 		return nil, err
@@ -208,6 +211,9 @@ func pendingDir(dir, revisionID string) (string, error) {
 	if _, err := uuid.Parse(revisionID); err != nil {
 		return "", fmt.Errorf("invalid revision ID %q", revisionID)
 	}
+	if err := checkPrivateDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("upload folder: %w", err)
+	}
 	return filepath.Join(dir, revisionID), nil
 }
 
@@ -220,6 +226,9 @@ func ListPendingUploads(dir string) ([]PendingUpload, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if err := checkPrivateDir(dir); err != nil {
+		return nil, fmt.Errorf("upload folder: %w", err)
 	}
 	var out []PendingUpload
 	for _, e := range entries {

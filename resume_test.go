@@ -15,6 +15,10 @@ import (
 // with one upload thread so part 1 is in storage and part 3 never went.
 func interruptedSend(t *testing.T, f *fakeAPI, dir string) ([]byte, *UploadInterruptedError) {
 	t.Helper()
+	// The SDK keeps ciphertext only in a folder private to this user.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	f.multipartAt, f.partSize, f.refusePart = 5<<20, 5<<20, 2
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	data := randomBytes(t, 12<<20)

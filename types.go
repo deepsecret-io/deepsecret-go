@@ -130,7 +130,9 @@ type EncryptOptions struct {
 	// folder named after its revision under this directory, so an upload
 	// that fails or is cancelled can finish later with ResumeUpload; the
 	// send then returns an UploadInterruptedError. Empty means a temporary
-	// directory removed when the send ends, and no resume.
+	// directory removed when the send ends, and no resume. It is created
+	// (mode 0700) when missing, and refused when it is a symlink or, on
+	// Unix, another user's or open to other users.
 	ResumeDir string
 
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes for
@@ -225,7 +227,7 @@ type DecryptResult struct {
 	SenderFingerprint    string
 	SenderEmail          string      // for a local file: the sender, whose registered key signed the manifest
 	RecipientFingerprint string      // the caller's own key, which the wrap was made for
-	Recipients           []Recipient // every recipient the sender signed for; Email is the server's (or a local file's) label for each fingerprint
+	Recipients           []Recipient // every recipient the sender signed for; Email is the server's label for each fingerprint, or for a local file the file's label when that account registered the key
 	Compressed           bool
 	Compression          string
 	PayloadType          string

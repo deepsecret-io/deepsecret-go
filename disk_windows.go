@@ -5,7 +5,12 @@
 
 package sdk
 
-import "golang.org/x/sys/windows"
+import (
+	"fmt"
+	"os"
+
+	"golang.org/x/sys/windows"
+)
 
 // freeDiskBytes reports the bytes the caller can still write in the volume
 // holding dir.
@@ -19,4 +24,17 @@ func freeDiskBytes(dir string) (int64, bool) {
 		return 0, false
 	}
 	return int64(free), true
+}
+
+// checkPrivateDir refuses dir unless it is a real directory, not a
+// symlink or junction. Access is left to the folder's ACL.
+func checkPrivateDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	return nil
 }

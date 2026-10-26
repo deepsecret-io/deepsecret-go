@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"github.com/deepsecret-io/sdk/crypto"
 )
 
 // openLocal opens path as email and decrypts it in memory.
@@ -70,6 +72,28 @@ func TestLocalFileRoundTrip(t *testing.T) {
 	}
 	if _, err := f.openLocal(alice.email, path); err == nil || !strings.Contains(err.Error(), "not encrypted for your key") {
 		t.Fatalf("sender who is not a recipient: %v", err)
+	}
+
+	// Recipient emails are unsigned labels: one moved to another key is
+	// not shown, though the file still opens.
+	rewriteHeader(t, path, func(h *localHeader) {
+		for i := range h.Wraps {
+			if h.Wraps[i].Fingerprint == carol.fp {
+				h.Wraps[i].Email = bob.email
+			}
+		}
+	})
+	out, err := f.openLocal(bob.email, path)
+	if err != nil {
+		t.Fatalf("open relabeled: %v", err)
+	}
+	for _, sr := range out.Recipients {
+		if sr.Fingerprint == carol.fp && sr.Email != "" {
+			t.Fatalf("carol's key is shown as %s", sr.Email)
+		}
+		if sr.Fingerprint == bob.fp && sr.Email != bob.email {
+			t.Fatalf("bob's own label was dropped: %+v", sr)
+		}
 	}
 }
 
@@ -194,6 +218,20 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	pathy := variant("pathy", clone())
 	rewriteHeader(t, pathy, func(h *localHeader) { h.SenderEmail = "../../actors/me@x" })
 	cases["sender email with a path"] = struct{ path, want string }{pathy, "invalid sender email"}
+	// The revision ID names the output directory, so a sender cannot make
+	// it a path; it is checked before the signature.
+	pathID := variant("path-id", clone())
+	rewriteHeader(t, pathID, func(h *localHeader) {
+		m, err := crypto.UnmarshalManifest(h.Manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.RevisionID = "../../escape"
+		if h.Manifest, err = m.Marshal(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	cases["revision ID is a path"] = struct{ path, want string }{pathID, "not a UUID"}
 	// A wrap moved to another fingerprint does not match the signed one.
 	dup := variant("dup", clone())
 	rewriteHeader(t, dup, func(h *localHeader) { h.Wraps = append(h.Wraps, h.Wraps[0]) })
@@ -207,5 +245,25 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	}
 	if out, err := f.openLocal("bob@example.com", orig); err != nil || out.Decrypted.Message != "the real one" {
 		t.Fatalf("the original no longer opens: %v", err)
+	}
+}
+
+// Emails from a file are looked up and printed, so they may not hold path
+// characters, controls (C0 or C1, such as an ANSI escape) or formatting
+// marks such as a right-to-left override.
+func TestPlausibleEmail(t *testing.T) {
+	for _, s := range []string{"alice@example.com", "o'brien+x@example.co.uk", "ünï@exämple.com"} {
+		if !plausibleEmail(s) {
+			t.Errorf("%q refused", s)
+		}
+	}
+	for _, s := range []string{
+		"", "alice", "@example.com", "alice@", "a b@example.com", "a/b@example.com", "../x@y",
+		"a\x1b[31m@example.com", "a\u009b31m@example.com", "a\u202e@example.com", "a\x00@example.com",
+		"bad\xff@example.com", strings.Repeat("a", 250) + "@example.com",
+	} {
+		if plausibleEmail(s) {
+			t.Errorf("%q accepted", s)
+		}
 	}
 }

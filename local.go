@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
@@ -55,6 +57,10 @@ const (
 
 	// maxEmailLen is the longest email address (RFC 5321).
 	maxEmailLen = 254
+
+	// maxCheckedLabels bounds the API lookups that check recipient labels
+	// on open; recipients past it are shown by fingerprint only.
+	maxCheckedLabels = 100
 )
 
 // localMagicItem is localMagic encoded as a CBOR text string (major type
@@ -65,9 +71,10 @@ var localMagicItem = append([]byte{0x60 | byte(len(localMagic))}, localMagic...)
 // major type 2 initial byte for an 8-byte length (0x5b) and the length.
 var localPrefixLen = int64(len(localMagicItem) + 9)
 
-// localHeader is the map after the payload. Emails are labels: the sender's
-// is checked against the key that signed the manifest, and a recipient's is
-// what the sender typed for that fingerprint.
+// localHeader is the map after the payload. Emails are labels the
+// signature does not cover: on open, the sender's is checked against the
+// key that signed the manifest, and each recipient's against the key it
+// labels, and a label that fails is not shown.
 type localHeader struct {
 	SenderEmail string      `cbor:"sender_email"`
 	Manifest    []byte      `cbor:"manifest"`
@@ -301,7 +308,12 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	senderED25519, err := identity.ResolveSenderED25519ByEmail(c.api, hdr.SenderEmail, peek.SenderFingerprint)
+	// Callers name output after the revision, as for a secret, so it must
+	// be what a send makes: a canonical UUID, never a path.
+	if id, err := uuid.Parse(peek.RevisionID); err != nil || id.String() != peek.RevisionID {
+		return nil, fmt.Errorf("%s: malformed local file: the revision ID is not a UUID", path)
+	}
+	senderED25519, err := identity.ResolveED25519ByEmail(c.api, hdr.SenderEmail, peek.SenderFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
 	}
@@ -350,9 +362,23 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
+	// The signed list holds fingerprints only, so an email is shown for
+	// one only when that account registered the key: anyone handling the
+	// file could have changed the labels.
 	recipients := make([]Recipient, len(m.Recipients))
+	checked := 0
 	for i, r := range m.Recipients {
-		recipients[i] = Recipient{Email: emails[r.Fingerprint], Fingerprint: r.Fingerprint}
+		email := emails[r.Fingerprint]
+		if email != "" {
+			checked++
+			if checked > maxCheckedLabels {
+				email = ""
+			} else if _, err := identity.ResolveED25519ByEmail(c.api, email, r.Fingerprint); err != nil {
+				debugf("verify", "recipient label %s does not own key %s; not shown", sanitizeForLog(email), crypto.ShortFingerprint(r.Fingerprint))
+				email = ""
+			}
+		}
+		recipients[i] = Recipient{Email: email, Fingerprint: r.Fingerprint}
 	}
 	o.Result = DecryptResult{
 		RevisionID:           m.RevisionID,
@@ -465,14 +491,16 @@ func (h *localHeader) validate() error {
 }
 
 // plausibleEmail accepts what could be an email address and nothing that
-// could change the path it is looked up under.
+// could change the path it is looked up under or the terminal it is
+// printed to: only printable characters, no spaces, controls or
+// formatting marks.
 func plausibleEmail(s string) bool {
 	at := strings.LastIndexByte(s, '@')
-	if len(s) > maxEmailLen || at < 1 || at == len(s)-1 {
+	if len(s) > maxEmailLen || at < 1 || at == len(s)-1 || !utf8.ValidString(s) {
 		return false
 	}
 	for _, r := range s {
-		if r <= ' ' || r == 0x7f || strings.ContainsRune("/\\?#%", r) {
+		if r == ' ' || !unicode.IsPrint(r) || strings.ContainsRune("/\\?#%", r) {
 			return false
 		}
 	}
