@@ -18,8 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -76,6 +76,7 @@ type fakeAPI struct {
 	partSize    int64
 	uploads     map[string]*fakeUpload // by revision id
 	refusePart  int                    // storage refuses this part's PUTs
+	afterPart   func(n int)            // called once storage holds part n
 
 	// Downloads: the part size the presign suggests, and how many range
 	// GETs a presigned URL serves before it is refused with 403 (0: no
@@ -474,7 +475,11 @@ func (f *fakeAPI) putPart(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.puts++
 	up.parts[n] = fakePart{etag: hex.EncodeToString(sum), size: info.Size()}
+	after := f.afterPart
 	f.mu.Unlock()
+	if after != nil {
+		after(n)
+	}
 	w.Header().Set("ETag", `"`+hex.EncodeToString(sum)+`"`)
 }
 

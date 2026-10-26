@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -70,6 +71,63 @@ func TestInterruptedSendResumes(t *testing.T) {
 	}
 	assertEmptyDir(t, dir)
 
+	out := t.TempDir()
+	if _, _, err := f.client("bob@example.com").DecryptToDir(interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
+}
+
+// Ctrl+C in the CLI cancels the client's root context. A send cancelled
+// mid-upload keeps its ciphertext and record, and resumes with a new
+// client, sending only the parts storage lacks.
+func TestCancelledSendResumes(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.multipartAt, f.partSize = 5<<20, 5<<20
+	src := filepath.Join(t.TempDir(), "backup.bin")
+	data := randomBytes(t, 12<<20)
+	writeFile(t, src, data, 0o600)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.afterPart = func(n int) {
+		if n == 1 {
+			cancel()
+		}
+	}
+	alice := f.client("alice@example.com")
+	alice.SetRootContext(ctx)
+	_, err := alice.EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{ResumeDir: dir, UploadThreads: 1})
+	var interrupted *UploadInterruptedError
+	if !errors.As(err, &interrupted) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled send: %v, want an interrupted upload caused by the cancel", err)
+	}
+	pending, err := ListPendingUploads(dir)
+	if err != nil || len(pending) != 1 || pending[0].RevisionID != interrupted.Upload.RevisionID {
+		t.Fatalf("pending after cancel: %+v, %v", pending, err)
+	}
+	if info, err := os.Stat(filepath.Join(pending[0].Dir, "payload")); err != nil || info.Size() != interrupted.Upload.Size {
+		t.Fatalf("kept ciphertext: %v, %v", info, err)
+	}
+
+	f.mu.Lock()
+	f.afterPart = nil
+	before := f.puts
+	f.mu.Unlock()
+	if _, err := f.client("alice@example.com").ResumeUpload(dir, interrupted.Upload.RevisionID, ResumeOptions{}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	f.mu.Lock()
+	sent := f.puts - before
+	f.mu.Unlock()
+	if sent != 2 {
+		t.Fatalf("resume sent %d parts, want the 2 the cancel stopped", sent)
+	}
+	assertEmptyDir(t, dir)
 	out := t.TempDir()
 	if _, _, err := f.client("bob@example.com").DecryptToDir(interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
 		t.Fatal(err)
