@@ -62,8 +62,10 @@ func main() {
 	fmt.Println("Key bundle signature: verified ✓")
 
 	// Save and reload keys (with password)
-	tmpDir := filepath.Join(os.TempDir(), "deepsecret-example")
-	os.MkdirAll(tmpDir, 0700)
+	tmpDir, err := os.MkdirTemp("", "deepsecret-example-")
+	if err != nil {
+		log.Fatal("create key directory: ", err)
+	}
 	defer os.RemoveAll(tmpDir)
 
 	if err := crypto.SaveKeyPairTo(tmpDir, senderFP, senderKP, "test-password"); err != nil {

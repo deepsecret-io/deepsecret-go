@@ -16,10 +16,14 @@ import (
 	"time"
 )
 
-// fakeToken is a JWT-shaped token: the client only reads its claims.
+// tokenLifetime is how long the API's session tokens last.
+const tokenLifetime = time.Hour
+
+// fakeToken is a JWT-shaped token issued tokenLifetime before it expires,
+// as the API issues them: the client only reads its claims.
 func fakeToken(sub string, exp time.Time, n int) string {
 	enc := base64.RawURLEncoding.EncodeToString
-	claims, _ := json.Marshal(map[string]any{"sub": sub, "exp": exp.Unix(), "jti": n})
+	claims, _ := json.Marshal(map[string]any{"sub": sub, "iat": exp.Add(-tokenLifetime).Unix(), "exp": exp.Unix(), "jti": n})
 	return enc([]byte(`{"alg":"HS256"}`)) + "." + enc(claims) + "." + enc([]byte(fmt.Sprint(n)))
 }
 
@@ -34,7 +38,7 @@ type sessionServer struct {
 }
 
 func newSessionServer(t *testing.T, tokens ...string) (*sessionServer, *Client) {
-	s := &sessionServer{valid: map[string]bool{}, lifetime: time.Hour}
+	s := &sessionServer{valid: map[string]bool{}, lifetime: tokenLifetime}
 	for _, tok := range tokens {
 		s.valid[tok] = true
 	}
@@ -93,6 +97,62 @@ func TestSession_RefreshesShortlyBeforeExpiry(t *testing.T) {
 	}
 }
 
+// A token in use renews once an eighth of its lifetime has passed, 7.5
+// minutes of a one-hour token, long before it expires, so a session in use
+// outlives its first token. A younger one is left alone.
+func TestSession_RenewsOnUseAfterAnEighthOfItsLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		age       time.Duration
+		refreshes int32
+	}{
+		{"five minutes old", 5 * time.Minute, 0},
+		{"eight minutes old", 8 * time.Minute, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(tokenLifetime-tc.age), 1))
+			for range 3 {
+				if _, err := c.Get("/api/v1/me"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if n := srv.refreshes.Load(); n != tc.refreshes {
+				t.Fatalf("%d refreshes over 3 requests, want %d", n, tc.refreshes)
+			}
+		})
+	}
+}
+
+// A refresh that fails is not retried on every request: the requests go
+// out with the current token, and the client asks again only a minute
+// later.
+func TestSession_FailingRefreshIsNotRetriedPerRequest(t *testing.T) {
+	var refreshes, requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == refreshPath {
+			refreshes.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"success":false,"error":"Failed to refresh token"}`)
+			return
+		}
+		requests.Add(1)
+		fmt.Fprint(w, `{"success":true,"data":{}}`)
+	}))
+	defer srv.Close()
+	c, err := NewClient(srv.URL, "bearer:"+fakeToken("actor-1", time.Now().Add(40*time.Minute), 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := c.Get("/api/v1/me"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if refreshes.Load() != 1 || requests.Load() != 5 {
+		t.Fatalf("%d refreshes and %d requests, want 1 and 5", refreshes.Load(), requests.Load())
+	}
+}
+
 // Workers sharing a client refresh once: the second refresh of the same
 // token would fail, since the first revoked it.
 func TestSession_ConcurrentRequestsRefreshOnce(t *testing.T) {
@@ -117,8 +177,8 @@ func TestSession_ConcurrentRequestsRefreshOnce(t *testing.T) {
 // Another process refreshed the shared session, which revoked this
 // client's token: the client picks up the stored token and retries.
 func TestSession_AdoptsTheStoredTokenOnUnauthorized(t *testing.T) {
-	mine := fakeToken("actor-1", time.Now().Add(time.Hour), 1)
-	theirs := fakeToken("actor-1", time.Now().Add(time.Hour), 2)
+	mine := fakeToken("actor-1", time.Now().Add(tokenLifetime), 1)
+	theirs := fakeToken("actor-1", time.Now().Add(tokenLifetime), 2)
 	srv, c := newSessionServer(t, mine)
 	srv.mu.Lock()
 	delete(srv.valid, mine)
@@ -136,8 +196,8 @@ func TestSession_AdoptsTheStoredTokenOnUnauthorized(t *testing.T) {
 // A stored token of another account, from a login made meanwhile, is
 // never used for this client's requests.
 func TestSession_IgnoresAnotherAccountsToken(t *testing.T) {
-	mine := fakeToken("actor-1", time.Now().Add(time.Hour), 1)
-	other := fakeToken("actor-2", time.Now().Add(time.Hour), 2)
+	mine := fakeToken("actor-1", time.Now().Add(tokenLifetime), 1)
+	other := fakeToken("actor-2", time.Now().Add(tokenLifetime), 2)
 	srv, c := newSessionServer(t, mine)
 	srv.mu.Lock()
 	delete(srv.valid, mine)

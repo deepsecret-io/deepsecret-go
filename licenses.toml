@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 DeepSecret
+
+# osv-scanner configuration for the license check in `task security`.
+# The allowlist is LICENSES in Taskfile.yml. A package outside it fails
+# the check unless it has a reviewed exception below, with its reason.
+
+# This scan checks licenses only; govulncheck gates vulnerabilities.
+[[PackageOverrides]]
+ecosystem = "Go"
+vulnerability.ignore = true
+reason = "License check only. govulncheck gates vulnerabilities."

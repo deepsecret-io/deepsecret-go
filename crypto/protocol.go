@@ -111,6 +111,7 @@ func validatePayloadParams(payloadType string, compressed bool, compression stri
 // contract: "It never returns an error."
 func writeField(h hash.Hash, data []byte) {
 	var length [4]byte
+	// #nosec G115 -- every hashed field is a key, ID or digest, a wrap of fixed size (Wrap.validate) or a field of a manifest capped at 1 MiB, far below 4 GiB.
 	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
 	h.Write(length[:])
 	h.Write(data)

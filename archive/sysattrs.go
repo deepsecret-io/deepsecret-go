@@ -21,16 +21,16 @@ type sysFileInfo struct {
 	Nlink uint64 // 1 if unavailable
 }
 
-// hardLinkKey returns a stable identifier for a (Dev, Ino) pair, suitable
-// for map lookup. Zero value means "no inode info" (Windows or hard links
-// not applicable); callers should not dedupe in that case.
-func (s sysFileInfo) hardLinkKey() (uint64, bool) {
+// hardLinkKey returns the (Dev, Ino) pair that identifies a file, for map
+// lookup. ok is false without inode info (Windows, or hard links not
+// applicable); callers should not dedupe in that case. The pair is kept
+// whole: a combined number could make two different files collide, and the
+// second would be archived as a link to the first.
+func (s sysFileInfo) hardLinkKey() (key [2]uint64, ok bool) {
 	if s.Ino == 0 {
-		return 0, false
+		return key, false
 	}
-	// Combine dev + ino. They're independent monotonic counters per FS, so
-	// xor with a shift gives a low-collision composite.
-	return s.Dev<<32 ^ s.Ino, true
+	return [2]uint64{s.Dev, s.Ino}, true
 }
 
 // Platform-specific functions — see sysattrs_unix.go and sysattrs_windows.go.

@@ -22,7 +22,7 @@ func sysStat(info os.FileInfo) sysFileInfo {
 	return sysFileInfo{
 		Uid:   int(s.Uid),
 		Gid:   int(s.Gid),
-		Dev:   uint64(s.Dev),
+		Dev:   uint64(s.Dev), // #nosec G115 -- int32 on macOS: an identity compared only for equality, so the bit pattern matters, not the value.
 		Ino:   uint64(s.Ino),
 		Nlink: uint64(s.Nlink),
 	}

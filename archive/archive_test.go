@@ -850,8 +850,9 @@ func TestCreateTarFromBytes_LongPaths(t *testing.T) {
 // ── Partial extraction cleanup ──────────────────────────────────────────────
 
 func TestExtractTar_PartialExtractionOnError(t *testing.T) {
-	// Valid first entry, then a FIFO (named pipe) — an unsupported tar
-	// type the extractor rejects, so we can verify the first file landed.
+	// Valid first entry, then a FIFO (named pipe): an unsupported tar type
+	// the extractor rejects, after the first file landed. The failure
+	// removes that file again.
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "good.txt", Size: 4})
@@ -864,11 +865,11 @@ func TestExtractTar_PartialExtractionOnError(t *testing.T) {
 	if err == nil {
 		t.Error("should fail on fifo entry")
 	}
-	if count != 1 {
-		t.Errorf("count = %d, want 1 (partial extraction)", count)
+	if count != 0 {
+		t.Errorf("count = %d, want 0: a failed extraction keeps nothing", count)
 	}
-	if _, statErr := os.Stat(filepath.Join(extractDir, "good.txt")); statErr != nil {
-		t.Error("first file should exist after partial extraction")
+	if _, statErr := os.Stat(filepath.Join(extractDir, "good.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("the first file is left after the failure: %v", statErr)
 	}
 }
 
@@ -1012,13 +1013,15 @@ func TestExtractTar_TotalSizeOverflowDoesNotLeaveFile(t *testing.T) {
 	if err == nil {
 		t.Error("should fail on total size overflow")
 	}
-	// First file should have been extracted
-	if count != 1 {
-		t.Errorf("count = %d, want 1", count)
+	// The failure removes the first file, and the second is refused
+	// before it is written.
+	if count != 0 {
+		t.Errorf("count = %d, want 0", count)
 	}
-	// Second file should NOT exist (rejected before writing)
-	if _, statErr := os.Stat(filepath.Join(extractDir, "toobig.txt")); statErr == nil {
-		t.Error("oversized file should not be written to disk")
+	for _, name := range []string{"small.txt", "toobig.txt"} {
+		if _, statErr := os.Stat(filepath.Join(extractDir, name)); !os.IsNotExist(statErr) {
+			t.Errorf("%s is on disk after the failure: %v", name, statErr)
+		}
 	}
 }
 

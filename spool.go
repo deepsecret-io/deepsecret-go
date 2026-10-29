@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -25,8 +26,8 @@ type spool struct {
 	buf  []byte
 	size int64
 
-	resumable bool // under ResumeDir, named after the revision (resume.go)
-	keep      bool // Close leaves the directory, for a resume
+	resume string // "upload" or "download": under a ResumeDir, named after the revision (resume.go, download_resume.go)
+	keep   bool   // Close leaves the directory, for a resume
 }
 
 // newSpool creates a private directory (0700) under base, or under
@@ -44,17 +45,22 @@ func newSpool(base string, need int64) (*spool, error) {
 	if err := checkFreeSpace(base, need, "the encrypted payload", "set "+TempDirEnv+" or the TempDir option to use another directory"); err != nil {
 		return nil, err
 	}
+	// base is the caller's TempDir option, $DEEPSECRET_TMPDIR or the
+	// system temp directory: the local user's choice, never the server's or
+	// a sender's. dir below is a fresh name MkdirTemp made inside it.
 	dir, err := os.MkdirTemp(base, "deepsecret-")
 	if err != nil {
 		return nil, fmt.Errorf("create temporary directory: %w", err)
 	}
+	// #nosec G302 G703 -- a directory needs its execute bit, and 0700 is owner-only; dir is a fresh name MkdirTemp made in the local user's temp directory.
 	if err := os.Chmod(dir, 0o700); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir) // #nosec G703 -- dir, a fresh name MkdirTemp made, is still empty; the chmod error is returned.
 		return nil, fmt.Errorf("protect temporary directory: %w", err)
 	}
+	// #nosec G304 G703 -- a fixed name in the fresh private directory, created exclusively.
 	f, err := os.OpenFile(filepath.Join(dir, "payload"), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir) // #nosec G703 -- dir, a fresh name MkdirTemp made, is still empty; the open error is returned.
 		return nil, fmt.Errorf("create temporary file: %w", err)
 	}
 	return &spool{dir: dir, file: f}, nil
@@ -117,7 +123,10 @@ func (s *spool) Close() error {
 		s.buf = nil
 		return nil
 	}
-	s.file.Close()
+	// The ciphertext was already read back, so a close error cannot change
+	// what was uploaded or decrypted; a resumed upload checks the file's
+	// size again.
+	_ = s.file.Close()
 	if s.keep {
 		return nil
 	}
@@ -142,6 +151,7 @@ func checkFreeSpace(dir string, need int64, what, hint string) error {
 	}
 	probe := dir
 	for {
+		// #nosec G703 -- dir is where the caller asked to write; Stat only finds its nearest existing parent.
 		if _, err := os.Stat(probe); err == nil {
 			break
 		}
@@ -159,6 +169,17 @@ func checkFreeSpace(dir string, need int64, what, hint string) error {
 		return fmt.Errorf("%s", msg)
 	}
 	return nil
+}
+
+// blocksToBytes is blocks of size bytes each, capped at math.MaxInt64:
+// some network and FUSE filesystems report more free space than an int64
+// holds, which would otherwise wrap to a small or negative number and
+// refuse a write that fits.
+func blocksToBytes(blocks, size uint64) int64 {
+	if size != 0 && blocks > math.MaxInt64/size {
+		return math.MaxInt64
+	}
+	return int64(blocks * size) // #nosec G115 -- the check above keeps the product within int64.
 }
 
 // ctxReader stops reading once ctx is done, so a cancel stops a long
@@ -182,8 +203,11 @@ func (s *spool) plan(need int64) string {
 		return "in memory (small payload)"
 	}
 	where := s.dir + " (private, removed when done)"
-	if s.resumable {
+	switch s.resume {
+	case "upload":
 		where = s.dir + " (private, kept until the upload finishes so it can resume)"
+	case "download":
+		where = s.dir + " (private, kept until the payload is decrypted so the download can resume)"
 	}
 	if free, ok := freeDiskBytes(s.dir); ok {
 		where += fmt.Sprintf("; needs %s, %s free", humanBytes(need), humanBytes(free))

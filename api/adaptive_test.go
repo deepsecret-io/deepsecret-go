@@ -6,6 +6,8 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -126,6 +128,69 @@ func TestTuner_ExplainsEachChange(t *testing.T) {
 	}
 }
 
+// Windows are short from 4 MB/s, where two seconds measure the link, and
+// stay five seconds below, where a short window would measure noise; a
+// level is held 30 seconds before the next probe either way.
+func TestTuner_WindowFollowsTheRate(t *testing.T) {
+	if windowFor(260e3) != 5*time.Second || windowFor(3.9e6) != 5*time.Second || windowFor(4e6) != 2*time.Second || windowFor(120e6) != 2*time.Second {
+		t.Fatalf("windows: %v at 260 KB/s, %v at 3.9 MB/s, %v at 4 MB/s, %v at 120 MB/s",
+			windowFor(260e3), windowFor(3.9e6), windowFor(4e6), windowFor(120e6))
+	}
+	if (&tuner{}).holdWindows() != 6 || (&tuner{window: 2 * time.Second}).holdWindows() != 15 {
+		t.Fatalf("hold: %d slow windows, %d fast ones", (&tuner{}).holdWindows(), (&tuner{window: 2 * time.Second}).holdWindows())
+	}
+	tu := &tuner{limit: 8, max: 32, prev: 4, base: 100e6, window: 2 * time.Second}
+	tu.next(100e6, 0)
+	if tu.limit != 4 || tu.hold != 15 {
+		t.Fatalf("a doubling that did not pay: limit %d, hold %d windows of 2s", tu.limit, tu.hold)
+	}
+}
+
+// On short windows, one window in which nothing moved (a brief stall)
+// does not shed a fast link's parts: the bound on parts in flight is
+// judged over 5 seconds. A link that stays slow for that long is shed.
+func TestTuner_OneStalledWindowDoesNotShed(t *testing.T) {
+	tu := &tuner{limit: 16, max: 32, partSize: 32 << 20, window: 2 * time.Second, steady: 5 * time.Second, hold: 100}
+	for range 3 {
+		tu.next(120e6, 0)
+	}
+	if tu.next(0, 0) != 16 {
+		t.Fatalf("one stalled window shed to %d parts (%s)", tu.limit, tu.reason)
+	}
+	tu.next(0, 0)
+	if tu.next(0, 0) != 8 || tu.reason != "at this rate parts would take over 1m each" {
+		t.Fatalf("a stall over the 5 seconds left %d parts (%s)", tu.limit, tu.reason)
+	}
+}
+
+// A doubling whose window falls far below the level before it (a brief
+// stall) is judged again on the next window instead of undone at once; a
+// doubling that keeps falling short is undone.
+func TestTuner_RejudgesADippedDoubling(t *testing.T) {
+	doubled := func() *tuner {
+		tu := &tuner{limit: 4, max: 32}
+		tu.probe(68e6, 32) // to 8, judged after its settling window
+		tu.next(70e6, 0)
+		return tu
+	}
+	tu := doubled()
+	if tu.next(31e6, 0) != 8 {
+		t.Fatalf("a dipped window undid the doubling: %d (%s)", tu.limit, tu.reason)
+	}
+	if tu.next(95e6, 0) != 16 {
+		t.Fatalf("the next window's gain was not kept: %d (%s)", tu.limit, tu.reason)
+	}
+	tu = doubled()
+	tu.next(31e6, 0)
+	if tu.next(30e6, 0) != 4 {
+		t.Fatalf("two short windows left %d (%s)", tu.limit, tu.reason)
+	}
+	tu = doubled()
+	if tu.next(66e6, 0) != 4 {
+		t.Fatalf("a doubling with no gain, and no dip, left %d (%s)", tu.limit, tu.reason)
+	}
+}
+
 // uploadTuner is the tuner of an upload of 8 MiB parts, before its first
 // window.
 func uploadTuner() *tuner {
@@ -133,14 +198,103 @@ func uploadTuner() *tuner {
 }
 
 // On a link that one part fills (260 KB/s, where a part alone takes 32
-// seconds), an upload never runs a second part: it would only slow the
-// first, and storage keeps finished parts only.
+// seconds), a second part only slows the first, and storage keeps
+// finished parts only. The upload tries one for its settling and judging
+// windows, goes back to one part, and tries again five minutes later.
 func TestTuner_SlowLinkSendsOnePartAtATime(t *testing.T) {
 	tu := uploadTuner()
-	for i := range 60 {
-		if tu.next(260e3, 0) != 1 {
+	var two []int
+	for i := 1; i <= 130; i++ {
+		switch tu.next(260e3, 0) {
+		case 1:
+		case 2:
+			two = append(two, i)
+		default:
 			t.Fatalf("window %d: %d parts in flight on a link one part fills (%s)", i, tu.limit, tu.reason)
 		}
+	}
+	// Back at one, a settling window, then five minutes of 5s windows.
+	if fmt.Sprint(two) != "[3 4 67 68]" {
+		t.Fatalf("two parts in windows %v, want 3 and 4, then 67 and 68", two)
+	}
+}
+
+// Where each connection is limited on its own (250 KB/s each), one part
+// measures slow and the time bound would hold the upload at one for good.
+// The second part it tries raises throughput, and from there the bound,
+// judged on the parts in flight, lets it climb: each part still finishes in
+// 33 seconds however many run.
+func TestTuner_SecondPartUnlocksAPerConnectionLimit(t *testing.T) {
+	tu := uploadTuner()
+	var said []string
+	for range 200 {
+		before := tu.limit
+		tu.next(float64(tu.limit)*250e3, 0)
+		if why, ok := tu.said(before); ok {
+			said = append(said, fmt.Sprintf("%d->%d %s", before, tu.limit, why))
+		}
+	}
+	if tu.limit != 32 {
+		t.Fatalf("settled at %d parts, want 32: %q", tu.limit, said)
+	}
+	if !slices.ContainsFunc(said, func(s string) bool { return strings.Contains(s, "the second part raised throughput") }) {
+		t.Fatalf("the second part's payoff was not said: %q", said)
+	}
+}
+
+// Even where a part alone takes over a minute (100 KB/s per connection),
+// a second part that doubles throughput is kept: it does not slow the
+// first. The bound still stops the upload from adding more.
+func TestTuner_KeepsASecondPartThatPaysOff(t *testing.T) {
+	tu := uploadTuner()
+	for range 100 {
+		tu.next(float64(tu.limit)*100e3, 0)
+	}
+	if tu.limit != 2 {
+		t.Fatalf("settled at %d parts, want 2", tu.limit)
+	}
+}
+
+// A debug log says each change, and why a count holds, once: a hold that
+// repeats is not said again until the count changes.
+func TestTuner_SaysWhyItHolds(t *testing.T) {
+	tu := uploadTuner()
+	var said []string
+	for range 130 {
+		before := tu.limit
+		tu.next(260e3, 0)
+		if why, ok := tu.said(before); ok {
+			said = append(said, fmt.Sprintf("%d->%d %s", before, tu.limit, why))
+		}
+	}
+	want := []string{
+		"1->1 one part at a time: at this rate a second would make each take over 1m",
+		"1->2 the 1m bound holds one part; trying a second in case one connection, not the link, is the limit",
+		"2->1 a second part did not raise throughput by 10%: one part fills the link; trying again in 5m",
+		"1->2 the 1m bound holds one part; trying a second in case one connection, not the link, is the limit",
+		"2->1 a second part did not raise throughput by 10%: one part fills the link; trying again in 5m",
+	}
+	if !slices.Equal(said, want) {
+		t.Fatalf("said %q\nwant %q", said, want)
+	}
+
+	top := &tuner{limit: 8, max: 8}
+	var holds int
+	for range 40 {
+		before := top.limit
+		top.next(80e6, 0)
+		if why, ok := top.said(before); ok {
+			holds++
+			if why != "at the most this transfer allows" {
+				t.Fatalf("at its ceiling it said %q", why)
+			}
+		}
+	}
+	if holds != 1 {
+		t.Fatalf("a transfer at its ceiling said so %d times, want once", holds)
+	}
+	if got := threadsChange(8, 8, 80e6, "at the most this transfer allows"); got != "stays at 8 at 76.29 MiB/s: at the most this transfer allows" {
+		t.Fatalf("a hold reads %q", got)
 	}
 }
 

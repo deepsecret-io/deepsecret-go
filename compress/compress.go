@@ -71,7 +71,7 @@ func CompressedSize(data []byte, algo Algorithm) (int64, error) {
 		return 0, err
 	}
 	if _, err := w.Write(data); err != nil {
-		w.Close()
+		_ = w.Close() // the write error is returned; the partial output is discarded.
 		return 0, err
 	}
 	if err := w.Close(); err != nil {
@@ -132,7 +132,7 @@ func Compress(data []byte, algo Algorithm) ([]byte, error) {
 		return nil, err
 	}
 	if _, err := w.Write(data); err != nil {
-		w.Close()
+		_ = w.Close() // the write error is returned; the partial output is discarded.
 		return nil, err
 	}
 	if err := w.Close(); err != nil {

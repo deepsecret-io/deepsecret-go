@@ -124,30 +124,30 @@ func TestValidateTarReaderRefusesHostileArchives(t *testing.T) {
 // unless told to.
 func TestWriteFile(t *testing.T) {
 	dir := t.TempDir()
-	path, n, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("hello"), 100, false)
+	path, n, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("hello"), 100, false, nil)
 	if err != nil || n != 5 || path != filepath.Join(dir, "sub", "a.txt") {
 		t.Fatalf("write: %s %d %v", path, n, err)
 	}
 	if got, _ := os.ReadFile(path); string(got) != "hello" {
 		t.Fatalf("content %q", got)
 	}
-	if _, _, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("x"), 100, false); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, _, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("x"), 100, false, nil); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("overwrite without permission: %v", err)
 	}
-	if _, _, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("x"), 100, true); err != nil {
+	if _, _, err := WriteFile(dir, "sub/a.txt", 0o640, strings.NewReader("x"), 100, true, nil); err != nil {
 		t.Fatalf("overwrite with permission: %v", err)
 	}
-	if _, _, err := WriteFile(dir, "../escape", 0o640, strings.NewReader("x"), 100, false); err == nil {
+	if _, _, err := WriteFile(dir, "../escape", 0o640, strings.NewReader("x"), 100, false, nil); err == nil {
 		t.Fatal("wrote outside the output directory")
 	}
-	if _, _, err := WriteFile(dir, "big", 0o640, strings.NewReader("too long"), 3, false); err == nil {
+	if _, _, err := WriteFile(dir, "big", 0o640, strings.NewReader("too long"), 3, false, nil); err == nil {
 		t.Fatal("wrote past the size limit")
 	}
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(dir, "out")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := WriteFile(dir, "out/x", 0o640, strings.NewReader("x"), 100, false); err == nil || !strings.Contains(err.Error(), "escape") {
+	if _, _, err := WriteFile(dir, "out/x", 0o640, strings.NewReader("x"), 100, false, nil); err == nil || !strings.Contains(err.Error(), "escape") {
 		t.Fatalf("wrote through a symlink out of the directory: %v", err)
 	}
 }

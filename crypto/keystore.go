@@ -9,10 +9,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -80,6 +82,9 @@ func SaveKeyPair(fingerprint string, kp *KeyPair, password string) error {
 // SaveKeyPairTo writes a key pair to <dir>/<fingerprint>.json.
 // If password is non-empty, private keys are encrypted with Argon2id + AES-256-GCM.
 func SaveKeyPairTo(dir, fingerprint string, kp *KeyPair, password string) error {
+	if !validKeyName(fingerprint) {
+		return errInvalidKeyName
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
@@ -107,7 +112,34 @@ func SaveKeyPairTo(dir, fingerprint string, kp *KeyPair, password string) error 
 	if err != nil {
 		return fmt.Errorf("marshal key pair: %w", err)
 	}
-	return os.WriteFile(filepath.Join(dir, fingerprint+".json"), data, 0600)
+	return writePrivateFile(filepath.Join(dir, fingerprint+".json"), data)
+}
+
+// writePrivateFile replaces path with data through a new 0600 file in the
+// same directory, synced and renamed over it. The key file is then private
+// even when an older one was not, a link at path is replaced rather than
+// written through, and a crash leaves the old file or the new one, never
+// half of either.
+func writePrivateFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	// After the rename this finds nothing; after a failure it removes the
+	// temporary file.
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close() // the write error is returned and the file removed.
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close() // the sync error is returned and the file removed.
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // LoadKeyPair loads a key pair from the default keys directory.
@@ -115,11 +147,18 @@ func LoadKeyPair(fingerprint, password string) (*KeyPair, error) {
 	return LoadKeyPairFrom(DefaultKeysDir(), fingerprint, password)
 }
 
-// LoadKeyPairFrom loads a key pair from <dir>/<fingerprint>.json. Only
+// LoadKeyPairFrom loads a key pair from <dir>/<fingerprint>.json, where
+// fingerprint may be a prefix of 16 or more characters. Only
 // KeyStorageVersion 4 is accepted; older formats must be regenerated.
 func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
+	// The fingerprint can come from the server (the primary key it lists),
+	// and it names the file read.
+	fingerprint = strings.ToLower(fingerprint)
+	if !validKeyName(fingerprint) {
+		return nil, errInvalidKeyName
+	}
 	resolved := resolveFingerprint(dir, fingerprint)
-	data, err := os.ReadFile(filepath.Join(dir, resolved+".json"))
+	data, err := os.ReadFile(filepath.Join(dir, resolved+".json")) // #nosec G304 -- resolved is hex only: validKeyName above, or a file name read from dir.
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +224,24 @@ func ListLocalKeysIn(dir string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// errInvalidKeyName refuses a fingerprint that cannot name a key file.
+var errInvalidKeyName = errors.New("a key fingerprint is 16 to 64 hex characters")
+
+// validKeyName reports whether fp can name a key file: 16 to 64 lower-case
+// hex characters, a fingerprint or a prefix of one. The file's path is
+// built from it, so nothing that could change the path passes.
+func validKeyName(fp string) bool {
+	if len(fp) < 16 || len(fp) > 64 {
+		return false
+	}
+	for i := 0; i < len(fp); i++ {
+		if c := fp[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveFingerprint resolves a possibly-truncated fingerprint to the full

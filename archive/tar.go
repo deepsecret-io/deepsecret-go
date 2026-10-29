@@ -6,14 +6,17 @@ package archive
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
-	"github.com/deepsecret-io/sdk/compress"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/deepsecret-io/sdk/compress"
 )
 
 // TarEntry represents an in-memory file for archive creation or extraction.
@@ -106,14 +109,43 @@ func extractXattrs(hdr *tar.Header) map[string]string {
 	return out
 }
 
-// applyXattrsBestEffort writes each xattr to path. Per-attribute failures
-// are silent — common reasons (cross-platform name namespaces, unsupported
-// FS, missing capabilities for security.*) are routine and shouldn't
-// derail extraction. Critical bytes (file content, mode, mtime) are
-// written unconditionally elsewhere; xattrs are pure metadata.
+// applyXattrsBestEffort writes each xattr extraction restores to path.
+// Per-attribute failures are silent: common reasons (cross-platform name
+// namespaces, unsupported FS) are routine and shouldn't derail extraction.
+// Critical bytes (file content, mode, mtime) are written unconditionally
+// elsewhere; xattrs are pure metadata.
 func applyXattrsBestEffort(path string, xattrs map[string]string) {
 	for name, value := range xattrs {
-		_ = writeXattr(path, name, value)
+		if restorableXattr(name) {
+			_ = writeXattr(path, name, value)
+		}
+	}
+}
+
+// restorableXattr reports whether extraction restores the extended
+// attribute name. Linux's security, trusted and system namespaces are left
+// out: they hold file capabilities, SELinux labels and ACLs, with which an
+// archive could grant privileges or access that its modes do not show.
+func restorableXattr(name string) bool {
+	for _, ns := range []string{"security.", "trusted.", "system."} {
+		if strings.HasPrefix(name, ns) {
+			return false
+		}
+	}
+	return true
+}
+
+// keepSpecialBits adds mode's setuid, setgid and sticky bits to path,
+// which open(2) and mkdir(2) leave out. They are set only with
+// KeepSpecialModes (see Limits.entryMode). The permission bits stay as the
+// file or directory was created, with the umask applied.
+func keepSpecialBits(path string, mode os.FileMode) {
+	special := mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	if special == 0 {
+		return
+	}
+	if info, err := os.Lstat(path); err == nil {
+		_ = os.Chmod(path, info.Mode().Perm()|special)
 	}
 }
 
@@ -172,7 +204,7 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 	// Track inodes we've already emitted so subsequent occurrences are
 	// stored as hard links instead of duplicated content. Keyed by the
 	// composite (dev, ino) — see sysFileInfo.hardLinkKey.
-	inodeIndex := map[uint64]string{}
+	inodeIndex := map[[2]uint64]string{}
 
 	for _, ef := range files {
 		info, err := os.Lstat(ef.FullPath)
@@ -281,7 +313,7 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 			return fmt.Errorf("open %s: %w", ef.FullPath, err)
 		}
 		_, copyErr := io.Copy(tw, f)
-		f.Close()
+		_ = f.Close() // f was only read; tw reports a short or long copy against the header's size.
 		if copyErr != nil {
 			return fmt.Errorf("tar write %s: %w", archivePath, copyErr)
 		}
@@ -467,13 +499,35 @@ func WriteTarStream(w io.Writer, entries []TarStreamEntry, algo compress.Algorit
 // All security guarantees from [ExtractTar] apply: path validation, duplicate
 // rejection, type rejection, size limits, symlink escape checks, atomic writes.
 //
-// outputDir is created if it does not exist.
+// outputDir is created if it does not exist. Directories extraction creates
+// without an entry of their own, outputDir among them, are private (0700).
+// Entries get their archive modes with the umask applied, and directories
+// that already exist keep their mode, owner, attributes and times. With
+// AllowOverwrite, a file is replaced by a new one renamed over it, so it
+// gets the entry's mode, not the old file's.
+//
+// When extraction fails, everything it created is removed, files it
+// overwrote among them; what was there before stays. The error names
+// anything that could not be removed.
 //
 // Returns the number of files successfully extracted.
 func ExtractTarReader(r io.Reader, outputDir string, algo compress.Algorithm, limits *Limits) (int, error) {
+	var undo Undo
+	n, err := ExtractTarReaderInto(r, outputDir, algo, limits, &undo)
+	if err != nil {
+		return 0, undo.Remove(err)
+	}
+	return n, nil
+}
+
+// ExtractTarReaderInto is [ExtractTarReader], but it records what it
+// creates and overwrites in undo and leaves it in place when it fails: for
+// a caller with checks of its own after extraction, which removes the
+// whole write with [Undo.Remove] when any of them fails.
+func ExtractTarReaderInto(r io.Reader, outputDir string, algo compress.Algorithm, limits *Limits, undo *Undo) (int, error) {
 	lim := limits.resolve()
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := undo.MkdirAll(outputDir, 0o700); err != nil {
 		return 0, fmt.Errorf("create output directory %q: %w", outputDir, err)
 	}
 	if info, err := os.Stat(outputDir); err != nil {
@@ -488,7 +542,7 @@ func ExtractTarReader(r io.Reader, outputDir string, algo compress.Algorithm, li
 	}
 	defer rc.Close()
 
-	return extractTarFromReader(rc, outputDir, lim)
+	return extractTarFromReader(rc, outputDir, lim, undo)
 }
 
 // ValidateTarReader checks an archive the way ExtractTarReader would
@@ -566,11 +620,12 @@ func ValidateTarReader(r io.Reader, algo compress.Algorithm, limits *Limits) ([]
 			if hdr.Size > lim.MaxEntrySize {
 				return nil, 0, fmt.Errorf("entry %q declares size %d exceeding limit %d", cleanName, hdr.Size, lim.MaxEntrySize)
 			}
-			if totalSize+hdr.Size > lim.MaxTotalSize {
+			if hdr.Size > lim.MaxTotalSize-totalSize {
 				return nil, 0, fmt.Errorf("entry %q (size %d) would exceed total size limit %d (current total: %d)",
 					cleanName, hdr.Size, lim.MaxTotalSize, totalSize)
 			}
 			totalSize += hdr.Size
+			// #nosec G110 -- tr yields exactly hdr.Size bytes, checked against MaxEntrySize and MaxTotalSize above.
 			if _, err := io.Copy(io.Discard, tr); err != nil {
 				return nil, 0, fmt.Errorf("tar read %q: %w", cleanName, err)
 			}
@@ -602,8 +657,9 @@ func checkNameLimits(name string, total *int64, lim *Limits) error {
 }
 
 // extractTarFromReader is the shared extraction core used by both
-// ExtractTarReader and ExtractTar.
-func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, error) {
+// ExtractTarReader and ExtractTar. It records what it creates and
+// overwrites in undo.
+func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo) (int, error) {
 	tr := tar.NewReader(r)
 	count := 0
 	var totalSize int64
@@ -661,20 +717,32 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 		}
 
 		if hdr.Typeflag == tar.TypeDir {
+			// A directory that is already there stays as it is: the
+			// archive does not change the mode, owner, attributes or
+			// times of what it did not create.
+			if info, err := os.Lstat(target); err == nil {
+				if !info.IsDir() {
+					return count, fmt.Errorf("mkdir %q: %s exists and is not a directory", cleanName, target)
+				}
+				continue
+			}
+			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				return count, fmt.Errorf("mkdir for %q: %w", cleanName, err)
+			}
 			mode := lim.entryMode(hdr.Mode)
 			if mode.Perm() == 0 {
 				mode |= 0o755
 			}
-			if err := os.MkdirAll(target, mode.Perm()); err != nil {
+			// Mkdir applies the umask to the entry's permission bits.
+			if err := os.Mkdir(target, mode.Perm()); err != nil {
 				return count, fmt.Errorf("mkdir %q: %w", cleanName, err)
 			}
-			// chown first so its sgid-clearing doesn't undo our chmod.
+			undo.add(target)
+			// chown first so its sgid-clearing doesn't undo the special bits.
 			if lim.KeepOwnership {
 				_ = lchown(target, hdr.Uid, hdr.Gid)
 			}
-			// MkdirAll only sets mode when creating; restore explicitly so
-			// pre-existing dirs and special bits (sgid, sticky) round-trip.
-			_ = os.Chmod(target, mode)
+			keepSpecialBits(target, mode)
 			applyXattrsBestEffort(target, extractXattrs(hdr))
 			if !hdr.ModTime.IsZero() {
 				dirTimes = append(dirTimes, pendingDirTime{path: target, mtime: hdr.ModTime})
@@ -686,7 +754,7 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			if err := validateSymlinkTarget(hdr.Linkname); err != nil {
 				return count, fmt.Errorf("unsafe symlink %q -> %q: %w", cleanName, hdr.Linkname, err)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return count, fmt.Errorf("mkdir for symlink %q: %w", cleanName, err)
 			}
 			if _, err := os.Lstat(target); err == nil {
@@ -700,6 +768,7 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return count, fmt.Errorf("symlink %q: %w", cleanName, err)
 			}
+			undo.add(target)
 			if lim.KeepOwnership {
 				_ = lchown(target, hdr.Uid, hdr.Gid)
 			}
@@ -726,7 +795,7 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			if err := ensureInsideDir(outputDir, linkSrc); err != nil {
 				return count, fmt.Errorf("hardlink target escape for %q: %w", cleanName, err)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return count, fmt.Errorf("mkdir for hardlink %q: %w", cleanName, err)
 			}
 			if _, err := os.Lstat(target); err == nil {
@@ -740,6 +809,7 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			if err := os.Link(linkSrc, target); err != nil {
 				return count, fmt.Errorf("hardlink %q -> %q: %w", cleanName, linkSrcRel, err)
 			}
+			undo.add(target)
 			count++
 			continue
 		}
@@ -751,13 +821,13 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			return count, fmt.Errorf("entry %q declares size %d exceeding limit %d",
 				cleanName, hdr.Size, lim.MaxEntrySize)
 		}
-		if totalSize+hdr.Size > lim.MaxTotalSize {
+		if hdr.Size > lim.MaxTotalSize-totalSize {
 			return count, fmt.Errorf("entry %q (size %d) would exceed total size limit %d (current total: %d)",
 				cleanName, hdr.Size, lim.MaxTotalSize, totalSize)
 		}
 
 		targetDir := filepath.Dir(target)
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
+		if err := undo.MkdirAll(targetDir, 0o700); err != nil {
 			return count, fmt.Errorf("mkdir for %q: %w", cleanName, err)
 		}
 
@@ -772,30 +842,29 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits) (int, erro
 			mode |= 0o644
 		}
 
-		// writeFileAtomicBounded only honours the standard 9-bit perm in
-		// the open(2) mode argument; setuid/setgid/sticky get applied by
-		// the os.Chmod(target, mode) call after the write completes.
+		// open(2) applies the umask to the entry's permission bits, for a
+		// new file and for one replacing an old file alike. setuid/setgid/
+		// sticky are added by keepSpecialBits after the write completes.
 		written, err := writeFileAtomicBounded(target, targetDir, mode.Perm(), tr, lim.MaxEntrySize, lim.AllowOverwrite)
 		if err != nil {
 			return count, fmt.Errorf("write %q: %w", cleanName, err)
 		}
+		undo.add(target)
 
 		totalSize += written
 		if totalSize > lim.MaxTotalSize {
-			os.Remove(target)
 			return count, fmt.Errorf("archive exceeds total size limit %d", lim.MaxTotalSize)
 		}
 
 		// Restore owner first — POSIX chown(2) clears setuid/setgid for
-		// security, so any chmod has to come after to keep those bits.
-		// Then mode (covers setuid/setgid/sticky), xattrs, and finally
-		// mtime so attribute writes don't bump it. Each step is
-		// best-effort; missing privileges or unsupported FS features
+		// security, so the special bits have to come after. Then xattrs,
+		// and finally mtime so attribute writes don't bump it. Each step
+		// is best-effort; missing privileges or unsupported FS features
 		// must not fail the whole extraction.
 		if lim.KeepOwnership {
 			_ = lchown(target, hdr.Uid, hdr.Gid)
 		}
-		_ = os.Chmod(target, mode)
+		keepSpecialBits(target, mode)
 		applyXattrsBestEffort(target, extractXattrs(hdr))
 		if !hdr.ModTime.IsZero() {
 			_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
@@ -853,10 +922,13 @@ func ExtractTar(data []byte, outputDir string, algo compress.Algorithm, limits *
 // WriteFile writes one file into outputDir the way extraction writes a
 // regular entry: name is checked as a portable path and must stay inside
 // outputDir after symlinks resolve, missing parents are created, and the
-// file is opened without following a symlink at its leaf and, unless
-// allowOverwrite, without replacing anything. It writes at most maxSize
-// bytes from r and returns the file's path and the bytes written.
-func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool) (string, int64, error) {
+// file is created without following a symlink at its leaf and, unless
+// allowOverwrite, without replacing anything. Missing parents are private
+// (0700), and the file gets mode with the umask applied, also when it
+// replaces an old file. It writes at most maxSize bytes from r and returns
+// the file's path and the bytes written. It records the directories and
+// the file it creates or overwrites in undo, which may be nil.
+func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool, undo *Undo) (string, int64, error) {
 	cleanName, err := ValidateArchivePath(name)
 	if err != nil {
 		return "", 0, fmt.Errorf("unsafe file name: %w", err)
@@ -866,7 +938,7 @@ func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize in
 		return "", 0, fmt.Errorf("symlink escape for %q: %w", cleanName, err)
 	}
 	targetDir := filepath.Dir(target)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
+	if err := undo.MkdirAll(targetDir, 0o700); err != nil {
 		return "", 0, fmt.Errorf("mkdir for %q: %w", cleanName, err)
 	}
 	// Re-verify after MkdirAll to detect a directory swapped for a symlink.
@@ -877,6 +949,7 @@ func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize in
 	if err != nil {
 		return "", 0, fmt.Errorf("write %q: %w", cleanName, err)
 	}
+	undo.add(target)
 	return target, written, nil
 }
 
@@ -898,34 +971,60 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// writeFileAtomicBounded writes data from r directly to target, refusing to
-// follow a symlink at the leaf component (Unix only — see safeOpenForWrite).
-// When allowOverwrite is false, an existing destination is rejected (O_EXCL);
-// when true, it is truncated (O_TRUNC). Either way the kernel honours
-// O_NOFOLLOW so an attacker cannot redirect the write through a symlink even
-// if they win the TOCTOU race against ensureInsideDir.
+// writeFileAtomicBounded writes at most maxSize bytes from r to target in
+// dir and returns how many it wrote. Without allowOverwrite it creates
+// target, refusing one that exists. With it, it writes a new file beside
+// target and renames it over target once complete, so target gets mode
+// (with the umask applied) instead of keeping an old file's, a link at
+// target is replaced rather than written through, and a reader never sees
+// half a file. Either way the file is created with O_EXCL and, on Unix,
+// O_NOFOLLOW (see safeCreate), so an attacker cannot redirect the write
+// through a symlink even if they win the TOCTOU race against
+// ensureInsideDir.
 func writeFileAtomicBounded(target, dir string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool) (int64, error) {
-	_ = dir
-	f, err := safeOpenForWrite(target, mode, allowOverwrite)
+	path := target
+	if allowOverwrite {
+		path = tempPath(dir)
+	}
+	f, err := safeCreate(path, mode)
 	if err != nil {
 		return 0, err
 	}
 
-	written, err := io.Copy(f, io.LimitReader(r, maxSize+1))
+	// One byte past maxSize tells a source that is too long; maxSize+1
+	// would overflow when maxSize is math.MaxInt64.
+	limit := maxSize
+	if limit < math.MaxInt64 {
+		limit++
+	}
+	written, err := io.Copy(f, io.LimitReader(r, limit))
 	if closeErr := f.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		os.Remove(target)
-		return 0, err
+		return 0, removeAfter(path, err)
 	}
 
 	if written > maxSize {
-		os.Remove(target)
-		return 0, fmt.Errorf("content exceeds size limit %d", maxSize)
+		return 0, removeAfter(path, fmt.Errorf("content exceeds size limit %d", maxSize))
 	}
 
+	if path != target {
+		if err := os.Rename(path, target); err != nil {
+			return 0, removeAfter(path, fmt.Errorf("replace %s: %w", target, err))
+		}
+	}
 	return written, nil
+}
+
+// removeAfter removes target, a file err left incomplete, and returns err,
+// joined with the reason when the file could not be removed, so a partly
+// written file is never left behind unreported.
+func removeAfter(target string, err error) error {
+	if rmErr := os.Remove(target); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		return errors.Join(err, fmt.Errorf("the partly written %s is left behind: %w", target, rmErr))
+	}
+	return err
 }
 
 // ensureInsideDir verifies that target resolves to a path inside dir after
@@ -939,6 +1038,7 @@ func writeFileAtomicBounded(target, dir string, mode os.FileMode, r io.Reader, m
 // Both inputs are normalized to canonical absolute paths before comparison:
 //   - filepath.Abs converts to absolute form (joins with CWD if relative).
 //   - filepath.EvalSymlinks resolves any symlinks in the existing prefix.
+//
 // On systems where common roots are themselves symlinks (e.g. macOS
 // `/tmp` → `/private/tmp`) the two-step normalization keeps both sides in
 // the same canonical form so a legitimate path inside `dir` doesn't get

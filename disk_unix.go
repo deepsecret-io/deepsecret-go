@@ -6,6 +6,7 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -17,10 +18,10 @@ import (
 // the filesystem holding dir.
 func freeDiskBytes(dir string) (int64, bool) {
 	var st unix.Statfs_t
-	if err := unix.Statfs(dir, &st); err != nil {
+	if err := unix.Statfs(dir, &st); err != nil || st.Bsize <= 0 {
 		return 0, false
 	}
-	return int64(st.Bavail) * int64(st.Bsize), true
+	return blocksToBytes(st.Bavail, uint64(st.Bsize)), true // #nosec G115 -- Bsize is positive here (int64 on Linux, uint32 on macOS).
 }
 
 // checkPrivateDir refuses dir unless it is a real directory, not a
@@ -41,4 +42,15 @@ func checkPrivateDir(dir string) error {
 		return fmt.Errorf("%s is open to other users (run: chmod 700 %s)", dir, dir)
 	}
 	return nil
+}
+
+// lockFile takes an exclusive lock on f without waiting, and returns
+// errLocked when another open file holds it. Closing f releases it, and so
+// does the process ending.
+func lockFile(f *os.File) error {
+	err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB) // #nosec G115 -- a file descriptor fits in an int.
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		return errLocked
+	}
+	return err
 }

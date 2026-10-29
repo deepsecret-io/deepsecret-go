@@ -111,11 +111,30 @@ type OpenedSecret struct {
 	// Result is the verified manifest's metadata. Its Decrypted is nil.
 	Result DecryptResult
 
-	opened *crypto.Opened
-	spool  *spool
-	ctx    context.Context
-	debugf func(step, format string, args ...any)
+	opened     *crypto.Opened
+	spool      *spool
+	journal    *downloadJournal // records a kept download's ranges; nil otherwise
+	ctx        context.Context
+	debugf     func(step, format string, args ...any)
+	onProgress func(stage DecryptStage, done, total int64) // optional
 }
+
+// DecryptStage names a pass over the downloaded ciphertext. Payload makes
+// one pass; WriteFiles checks the whole payload before it writes anything,
+// so it makes two, and three for an archive.
+type DecryptStage string
+
+const (
+	// DecryptDecrypting is Payload's pass, decrypting in memory.
+	DecryptDecrypting DecryptStage = "decrypting"
+	// DecryptChecking is WriteFiles' first pass: the payload's structure,
+	// names, sizes and every file's SHA-256, writing nothing.
+	DecryptChecking DecryptStage = "checking"
+	// DecryptCheckingArchive checks an archive's entries.
+	DecryptCheckingArchive DecryptStage = "checking the archive"
+	// DecryptWriting writes the files.
+	DecryptWriting DecryptStage = "writing"
+)
 
 // smallPayloadSize is the largest stored payload OpenSecret keeps in
 // memory rather than in a temporary file.
@@ -227,31 +246,69 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 			humanBytes(m.CiphertextSize))
 	}
 	var sp *spool
-	if inMemory || m.CiphertextSize <= smallPayloadSize {
+	var journal *downloadJournal // a download kept under ResumeDir
+	switch {
+	case inMemory || m.CiphertextSize <= smallPayloadSize:
 		sp = newMemSpool(m.CiphertextSize)
-	} else if sp, err = newSpool(opt.TempDir, spoolNeed(m.CiphertextSize)); err != nil {
-		opened.Close()
-		return nil, err
+	case opt.ResumeDir != "":
+		var rec *PendingDownload
+		if sp, rec, err = c.openDownloadSpool(opt.ResumeDir, secretInfo, m, debugf); err != nil {
+			opened.Close()
+			return nil, err
+		}
+		journal = newDownloadJournal(sp.file, rec)
+	default:
+		if sp, err = newSpool(opt.TempDir, spoolNeed(m.CiphertextSize)); err != nil {
+			opened.Close()
+			return nil, err
+		}
 	}
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf}
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress}
 
-	// Download the ciphertext into the spool.
-	debugf("download", "revision=%s", targetRevID)
-	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(m.CiphertextSize)))
-	t0 := time.Now()
-	if err := c.api.DownloadToFile(targetRevID, sp, m.CiphertextSize, api.MultipartDownloadOptions{
+	// Download the ciphertext into the spool, or the ranges a kept
+	// download lacks.
+	dl := api.MultipartDownloadOptions{
 		Threads:              opt.DownloadThreads,
 		OnProgress:           opt.OnDownloadProgress,
 		OnDebug:              opt.OnDebug,
+		Status:               opt.DownloadStatus,
 		PresignExpiryMinutes: opt.PresignExpiryMinutes,
-	}); err != nil {
-		o.Close()
+	}
+	var resumed int64
+	if journal != nil {
+		dl.Have, dl.OnRange = journal.rec.Have, journal.add
+		resumed = journal.rec.Downloaded()
+		go journal.run()
+	}
+	debugf("download", "revision=%s", targetRevID)
+	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(m.CiphertextSize-resumed)))
+	t0 := time.Now()
+	err = c.api.DownloadToFile(targetRevID, sp, m.CiphertextSize, dl)
+	if journal != nil {
+		journal.halt()
+		o.journal = journal
+		if err != nil {
+			if cerr := journal.checkpoint(); cerr != nil {
+				debugf("resume", "recording the download failed: %v", cerr)
+			}
+			if journal.rec.Downloaded() > 0 {
+				_ = o.Close() // the folder stays for the next decrypt (sp.keep); it holds ciphertext only, in a private (0700) directory.
+				return nil, &DownloadInterruptedError{Download: *journal.rec, Err: err}
+			}
+		}
+	}
+	if err != nil {
+		sp.keep = false // nothing downloaded is worth keeping
+		_ = o.Close()   // the download error is returned; the spool holds ciphertext only, in a private (0700) directory.
 		return nil, fmt.Errorf("download: %w", err)
 	}
 	dlElapsed := time.Since(t0)
 	debugf("download", "payload=%s", humanBytes(m.CiphertextSize))
+	if resumed > 0 {
+		debugf("download", "kept from an earlier download=%s", humanBytes(resumed))
+	}
 	debugf("download", "elapsed=%s", dlElapsed.Round(time.Millisecond))
-	debugf("download", "rate=%s", formatRate(m.CiphertextSize, dlElapsed))
+	debugf("download", "rate=%s", formatRate(m.CiphertextSize-resumed, dlElapsed))
 
 	o.Result = DecryptResult{
 		RevisionID:           targetRevID,
@@ -265,13 +322,22 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		CipherSuite:          m.CipherSuite,
 		PayloadDigest:        hex.EncodeToString(m.PayloadDigest),
 		EncryptedSize:        m.CiphertextSize,
+		ResumedBytes:         resumed,
 	}
 	return o, nil
 }
 
-// Close removes the temporary ciphertext and clears the payload key.
+// Close removes the temporary ciphertext and clears the payload key. A
+// download kept under DecryptOptions.ResumeDir stays unless its payload
+// was decrypted or failed its check, so the next decrypt need not fetch
+// it again.
 func (o *OpenedSecret) Close() error {
 	o.opened.Close()
+	if o.spool.keep && o.journal != nil {
+		if err := o.journal.checkpoint(); err != nil {
+			o.debugf("resume", "recording the download failed: %v", err)
+		}
+	}
 	return o.spool.Close()
 }
 
@@ -281,16 +347,25 @@ var errPassDone = errors.New("decrypt pass stopped")
 // pass decrypts the stored ciphertext once and hands the plaintext,
 // decompressed, to read. The ciphertext's size and digest are checked
 // against the signed manifest before the first plaintext byte, and every
-// chunk is authenticated before it is released.
-func (o *OpenedSecret) pass(read func(r io.Reader) error) error {
+// chunk is authenticated before it is released. stage names the pass for
+// OnDecryptProgress.
+func (o *OpenedSecret) pass(stage DecryptStage, read func(r io.Reader) error) error {
 	if err := o.ctx.Err(); err != nil {
 		return err
 	}
 	m := o.opened.Manifest
+	var src io.ReadSeeker = o.spool.reader(m.CiphertextSize)
+	if o.onProgress != nil {
+		// DecryptTo reads the ciphertext twice, for the digest and then
+		// to decrypt: each read is half the pass.
+		size := m.CiphertextSize
+		o.onProgress(stage, 0, size)
+		src = &passReader{r: src, total: 2 * size, report: func(n int64) { o.onProgress(stage, n/2, size) }}
+	}
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		err := o.opened.DecryptTo(pw, o.spool.reader(m.CiphertextSize))
+		err := o.opened.DecryptTo(pw, src)
 		pw.CloseWithError(err)
 		done <- err
 	}()
@@ -308,12 +383,41 @@ func (o *OpenedSecret) pass(read func(r io.Reader) error) error {
 		defer zr.Close()
 		return read(zr)
 	}()
-	pr.CloseWithError(errPassDone)
+	_ = pr.CloseWithError(errPassDone) // io.PipeReader.CloseWithError always returns nil.
 	decErr := <-done
 	if decErr != nil && !errors.Is(decErr, errPassDone) && !errors.Is(decErr, io.ErrClosedPipe) {
+		// The ciphertext failed its check or could not be read: a kept
+		// download goes, so the next decrypt fetches it afresh.
+		o.spool.keep = false
+		if o.Result.ResumedBytes > 0 {
+			return fmt.Errorf("%w (%s of it was kept from an earlier download; that copy is discarded, so decrypting again downloads it afresh)",
+				decErr, humanBytes(o.Result.ResumedBytes))
+		}
 		return decErr
 	}
 	return readErr
+}
+
+// passReader counts what a pass reads of the ciphertext, rewinds
+// included, up to total.
+type passReader struct {
+	r      io.ReadSeeker
+	n      int64
+	total  int64
+	report func(n int64)
+}
+
+func (p *passReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.n += int64(n)
+		p.report(min(p.n, p.total))
+	}
+	return n, err
+}
+
+func (p *passReader) Seek(offset int64, whence int) (int64, error) {
+	return p.r.Seek(offset, whence)
 }
 
 // maxSmallPlaintext bounds a decrypted message or key-value payload.
@@ -336,7 +440,7 @@ func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
 	}
 	var plaintext []byte
 	tDec := time.Now()
-	err := o.pass(func(r io.Reader) error {
+	err := o.pass(DecryptDecrypting, func(r io.Reader) error {
 		b, err := io.ReadAll(io.LimitReader(r, limit+1))
 		if err != nil {
 			return err
@@ -350,6 +454,7 @@ func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
 	if err != nil {
 		return nil, err
 	}
+	o.spool.keep = false // decrypted: a kept download has done its job
 	o.debugf("verify", "payload sha256=%s… matches the signed manifest", hex.EncodeToString(m.PayloadDigest)[:12])
 	o.debugf("verify", "every chunk authenticated, in order, ending on the last-chunk flag")
 	o.debugf("decrypt", "plaintext=%s", humanBytes(int64(len(plaintext))))
@@ -458,7 +563,9 @@ type WriteResult struct {
 // and an archive's entries), and only then again to write, so a payload
 // that fails a check writes nothing. Names are portable relative paths and
 // every write stays inside dir; existing files are not replaced unless
-// w.Overwrite is set.
+// w.Overwrite is set. When writing fails midway, or the second decryption differs
+// from the first, everything it created is removed, files it overwrote
+// among them; what was there before stays.
 func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, error) {
 	m := o.opened.Manifest
 	if m.PayloadType != "files" {
@@ -469,7 +576,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	// Pass 1: check the payload, writing nothing.
 	tCheck := time.Now()
 	var info *payload.Files
-	if err := o.pass(func(r io.Reader) error {
+	if err := o.pass(DecryptChecking, func(r io.Reader) error {
 		var err error
 		info, err = payload.DecodeFiles(r, decLim, nil)
 		return err
@@ -485,7 +592,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	if info.Archive {
 		// The archive's entries are checked on a pass of their own: a
 		// payload says it is an archive only after its data.
-		if err := o.pass(func(r io.Reader) error {
+		if err := o.pass(DecryptCheckingArchive, func(r io.Reader) error {
 			_, err := payload.DecodeFiles(r, decLim, func(_ int, _ int64, data io.Reader) error {
 				var err error
 				names, total, err = archive.ValidateTarReader(data, archiveAlgo, tarLim)
@@ -522,16 +629,19 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	}
 	o.debugf("verify", "checked %d payload entries in %s", len(names), time.Since(tCheck).Round(time.Millisecond))
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Directories made to hold decrypted files are private. undo records
+	// what the write creates, so a failure removes all of it.
+	var undo archive.Undo
+	if err := undo.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
 
 	// Pass 2: write.
 	result := &WriteResult{Archived: info.Archive}
-	err := o.pass(func(r io.Reader) error {
+	err := o.pass(DecryptWriting, func(r io.Reader) error {
 		out, err := payload.DecodeFiles(r, decLim, func(idx int, size int64, data io.Reader) error {
 			if info.Archive {
-				n, err := archive.ExtractTarReader(data, dir, archiveAlgo, tarLim)
+				n, err := archive.ExtractTarReaderInto(data, dir, archiveAlgo, tarLim, &undo)
 				result.Extracted = n
 				return err
 			}
@@ -540,7 +650,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 			if mode == 0 {
 				mode = 0o600
 			}
-			path, _, err := archive.WriteFile(dir, f.Name, mode, data, size, w.Overwrite)
+			path, _, err := archive.WriteFile(dir, f.Name, mode, data, size, w.Overwrite, &undo)
 			if err != nil {
 				return err
 			}
@@ -562,11 +672,9 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 		return nil
 	})
 	if err != nil {
-		for _, f := range result.Files {
-			os.Remove(f.Path)
-		}
-		return nil, fmt.Errorf("write files: %w", err)
+		return nil, undo.Remove(fmt.Errorf("write files: %w", err))
 	}
+	o.spool.keep = false // decrypted: a kept download has done its job
 	return result, nil
 }
 

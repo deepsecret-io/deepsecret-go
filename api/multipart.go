@@ -6,7 +6,7 @@ package api
 import (
 	"cmp"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- MD5 only as S3 requires it: Content-MD5 and part ETags, transfer checksums, never a security control.
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -204,6 +204,9 @@ type MultipartUploadOptions struct {
 	OnProgress func(int64, int64)
 	// OnDebug is called with structured debug events.
 	OnDebug func(step, message string)
+	// Status, when set, follows the upload part by part for a progress
+	// display.
+	Status *TransferStatus
 }
 
 // uploadPart is one part's range of the source.
@@ -294,8 +297,12 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	if opts.OnProgress != nil {
 		opts.OnProgress(kept, totalSize)
 	}
+	var lim *limiter
 	if len(work) > 0 {
-		lim := newLimiter(ctx, opts.Threads, min(MaxUploadThreads, len(work)), init.PartSize)
+		lim = newLimiter(ctx, opts.Threads, min(MaxUploadThreads, len(work)), init.PartSize)
+	}
+	opts.Status.start(totalSize, count, kept, count-len(work), lim)
+	if len(work) > 0 {
 		debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxUploadThreads, "part"))
 		debugf("plan", "part URLs: %d per request, fetched again %s before they expire or when storage refuses one", partURLBatch, roundDuration(partURLRenewMargin))
 		debugf("plan", "retries: %s", retryPlan())
@@ -329,12 +336,14 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 						return
 					}
 					p := parts[idx]
+					conn := opts.Status.begin(p.Number, p.Size)
 					t0 := time.Now()
 					sum, err := partMD5(src, p)
 					if err == nil {
-						etags[idx], err = c.uploadPart(ctx, urls, lim, p, src, base64.StdEncoding.EncodeToString(sum), progress)
+						etags[idx], err = c.uploadPart(ctx, urls, lim, conn, p, src, base64.StdEncoding.EncodeToString(sum), progress)
 					}
 					lim.release()
+					opts.Status.end(conn, err == nil)
 					if err != nil {
 						cancel(fmt.Errorf("part %d: %w", p.Number, err))
 						return
@@ -439,7 +448,7 @@ func isMD5Hex(s string) bool {
 // partMD5 reads part p of src and returns its MD5. A source shorter than
 // the declared size is an error.
 func partMD5(src io.ReaderAt, p uploadPart) ([]byte, error) {
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- the Content-MD5 S3 checks and the ETag a kept part is matched by; the signed manifest covers the payload's SHA-256.
 	n, err := io.Copy(h, io.NewSectionReader(src, p.Offset, p.Size))
 	if err == nil && n != p.Size {
 		err = io.ErrUnexpectedEOF
@@ -588,25 +597,34 @@ func (c *Client) retryAPI(ctx context.Context, call func() error) error {
 // URL storage refuses (403, usually expired) is presigned again and
 // retried at once; refused again, the upload fails, since a fresh URL
 // being refused is not an expiry. Returns the part's unquoted ETag.
-func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limiter, p uploadPart, src io.ReaderAt, contentMD5 string, onChunk func(int)) (string, error) {
+func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limiter, conn *connRun, p uploadPart, src io.ReaderAt, contentMD5 string, onChunk func(int)) (string, error) {
 	var lastErr error
 	refused := false
 	for attempt := 0; attempt < multipartAttempts; attempt++ {
-		if attempt > 0 && !refused {
-			if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
-				return "", err
+		if attempt > 0 {
+			conn.retry(attempt+1, 0) // a part is sent again whole
+			if !refused {
+				if err := multipartBackoff(ctx, attempt, lastErr); err != nil {
+					return "", err
+				}
 			}
 		}
 		url, err := urls.get(ctx, p.Number)
 		if err != nil {
 			return "", err
 		}
+		if attempt > 0 {
+			conn.resume()
+		}
 		var moved atomic.Int64
+		sent := time.Now()
 		etag, err := c.putPart(ctx, url, io.NewSectionReader(src, p.Offset, p.Size), p.Size, contentMD5, func(n int) {
 			moved.Add(int64(n))
+			conn.add(n)
 			onChunk(n)
 		})
 		if err == nil {
+			lim.partDone(p.Size, time.Since(sent))
 			return etag, nil
 		}
 		// Take back the progress of the failed attempt.
@@ -748,7 +766,7 @@ func (c *Client) putPart(ctx context.Context, presignedURL string, data io.Reade
 		return "", errPresignRefused
 	}
 	if resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorExcerpt))
 		return "", &storageError{status: resp.StatusCode, code: storageErrorCode(msg)}
 	}
 	etag := strings.Trim(resp.Header.Get("ETag"), `"`)

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ type uploadServer struct {
 	fail        map[int]int // part -> PUTs to fail with 503
 	stall       map[int]int // part -> PUTs that hang without reading
 	link        *sharedLink // when set, every PUT body is read through it
+	connRate    float64     // when set, each PUT body is read at this rate on its own, as on a path that limits every connection
 }
 
 // sharedLink paces reads so that all requests together move rate bytes a
@@ -223,6 +225,9 @@ func (u *uploadServer) servePart(w http.ResponseWriter, r *http.Request) {
 	var body io.Reader = r.Body
 	if u.link != nil {
 		body = linkReader{r.Body, u.link}
+	}
+	if u.connRate > 0 {
+		body = linkReader{body, &sharedLink{rate: u.connRate}}
 	}
 	data, err := io.ReadAll(body)
 	if err != nil || int64(len(data)) != r.ContentLength {
@@ -408,13 +413,16 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 	}
 	for key, want := range map[string]string{
 		"upload":    "multipart, 15.00 MiB in 3 part(s) of 5.00 MiB",
-		"threads":   "adaptive: start 1, 3 after 5s if each part finishes within 1m at the measured rate, up to 3 (limit 32, at most one per part)",
+		"threads":   "adaptive: start 1, 3 once the first part finishes (or after 5s) if each part finishes within 1m at the measured rate, up to 3 (limit 32, at most one per part)",
 		"part URLs": "100 per request",
 		"retries":   "8 attempts per request, waits doubling from 2s up to 1m; a request that moves no bytes for 1m30s restarts",
 	} {
 		if !strings.HasPrefix(plans[key], want) {
 			t.Errorf("plan %q: got %q, want it to start with %q", key, plans[key], want)
 		}
+	}
+	if !strings.Contains(plans["threads"], "from one part it tries a second, kept if throughput rises over 10% even where that bound would hold one, else tried again after 5m") {
+		t.Errorf("the threads plan does not say how a held upload tries a second part: %q", plans["threads"])
 	}
 
 	plans = map[string]string{}
@@ -433,11 +441,13 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 // parts' worth of data keeps most of it, and resuming sends only the rest.
 func TestUpload_SlowLinkKeepsFinishedPartsForResume(t *testing.T) {
 	const part = S3MinPartSize
-	win, limit := adaptiveWindow, partTimeLimit
+	win, fast, start, limit := adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit
 	// A part alone takes 500ms on this link; a minute is to the real
 	// link's 32 seconds a part what 800ms is here.
-	adaptiveWindow, partTimeLimit = 100*time.Millisecond, 800*time.Millisecond
-	t.Cleanup(func() { adaptiveWindow, partTimeLimit = win, limit })
+	adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit = 100*time.Millisecond, 40*time.Millisecond, 100*time.Millisecond, 800*time.Millisecond
+	t.Cleanup(func() {
+		adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit = win, fast, start, limit
+	})
 
 	u := newUploadServer(t, 8*part, part)
 	u.link = &sharedLink{rate: 10 << 20}
@@ -475,4 +485,61 @@ func TestUpload_SlowLinkKeepsFinishedPartsForResume(t *testing.T) {
 			t.Fatalf("completed %d parts, want 8", len(u.completed))
 		}
 	})
+}
+
+// Where every connection is limited on its own (16 MiB/s each here), one
+// part measures slow, and the time bound, judged on that one connection,
+// would hold the upload at one part to the end. The second part it tries
+// doubles throughput, so it keeps it and climbs past two.
+func TestUpload_LeavesOnePartWhenEachConnectionIsLimited(t *testing.T) {
+	win, fast, start, limit := adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit
+	adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit = 100*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, 590*time.Millisecond
+	t.Cleanup(func() {
+		adaptiveWindow, adaptiveFastWindow, adaptiveStartWindow, partTimeLimit = win, fast, start, limit
+	})
+
+	const part = S3MinPartSize
+	u := newUploadServer(t, 16*part, part)
+	u.connRate = 16 << 20 // a part alone takes 0.31s, so the bound at one part allows 1.9 of them
+	var mu sync.Mutex
+	var said []string
+	var status TransferStatus
+	most := 0
+	done, sampled := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(5 * time.Millisecond):
+				most = max(most, len(status.Snapshot().Connections))
+			}
+		}
+	}()
+	err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{
+		Status: &status,
+		OnDebug: func(step, msg string) {
+			if step == "threads" {
+				mu.Lock()
+				said = append(said, msg)
+				mu.Unlock()
+			}
+		},
+	})
+	close(done)
+	<-sampled
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Whether the bound held it at one when it tried depends on how fast
+	// the window measured; the tuner's tests pin what each case says.
+	if !slices.ContainsFunc(said, func(s string) bool { return strings.HasPrefix(s, "1 -> 2 ") }) {
+		t.Fatalf("the upload never tried a second part: %q", said)
+	}
+	if most < 3 {
+		t.Fatalf("at most %d parts in flight: %q", most, said)
+	}
 }

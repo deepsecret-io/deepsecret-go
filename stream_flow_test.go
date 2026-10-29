@@ -118,6 +118,14 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	assertFile(t, filepath.Join(out, root, "a.txt"), []byte(strings.Repeat("compress me ", 1000)), 0o640)
 	assertFile(t, filepath.Join(out, root, "sub", "b.bin"), big, 0o600)
 	assertFile(t, filepath.Join(out, root, "empty"), nil, 0o644)
+	// The directories made to hold decrypted files are private.
+	if runtime.GOOS != "windows" {
+		for _, dir := range []string{out, filepath.Join(out, root), filepath.Join(out, root, "sub")} {
+			if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0o700 {
+				t.Fatalf("%s: %v, %v; want a private directory", dir, info, err)
+			}
+		}
+	}
 
 	// Decrypting again into the same directory replaces nothing.
 	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
@@ -189,6 +197,124 @@ func TestStreamMultipartRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
+}
+
+// A send reports its encryption as the file is read, and its upload and
+// the download part by part, each ending with every byte counted. A small
+// send goes in one request, shown as one part.
+func TestSendAndDownloadReportProgress(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	f.multipartAt, f.partSize, f.downloadPartSize = 5<<20, 5<<20, 1<<20
+	src := filepath.Join(t.TempDir(), "backup.bin")
+	data := randomBytes(t, 12<<20)
+	writeFile(t, src, data, 0o600)
+
+	var encDone, encTotal int64
+	backwards := false
+	var upload TransferStatus
+	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{
+		UploadThreads: 3,
+		UploadStatus:  &upload,
+		OnEncryptProgress: func(done, total int64) {
+			backwards = backwards || done < encDone || done > total
+			encDone, encTotal = done, total
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The payload adds its file's header to the data.
+	if backwards || encDone != encTotal || encDone < int64(len(data)) || encDone > int64(len(data))+1024 {
+		t.Fatalf("encryption progress ended at %d of %d (backwards %v)", encDone, encTotal, backwards)
+	}
+	snap := upload.Snapshot()
+	if snap.Total != res.EncryptedSize || snap.Done != snap.Total || snap.Parts != 3 || snap.PartsDone != 3 || len(snap.Connections) != 0 {
+		t.Fatalf("upload %+v", snap)
+	}
+
+	var download TransferStatus
+	passes := passRecorder{}
+	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, t.TempDir(), DecryptOptions{
+		DownloadThreads: 4, DownloadStatus: &download, OnDecryptProgress: passes.record,
+	}, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	passes.check(t, res.EncryptedSize, DecryptChecking, DecryptWriting)
+	// Ranges are 8 MiB below 1 GiB, whatever smaller size the server
+	// suggests: two for 12 MiB.
+	snap = download.Snapshot()
+	if snap.Total != res.EncryptedSize || snap.Done != snap.Total || snap.Parts != 2 || snap.PartsDone != 2 || len(snap.Connections) != 0 {
+		t.Fatalf("download %+v", snap)
+	}
+
+	var small TransferStatus
+	res, err = f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{UploadStatus: &small})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap := small.Snapshot(); snap.Parts != 1 || snap.PartsDone != 1 || snap.Done != res.EncryptedSize || snap.Total != res.EncryptedSize {
+		t.Fatalf("small send %+v", snap)
+	}
+}
+
+// passRecorder follows OnDecryptProgress: the passes in order, and how
+// far each went.
+type passRecorder struct {
+	stages    []DecryptStage
+	ends      []int64
+	backwards bool
+}
+
+func (p *passRecorder) record(stage DecryptStage, done, total int64) {
+	if n := len(p.stages); n == 0 || p.stages[n-1] != stage {
+		p.stages, p.ends = append(p.stages, stage), append(p.ends, 0)
+	}
+	n := len(p.ends) - 1
+	p.backwards = p.backwards || done < p.ends[n] || done > total
+	p.ends[n] = done
+}
+
+// check wants these passes, in order, each through all size bytes.
+func (p *passRecorder) check(t *testing.T, size int64, want ...DecryptStage) {
+	t.Helper()
+	if p.backwards || len(p.stages) != len(want) {
+		t.Fatalf("passes %v ending at %v (backwards %v), want %v", p.stages, p.ends, p.backwards, want)
+	}
+	for i := range want {
+		if p.stages[i] != want[i] || p.ends[i] != size {
+			t.Fatalf("passes %v ending at %v, want %v through %d bytes", p.stages, p.ends, want, size)
+		}
+	}
+}
+
+// Decrypting in memory is one pass, and an archive is checked on a pass
+// of its own before it is written.
+func TestDecryptReportsItsPasses(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice, bob := f.client("alice@example.com"), f.client("bob@example.com")
+
+	res, err := alice.EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	passes := passRecorder{}
+	if _, err := bob.DecryptSecretFull(res.Secret.ID, DecryptOptions{OnDecryptProgress: passes.record}); err != nil {
+		t.Fatal(err)
+	}
+	passes.check(t, res.EncryptedSize, DecryptDecrypting)
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.txt"), []byte("one"), 0o600)
+	writeFile(t, filepath.Join(dir, "b.txt"), []byte("two"), 0o600)
+	res, err = alice.EncryptPaths([]string{"bob@example.com"}, []string{dir}, EncryptOptions{Archive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	passes = passRecorder{}
+	if _, _, err := bob.DecryptToDir(res.Secret.ID, t.TempDir(), DecryptOptions{OnDecryptProgress: passes.record}, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	passes.check(t, res.EncryptedSize, DecryptChecking, DecryptCheckingArchive, DecryptWriting)
 }
 
 // A download that outlives its presigned URL presigns again and finishes.

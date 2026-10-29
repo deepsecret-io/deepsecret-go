@@ -88,7 +88,7 @@ func (m *Manifest) SignableBytes() []byte {
 	writeField(h, m.PayloadDigest)
 	writeField(h, int64Field(m.Timestamp))
 	var count [4]byte
-	binary.BigEndian.PutUint32(count[:], uint32(len(m.Recipients)))
+	binary.BigEndian.PutUint32(count[:], uint32(len(m.Recipients))) // #nosec G115 -- validate and Seal cap the list at MaxRecipients (1000).
 	writeField(h, count[:])
 	for _, r := range m.Recipients {
 		writeField(h, []byte(r.Fingerprint))
@@ -106,7 +106,7 @@ func boolField(b bool) []byte {
 
 func int64Field(v int64) []byte {
 	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], uint64(v))
+	binary.BigEndian.PutUint64(b[:], uint64(v)) // #nosec G115 -- the two's-complement bit pattern of v, as protocol v4 encodes integers: lossless and one-to-one.
 	return b[:]
 }
 

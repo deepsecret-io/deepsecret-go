@@ -49,19 +49,19 @@ type Actor struct {
 //
 // What changed from the pre-Phase-5 SDK:
 //
-//	  - first_name / last_name → single Name field (PERMISSIONS.md §7).
-//	  - is_active dropped (effective_state encodes the same information).
-//	  - memberships []  → membership * (single-org-per-actor).
-//	  - tier limits (max_files_per_secret, max_upload_bytes, policy_ttl,
-//	    policy_ip_lock) are gone from /api/me. The backend enforces them;
-//	    the SDK no longer mirrors them client-side. Callers that want
-//	    tier metadata fetch /api/v1/tiers explicitly.
+//   - first_name / last_name → single Name field (PERMISSIONS.md §7).
+//   - is_active dropped (effective_state encodes the same information).
+//   - memberships []  → membership * (single-org-per-actor).
+//   - tier limits (max_files_per_secret, max_upload_bytes, policy_ttl,
+//     policy_ip_lock) are gone from /api/me. The backend enforces them;
+//     the SDK no longer mirrors them client-side. Callers that want
+//     tier metadata fetch /api/v1/tiers explicitly.
 type ActorInfo struct {
-	Actor          Actor             `json:"actor"`
-	Membership     *Membership       `json:"membership"`
-	EffectiveState string            `json:"effective_state"`
-	Permissions    map[string]bool   `json:"permissions"`
-	Subscription   Subscription      `json:"subscription"`
+	Actor          Actor           `json:"actor"`
+	Membership     *Membership     `json:"membership"`
+	EffectiveState string          `json:"effective_state"`
+	Permissions    map[string]bool `json:"permissions"`
+	Subscription   Subscription    `json:"subscription"`
 
 	// Flat conveniences populated post-parse so existing call sites
 	// (encrypt.go, the CLI, examples) keep reading actor.OrgID etc.

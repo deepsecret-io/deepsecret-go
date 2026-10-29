@@ -26,7 +26,7 @@ func main() {
 		log.Fatal("DS_API_KEY is required")
 	}
 
-	fmt.Printf("DeepSecret SDK v%s: basic example\n\n", sdk.Version)
+	fmt.Print("DeepSecret SDK: basic example\n\n")
 
 	client, err := sdk.NewClient(apiURL, apiKey)
 	if err != nil {

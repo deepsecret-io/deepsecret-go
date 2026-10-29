@@ -69,6 +69,8 @@ type ResumeOptions struct {
 	UploadThreads int
 	// OnUploadProgress is called with bytes transferred and total bytes.
 	OnUploadProgress func(transferred, total int64)
+	// UploadStatus follows the upload, as for EncryptOptions.
+	UploadStatus *TransferStatus
 	// OnDebug receives debug events, as for EncryptOptions.
 	OnDebug func(step, message string)
 }
@@ -86,7 +88,7 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 	if err := checkPrivateDir(opt.ResumeDir); err != nil {
 		return nil, fmt.Errorf("upload folder: %w", err)
 	}
-	pruneAbandoned(opt.ResumeDir)
+	pruneAbandoned(opt.ResumeDir, revisionID)
 	if err := checkFreeSpace(opt.ResumeDir, need, "the encrypted payload", "free some space or use another ResumeDir"); err != nil {
 		return nil, err
 	}
@@ -94,12 +96,13 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create upload folder: %w", err)
 	}
+	// #nosec G304 -- revisionID is a UUID this client generated, in the caller's ResumeDir, which checkPrivateDir accepted.
 	f, err := os.OpenFile(filepath.Join(dir, payloadFile), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir) // dir was just created and is empty; the open error is returned.
 		return nil, fmt.Errorf("create upload file: %w", err)
 	}
-	return &spool{dir: dir, file: f, resumable: true}, nil
+	return &spool{dir: dir, file: f, resume: "upload"}, nil
 }
 
 // abandonedAfter is how long a folder in ResumeDir without an upload
@@ -107,19 +110,28 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 const abandonedAfter = time.Hour
 
 // pruneAbandoned removes folders of sends that died before recording an
-// upload (killed while sealing, or during a single PUT): nothing can
-// resume them. A folder still being written is recent, so it stays.
-func pruneAbandoned(dir string) {
+// upload (killed while sealing, or during a single PUT), and of downloads
+// that died before recording theirs: nothing can resume them. A folder
+// still being written is recent, so it stays. It also removes downloads
+// kept for a week without use (download_resume.go), except the folder
+// named except, which the caller is about to use.
+func pruneAbandoned(dir, except string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if _, err := uuid.Parse(e.Name()); err != nil || !e.IsDir() {
+		if _, err := uuid.Parse(e.Name()); err != nil || !e.IsDir() || e.Name() == except {
 			continue
 		}
 		sub := filepath.Join(dir, e.Name())
 		if _, err := os.Stat(filepath.Join(sub, pendingFile)); err == nil {
+			continue
+		}
+		if record, err := os.Stat(filepath.Join(sub, downloadFile)); err == nil {
+			if time.Since(record.ModTime()) > staleDownloadAfter {
+				removeKeptDownload(sub)
+			}
 			continue
 		}
 		info, err := os.Stat(filepath.Join(sub, payloadFile))
@@ -127,7 +139,7 @@ func pruneAbandoned(dir string) {
 			info, err = os.Stat(sub)
 		}
 		if err == nil && time.Since(info.ModTime()) > abandonedAfter {
-			os.RemoveAll(sub)
+			_ = os.RemoveAll(sub) // best-effort pruning of ciphertext no upload can resume; the next send retries it.
 		}
 	}
 }
@@ -135,7 +147,7 @@ func pruneAbandoned(dir string) {
 // startUpload records a multipart upload about to start, when its spool
 // can resume. The record is what ResumeUpload and ListPendingUploads read.
 func (c *Client) startUpload(sp *spool, secret *secrets.Secret, revisionID string, size int64) (*PendingUpload, error) {
-	if !sp.resumable {
+	if sp.resume != "upload" {
 		return nil, nil
 	}
 	now := time.Now().UTC()
@@ -191,6 +203,7 @@ func writePending(p *PendingUpload) error {
 }
 
 func readPending(dir string) (*PendingUpload, error) {
+	// #nosec G304 -- dir is <ResumeDir>/<UUID>: pendingDir and ListPendingUploads accept only UUID names.
 	data, err := os.ReadFile(filepath.Join(dir, pendingFile))
 	if err != nil {
 		return nil, err
@@ -206,15 +219,18 @@ func readPending(dir string) (*PendingUpload, error) {
 	return &p, nil
 }
 
-// pendingDir returns the folder of revisionID's pending upload in dir.
-func pendingDir(dir, revisionID string) (string, error) {
-	if _, err := uuid.Parse(revisionID); err != nil {
+// pendingDir returns the folder of revisionID's pending upload or kept
+// download in dir, named by the ID's canonical form; what names dir in
+// errors.
+func pendingDir(dir, revisionID, what string) (string, error) {
+	id, err := uuid.Parse(revisionID)
+	if err != nil {
 		return "", fmt.Errorf("invalid revision ID %q", revisionID)
 	}
 	if err := checkPrivateDir(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("upload folder: %w", err)
+		return "", fmt.Errorf("%s: %w", what, err)
 	}
-	return filepath.Join(dir, revisionID), nil
+	return filepath.Join(dir, id.String()), nil
 }
 
 // ListPendingUploads returns the unfinished uploads kept in dir, oldest
@@ -253,7 +269,7 @@ func ListPendingUploads(dir string) ([]PendingUpload, error) {
 // removed. A failure that can resume again returns an
 // UploadInterruptedError.
 func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*PendingUpload, error) {
-	pdir, err := pendingDir(dir, revisionID)
+	pdir, err := pendingDir(dir, revisionID, "upload folder")
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +283,7 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 	if p.APIURL != c.api.BaseURL() {
 		return nil, fmt.Errorf("upload %s was made against %s, not %s", revisionID, p.APIURL, c.api.BaseURL())
 	}
-	f, err := os.Open(filepath.Join(pdir, payloadFile))
+	f, err := os.Open(filepath.Join(pdir, payloadFile)) // #nosec G304 -- pdir is <dir>/<UUID> from pendingDir, which checked both.
 	if err != nil {
 		return nil, fmt.Errorf("open upload file: %w", err)
 	}
@@ -279,6 +295,7 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 		Threads:    opt.UploadThreads,
 		OnProgress: opt.OnUploadProgress,
 		OnDebug:    opt.OnDebug,
+		Status:     opt.UploadStatus,
 	})
 	if err != nil {
 		if !resumable(err) {
@@ -288,7 +305,7 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 		_ = writePending(p)
 		return nil, &UploadInterruptedError{Upload: *p, Err: err}
 	}
-	f.Close()
+	_ = f.Close() // f was only read; it is closed before RemoveAll so Windows can delete it.
 	if err := os.RemoveAll(pdir); err != nil {
 		return p, fmt.Errorf("upload finished, but removing %s failed: %w", pdir, err)
 	}
@@ -299,7 +316,7 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 // server, which frees what it stored, and removes its folder from dir. An
 // upload the server already dropped or finished is removed all the same.
 func (c *Client) DiscardPendingUpload(dir, revisionID string) error {
-	pdir, err := pendingDir(dir, revisionID)
+	pdir, err := pendingDir(dir, revisionID, "upload folder")
 	if err != nil {
 		return err
 	}

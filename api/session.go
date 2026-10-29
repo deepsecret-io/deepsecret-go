@@ -6,14 +6,28 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
-// A session token lasts an hour. The client refreshes it this long before
-// it expires, so a send or receive that runs for hours keeps working.
-const sessionRefreshBefore = 5 * time.Minute
+// A session token lasts an hour, and so does a session left unused.
+// The client renews its token on use once an eighth of the token's
+// lifetime has passed (renewDue), so a session in use lasts until the
+// server's limit, seven days from login. Whatever its age, a token renews
+// sessionRefreshBefore before it expires, so a send or receive that runs
+// for hours keeps working. A client refreshes at most once every
+// sessionRenewGap, so a failing refresh or a wrong clock cannot add a
+// refresh to every request.
+const (
+	sessionRefreshBefore = 5 * time.Minute
+	sessionRenewGap      = time.Minute
+)
+
+// errRefreshedRecently is a renewal skipped because the client asked for
+// a refresh less than sessionRenewGap ago.
+var errRefreshedRecently = errors.New("refresh session: refreshed under a minute ago")
 
 const refreshPath = "/api/v1/auth/refresh"
 
@@ -46,15 +60,15 @@ func (c *Client) credential() string {
 	return c.apiKey
 }
 
-// freshCredential returns the credential for a request, refreshing a
-// session token that expires within sessionRefreshBefore. A failed refresh
-// is left to the request: the server refuses it if the token is no good.
+// freshCredential returns the credential for a request, renewing a
+// session token that is due (renewDue). A failed renewal is left to the
+// request: the server refuses it if the token is no good.
 func (c *Client) freshCredential() string {
 	key := c.credential()
 	if !isBearer(key) {
 		return key
 	}
-	if claims, ok := tokenClaims(strings.TrimPrefix(key, "bearer:")); ok && time.Until(claims.expires()) < sessionRefreshBefore {
+	if claims, ok := tokenClaims(strings.TrimPrefix(key, "bearer:")); ok && claims.renewDue(time.Now()) {
 		_ = c.renewSession(key)
 		return c.credential()
 	}
@@ -73,6 +87,10 @@ func (c *Client) renewSession(stale string) error {
 	if c.adoptStored(stale) {
 		return nil
 	}
+	if time.Since(c.refreshedAt) < sessionRenewGap {
+		return errRefreshedRecently
+	}
+	c.refreshedAt = time.Now()
 	token, err := c.refreshToken(stale)
 	if err != nil {
 		// Another process with the same session may have refreshed first,
@@ -149,11 +167,25 @@ func (c *Client) adoptStored(stale string) bool {
 // jwtClaims are the claims the client reads from its session token. The
 // signature is the server's to check; the client only schedules refreshes.
 type jwtClaims struct {
-	Subject string `json:"sub"`
-	Expiry  int64  `json:"exp"`
+	Subject  string `json:"sub"`
+	IssuedAt int64  `json:"iat"`
+	Expiry   int64  `json:"exp"`
 }
 
 func (j jwtClaims) expires() time.Time { return time.Unix(j.Expiry, 0) }
+
+// renewDue reports whether a request at now should first renew the
+// token: once an eighth of its lifetime has passed (7.5 minutes of a
+// one-hour token), or when it expires within sessionRefreshBefore.
+func (j jwtClaims) renewDue(now time.Time) bool {
+	if j.IssuedAt != 0 && j.Expiry > j.IssuedAt {
+		issued := time.Unix(j.IssuedAt, 0)
+		if now.Sub(issued) >= j.expires().Sub(issued)/8 {
+			return true
+		}
+	}
+	return j.expires().Sub(now) < sessionRefreshBefore
+}
 
 func tokenClaims(token string) (jwtClaims, bool) {
 	parts := strings.Split(token, ".")

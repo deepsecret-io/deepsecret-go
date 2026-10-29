@@ -199,7 +199,7 @@ func TestAbandonedSendFoldersArePruned(t *testing.T) {
 	}
 	past := time.Now().Add(-2 * abandonedAfter)
 	os.Chtimes(filepath.Join(old, "payload"), past, past)
-	pruneAbandoned(dir)
+	pruneAbandoned(dir, "")
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatal("the abandoned folder is still there")
 	}

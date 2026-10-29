@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 DeepSecret
+
+# SDK tasks. `task --list` shows them; run from sdk/.
+version: '3'
+
+vars:
+  # Scanners for `task security`, pinned and checked against the Go
+  # checksum database. Dependabot does not see them; bump them by hand.
+  GOVULNCHECK: golang.org/x/vuln/cmd/govulncheck@v1.9.0
+  GOSEC: github.com/securego/gosec/v2/cmd/gosec@v2.30.0
+  OSV_SCANNER: github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0
+  GITLEAKS: github.com/zricethezav/gitleaks/v8@v8.30.1
+  # Dependency licenses allowed without review. Reviewed exceptions, each
+  # with a reason, live in licenses.toml.
+  LICENSES: Apache-2.0,BSD-2-Clause,BSD-3-Clause,0BSD,MIT,ISC
+  REPORTS: reports
+  # A release version, vMAJOR.MINOR.PATCH (semver.org; see the README's
+  # Versions).
+  SEMVER: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+tasks:
+  release:
+    desc: 'Tag HEAD as VERSION and push the tag, once the checks, tests and security gate pass: task release VERSION=v0.3.0'
+    # A pushed tag is permanent: the Go module mirror and checksum database
+    # keep it even if it is deleted, so nothing is tagged before every
+    # check passes. VERSION reaches the shell as an environment variable,
+    # never as command text.
+    requires:
+      vars: [VERSION]
+    env:
+      VERSION: '{{.VERSION}}'
+    cmds:
+      - task: release-check
+      - go vet ./...
+      - go test -race -count=1 ./...
+      - task: security
+      - git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || git tag -a "$VERSION" -m "SDK $VERSION"
+      - git push origin "refs/tags/$VERSION"
+
+  release-check:
+    internal: true
+    env:
+      VERSION: '{{.VERSION}}'
+    preconditions:
+      - sh: printf '%s' "$VERSION" | grep -Eq '{{.SEMVER}}'
+        msg: 'VERSION must be vMAJOR.MINOR.PATCH, like v0.3.0'
+      - sh: test -z "$(git status --porcelain)"
+        msg: 'the tree has uncommitted or untracked files: a release is a commit'
+      - sh: git fetch --quiet origin main && git merge-base --is-ancestor HEAD origin/main
+        msg: 'HEAD is not on origin/main: push it first'
+      - sh: test -z "$(git ls-remote --tags origin "refs/tags/$VERSION")"
+        msg: 'this version is already published'
+      - sh: '! git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || test "$(git rev-list -n 1 "refs/tags/$VERSION")" = "$(git rev-parse HEAD)"'
+        msg: 'a local tag for this version points at another commit'
+      - sh: |
+          last=$(git tag --list 'v*' | grep -E '{{.SEMVER}}' | grep -vxF "$VERSION" | sort -V | tail -n 1)
+          test -z "$last" || test "$(printf '%s\n%s\n' "$last" "$VERSION" | sort -V | tail -n 1)" = "$VERSION"
+        msg: 'VERSION is not newer than the last release'
+      - sh: |
+          major=$(printf '%s' "$VERSION" | sed -E 's/^v([0-9]+)\..*/\1/')
+          test "$major" -lt 2 || go list -m | grep -q "/v$major\$"
+        msg: 'a v2 or later release needs the module path to end in /vN'
+
+  security:
+    desc: 'Release gate: known vulnerabilities, gosec, disallowed licenses and secrets in git history (reports in reports/)'
+    # The four scans run in parallel; each one finishes and keeps its report
+    # even when another fails, and the task fails if any of them did.
+    deps:
+      - task: scan
+        vars: {NAME: govulncheck, CMD: 'go run {{.GOVULNCHECK}} ./...'}
+      - task: scan
+        vars: {NAME: gosec, CMD: 'go run {{.GOSEC}} -nosec-require-justification -nosec-require-rules ./...'}
+      - task: scan
+        vars: {NAME: licenses, CMD: 'go run {{.OSV_SCANNER}} scan source --config=licenses.toml --licenses={{.LICENSES}} .'}
+      - task: scan
+        vars: {NAME: gitleaks, CMD: 'go run {{.GITLEAKS}} git --no-banner --no-color --redact --verbose --log-opts=--all .'}
+
+  scan:
+    internal: true
+    # Runs CMD into REPORTS/NAME.txt and prints the report only on failure.
+    cmds:
+      - mkdir -p {{.REPORTS}}
+      - '{{.CMD}} > {{.REPORTS}}/{{.NAME}}.txt 2>&1 || { cat {{.REPORTS}}/{{.NAME}}.txt; echo "{{.NAME}}: FAILED, report in {{.REPORTS}}/{{.NAME}}.txt"; exit 1; }'
+      - 'echo "{{.NAME}}: passed"'

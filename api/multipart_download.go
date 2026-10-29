@@ -4,11 +4,13 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -73,11 +75,62 @@ type MultipartDownloadOptions struct {
 	// OnDebug is called with structured debug events. Optional.
 	OnDebug func(step, message string)
 
+	// Status, when set, follows the download range by range for a
+	// progress display.
+	Status *TransferStatus
+
 	// PresignExpiryMinutes requests presigned URL lifetime in minutes.
 	// Allowed range is 1-30 (server clamps at 30). 0 = default
 	// (DefaultPresignExpiryMinutes, currently 30). A download that outlives
 	// it presigns again.
 	PresignExpiryMinutes int
+
+	// Have lists the byte ranges dst already holds from an earlier
+	// download of the same object, as [from, to) offsets: only the rest is
+	// fetched. The caller checks the whole object against its digest, as
+	// after any download.
+	Have [][2]int64
+
+	// OnRange is called once a range is written to dst, with its [from,
+	// to) offsets, one call at a time.
+	OnRange func(from, to int64)
+}
+
+// MergeRanges sorts byte ranges, given as [from, to) offsets, and merges
+// those that overlap or touch. It refuses a range that is empty or lies
+// outside an object of size bytes. The result is a new slice.
+func MergeRanges(ranges [][2]int64, size int64) ([][2]int64, error) {
+	sorted := slices.Clone(ranges)
+	slices.SortFunc(sorted, func(a, b [2]int64) int { return cmp.Compare(a[0], b[0]) })
+	var out [][2]int64
+	for _, r := range sorted {
+		if r[0] < 0 || r[0] >= r[1] || r[1] > size {
+			return nil, fmt.Errorf("byte range [%d, %d) is not within %d bytes", r[0], r[1], size)
+		}
+		if n := len(out); n > 0 && r[0] <= out[n-1][1] {
+			out[n-1][1] = max(out[n-1][1], r[1])
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// missingRanges is what [0, size) holds beyond have, which MergeRanges
+// sorted and merged.
+func missingRanges(have [][2]int64, size int64) [][2]int64 {
+	var out [][2]int64
+	from := int64(0)
+	for _, r := range have {
+		if r[0] > from {
+			out = append(out, [2]int64{from, r[0]})
+		}
+		from = r[1]
+	}
+	if from < size {
+		out = append(out, [2]int64{from, size})
+	}
+	return out
 }
 
 // errPresignRefused is a Range GET answered with 403: the presigned URL
@@ -92,15 +145,26 @@ var errPresignRefused = errors.New("presigned URL refused (403)")
 //
 // One presigned URL serves every range. It is presigned again when a range
 // is refused with 403, or when it is close to expiring, so a download can
-// run longer than the URL's lifetime.
+// run longer than the URL's lifetime. It is presigned even when dst holds
+// every range already (opts.Have): the server applies the secret's
+// policies there and records the download.
 //
 // Security: dst holds ciphertext that the caller checks against the signed
 // manifest's digest before any plaintext is released, so Range stitching
-// does not bypass integrity. Range responses are size-bounded, so a
-// compromised S3 cannot over-read into adjacent objects' data.
+// does not bypass integrity, and neither do ranges kept from an earlier
+// download. Range responses are size-bounded, so a compromised S3 cannot
+// over-read into adjacent objects' data.
 func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, opts MultipartDownloadOptions) error {
 	if size <= 0 {
 		return fmt.Errorf("download: invalid size %d", size)
+	}
+	have, err := MergeRanges(opts.Have, size)
+	if err != nil {
+		return fmt.Errorf("download: held %w", err)
+	}
+	var held int64
+	for _, r := range have {
+		held += r[1] - r[0]
 	}
 	debugf := func(step, format string, args ...any) {
 		if opts.OnDebug == nil {
@@ -124,35 +188,49 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	}
 	partSize = min(max(partSize, minDownloadChunkSize), maxDownloadPartSize, size)
 
-	type span struct {
-		idx        int
-		start, end int64 // [start, end] inclusive (HTTP Range semantics)
+	var spans [][2]int64 // [from, to)
+	for _, gap := range missingRanges(have, size) {
+		for from := gap[0]; from < gap[1]; from += partSize {
+			spans = append(spans, [2]int64{from, min(from+partSize, gap[1])})
+		}
 	}
-	var spans []span
-	for start, idx := int64(0), 0; start < size; idx++ {
-		end := min(start+partSize, size) - 1
-		spans = append(spans, span{idx: idx, start: start, end: end})
-		start = end + 1
+
+	rule := PieceSizeRule
+	if opts.PartSize > 0 {
+		rule = "requested"
+	}
+	if held > 0 {
+		debugf("plan", "resume: %s of %s already downloaded, %s left", humanBytesLocal(held), humanBytesLocal(size), humanBytesLocal(size-held))
+	}
+	if len(spans) == 0 {
+		opts.Status.start(size, 0, size, 0, nil)
+		if opts.OnProgress != nil {
+			opts.OnProgress(size, size)
+		}
+		debugf("done", "nothing left to fetch")
+		return nil
 	}
 
 	ctx, cancel := context.WithCancelCause(c.reqCtx())
 	defer cancel(nil)
 	lim := newLimiter(ctx, opts.Threads, min(MaxDownloadConcurrency, len(spans)), 0)
-	rule := PieceSizeRule
-	if opts.PartSize > 0 {
-		rule = "requested"
-	}
-	debugf("plan", "download: %s in %d range(s) of %s (%s)", humanBytesLocal(size), len(spans), humanBytesLocal(partSize), rule)
+	debugf("plan", "download: %s in %d range(s) of %s (%s)", humanBytesLocal(size-held), len(spans), humanBytesLocal(partSize), rule)
 	debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxDownloadConcurrency, "range"))
 	debugf("plan", "URL: one presigned URL for every range, valid %dm, presigned again %s before it expires or when storage refuses it",
 		urls.expiry, roundDuration(urls.renewMargin()))
 	debugf("plan", "retries: %s", retryPlan())
+	sched := newRangeScheduler(spans, opts.Status, minSplit)
+	debugf("plan", "tail: once every range has started, an idle connection takes the second half of what the range in flight with the most left has not fetched, while each half is at least %s", humanBytesLocal(sched.minSplit))
 	go lim.tune(ctx, func(from, to int, rate float64, reason string) {
 		debugf("threads", "%s", threadsChange(from, to, rate, reason))
 	})
+	opts.Status.start(size, len(spans), held, 0, lim)
 
 	var transferred atomic.Int64
-	var next atomic.Int64
+	transferred.Store(held)
+	if held > 0 && opts.OnProgress != nil {
+		opts.OnProgress(held, size)
+	}
 	var progressMu sync.Mutex
 	var wg sync.WaitGroup
 	for range lim.max {
@@ -163,23 +241,29 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 				if lim.acquire(ctx) != nil {
 					return
 				}
-				k := int(next.Add(1)) - 1
-				if k >= len(spans) {
+				p := sched.take(debugf)
+				if p == nil {
 					lim.release()
 					return
 				}
-				s := spans[k]
-				err := c.downloadRange(ctx, urls, lim, s.start, s.end, dst, debugf, s.idx)
+				err := c.downloadPiece(ctx, urls, lim, p, dst, debugf)
 				lim.release()
+				sched.done(p)
+				opts.Status.end(p.conn, err == nil)
 				if err != nil {
 					cancel(err)
 					return
 				}
-				if opts.OnProgress != nil {
-					progressMu.Lock()
-					opts.OnProgress(transferred.Add(s.end-s.start+1), size)
-					progressMu.Unlock()
+				from, to := p.extent()
+				progressMu.Lock()
+				done := transferred.Add(to - from)
+				if opts.OnRange != nil {
+					opts.OnRange(from, to)
 				}
+				if opts.OnProgress != nil {
+					opts.OnProgress(done, size)
+				}
+				progressMu.Unlock()
 			}
 		}()
 	}
@@ -187,7 +271,7 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	debugf("done", "got=%d bytes", size)
+	debugf("done", "got=%d bytes", size-held)
 	return nil
 }
 
@@ -241,19 +325,176 @@ func (p *presignedDownload) renewMargin() time.Duration {
 	return min(2*time.Minute, time.Duration(p.expiry)*time.Minute/4)
 }
 
-// downloadRange fetches one byte range into dst at its offset, retrying on
-// transient errors and presigning again when the URL is refused. A retry
-// overwrites what a failed attempt wrote.
-func (c *Client) downloadRange(ctx context.Context, urls *presignedDownload, lim *limiter, start, end int64, dst io.WriterAt, debugf func(step, format string, args ...any), partIdx int) error {
-	expected := end - start + 1
+// ── Tail splitting ──────────────────────────────────────────────────────────
+//
+// Ranges go out in order. Once every range has started, a connection that
+// finishes has nothing left to fetch, and the download waits on the last
+// few ranges, however slow their connections. So a connection with
+// nothing to do takes the second half of what the range in flight with
+// the most left has not fetched yet: that range's end moves down, its
+// connection stops there, and the half becomes a range of its own. Halves
+// are at least minSplit bytes, so a split is worth its request.
 
+// minSplit is the smallest half a split leaves on either connection;
+// tests shorten it.
+var minSplit int64 = 4 << 20
+
+// piece is a byte range one connection fetches: one of the download's
+// ranges, or a half split off one. Its end moves down when another
+// connection takes the rest.
+type piece struct {
+	n     int   // its number in the status and debug, from 1
+	start int64 // its first byte
+	conn  *connRun
+
+	mu   sync.Mutex
+	next int64 // the first byte not yet written, or claimed by the write in progress
+	end  int64 // one past its last byte
+}
+
+// claim takes up to n bytes of p, from its first byte not yet written, for
+// the write about to happen. It returns where they start and how many it
+// took: fewer than n once p's end is reached.
+func (p *piece) claim(n int) (int64, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	at := p.next
+	k := int(min(int64(n), p.end-at))
+	p.next += int64(k)
+	return at, k
+}
+
+// rest is what p has left to fetch, as [from, to).
+func (p *piece) rest() (int64, int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.next, p.end
+}
+
+// extent is all of p, as [from, to), with its end as it stands.
+func (p *piece) extent() (int64, int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.start, p.end
+}
+
+// written is how many of p's bytes are written, or claimed by the write in
+// progress.
+func (p *piece) written() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.next - p.start
+}
+
+// left is how many of p's bytes are not claimed yet.
+func (p *piece) left() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.end - p.next
+}
+
+// split moves p's end down to the middle of what it has not claimed, when
+// each half is at least minSize, and returns the second half as [from, to).
+// A write already claimed stays below the middle, so the two connections
+// never write the same byte.
+func (p *piece) split(minSize int64) (from, to int64, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Halved rather than minSize doubled, which overflows for a huge
+	// minSize; and never below a byte, so no half is empty.
+	half := (p.end - p.next) / 2
+	if half < max(minSize, 1) {
+		return 0, 0, false
+	}
+	mid := p.next + half
+	from, to, p.end = mid, p.end, mid
+	p.conn.shrink(mid - p.start)
+	return from, to, true
+}
+
+// rangeScheduler hands out a download's ranges in order, then, once none is
+// left, halves of the ranges in flight.
+type rangeScheduler struct {
+	spans    [][2]int64 // [from, to)
+	status   *TransferStatus
+	minSplit int64
+
+	mu       sync.Mutex
+	next     int // the next span to hand out
+	numbered int // the pieces handed out so far
+	inFlight map[*piece]struct{}
+}
+
+func newRangeScheduler(spans [][2]int64, status *TransferStatus, minSplit int64) *rangeScheduler {
+	return &rangeScheduler{spans: spans, status: status, minSplit: minSplit, inFlight: map[*piece]struct{}{}}
+}
+
+// take returns the next range, or once every range has started, the second
+// half of the range in flight with the most left to fetch. It returns nil
+// when nothing is worth taking: what is in flight only shrinks, so nothing
+// will be later either.
+func (s *rangeScheduler) take(debugf func(step, format string, args ...any)) *piece {
+	p, victim, size := s.pick()
+	if victim != nil {
+		debugf("split", "part %d gave the last %s of what it had left to part %d", victim.n, humanBytesLocal(size), p.n)
+	}
+	return p
+}
+
+// pick is take without its debug line, which waits until the lock is
+// released. For a split it also returns the piece the half came from, and
+// the half's size.
+func (s *rangeScheduler) pick() (*piece, *piece, int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var from, to int64
+	var victim *piece
+	if s.next < len(s.spans) {
+		from, to = s.spans[s.next][0], s.spans[s.next][1]
+		s.next++
+	} else {
+		var most int64
+		for p := range s.inFlight {
+			if left := p.left(); left > most {
+				victim, most = p, left
+			}
+		}
+		if victim == nil {
+			return nil, nil, 0
+		}
+		var ok bool
+		if from, to, ok = victim.split(s.minSplit); !ok {
+			return nil, nil, 0
+		}
+		s.status.addPart()
+	}
+	s.numbered++
+	p := &piece{n: s.numbered, start: from, next: from, end: to}
+	p.conn = s.status.begin(p.n, to-from)
+	s.inFlight[p] = struct{}{}
+	return p, victim, to - from
+}
+
+// done takes p out of the pieces that can be split.
+func (s *rangeScheduler) done(p *piece) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, p)
+}
+
+// downloadPiece fetches p into dst, retrying transient failures from the
+// first byte not yet written and presigning again when the URL is
+// refused. It stops at p's end as it stands, which a split can move down.
+func (c *Client) downloadPiece(ctx context.Context, urls *presignedDownload, lim *limiter, p *piece, dst io.WriterAt, debugf func(step, format string, args ...any)) error {
 	var lastErr error
 	renewed := false
+	t0 := time.Now()
 	for attempt := 0; attempt < multipartAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if attempt > 0 {
+			p.conn.retry(attempt+1, p.written())
 			// A freshly presigned URL is retried at once; anything else
 			// backs off first.
 			if !renewed {
@@ -261,20 +502,27 @@ func (c *Client) downloadRange(ctx context.Context, urls *presignedDownload, lim
 					return err
 				}
 			}
-			debugf("retry", "part=%d attempt=%d range=%d-%d err=%v", partIdx, attempt, start, end, lastErr)
+			from, to := p.rest()
+			debugf("retry", "part=%d attempt=%d range=%d-%d err=%v", p.n, attempt, from, to-1, lastErr)
 		}
 		renewed = false
+		from, to := p.rest()
+		if from >= to {
+			break
+		}
 		url, err := urls.current()
 		if err != nil {
 			return err
 		}
-		t0 := time.Now()
-		if err := c.doRangeGET(ctx, url, start, end, dst, lim.add); err != nil {
+		if attempt > 0 {
+			p.conn.resume()
+		}
+		if err := c.doRangeGET(ctx, url, p, from, to, dst, lim.add); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if errors.Is(err, errPresignRefused) {
-				debugf("presign", "range %d-%d refused, presigning again", start, end)
+				debugf("presign", "range %d-%d refused, presigning again", from, to-1)
 				if _, rerr := urls.renew(url); rerr != nil {
 					return rerr
 				}
@@ -287,27 +535,33 @@ func (c *Client) downloadRange(ctx context.Context, urls *presignedDownload, lim
 			lastErr = err
 			continue
 		}
-		debugf("range", "part %d range=%d-%d size=%s in %s", partIdx+1, start, end, humanBytesLocal(expected), time.Since(t0).Round(time.Millisecond))
+		start, end := p.extent()
+		debugf("range", "part %d range=%d-%d size=%s in %s", p.n, start, end-1, humanBytesLocal(end-start), time.Since(t0).Round(time.Millisecond))
 		return nil
 	}
-	return fmt.Errorf("range %d-%d after %d attempts: %w", start, end, multipartAttempts, lastErr)
+	if from, to := p.rest(); from >= to {
+		return nil
+	}
+	start, end := p.extent()
+	return fmt.Errorf("range %d-%d after %d attempts: %w", start, end-1, multipartAttempts, lastErr)
 }
 
-// doRangeGET performs a single Range request and streams the bytes into
-// dst at start, so memory does not grow with the range size. It writes
-// exactly end-start+1 bytes or returns an error. We use a fresh request per
-// attempt so retries don't see stale connection state. onBytes sees the
-// bytes as they arrive. A range that moves no bytes for stallTimeout is
-// cancelled; a slow one that keeps moving is not.
-func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end int64, dst io.WriterAt, onBytes func(int)) error {
-	expected := end - start + 1
+// doRangeGET requests [from, to) of the object and streams it into dst
+// through p, so memory does not grow with the range size: it writes what
+// arrives up to p's end as it stands, and returns nil once p is written.
+// A fresh request per attempt keeps retries clear of stale connection
+// state. onBytes sees the bytes as they arrive. A range that moves no
+// bytes for stallTimeout is cancelled; a slow one that keeps moving is
+// not.
+func (c *Client) doRangeGET(ctx context.Context, presignedURL string, p *piece, from, to int64, dst io.WriterAt, onBytes func(int)) error {
+	expected := to - from
 	guard := newStallGuard(ctx)
 	defer guard.stop()
 	req, err := http.NewRequestWithContext(guard.ctx, "GET", presignedURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, to-1))
 
 	resp, err := c.doPresigned(req)
 	if err != nil {
@@ -328,7 +582,7 @@ func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end
 	case http.StatusForbidden:
 		return errPresignRefused
 	default:
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorExcerpt))
 		if resp.StatusCode >= 500 {
 			return errors.New(storageFailure("Range GET transient", resp.StatusCode, body))
 		}
@@ -347,32 +601,51 @@ func (c *Client) doRangeGET(ctx context.Context, presignedURL string, start, end
 		guard.moved()
 		onBytes(n)
 	}}
-	out := &writeTracker{w: io.NewOffsetWriter(dst, start)}
-	n, err := io.CopyN(out, body, expected)
+	out := &pieceWriter{p: p, dst: dst}
+	n, err := io.Copy(out, body)
 	switch {
 	case out.err != nil:
 		return &writeError{err: out.err}
+	case errors.Is(err, errPieceDone):
+		return nil // p's end moved down, and it is written
 	case err != nil && guard.stalled():
 		return fmt.Errorf("Range GET body: %w", errStalled)
 	case err != nil:
 		return fmt.Errorf("Range GET body (%d of %d bytes): %w", n, expected, err)
 	}
+	if next, end := p.rest(); next < end {
+		return fmt.Errorf("short Range GET body: %d of %d bytes", n, expected)
+	}
 	return nil
 }
 
-// writeTracker remembers a failed write, so a full disk is told apart from
-// a dropped connection.
-type writeTracker struct {
-	w   io.Writer
+// errPieceDone stops a range's copy at its end, which a split may have
+// moved down while the response was arriving.
+var errPieceDone = errors.New("range written")
+
+// pieceWriter writes what a range's response brings into dst at its
+// offsets, up to the piece's end as it stands at each write. It remembers
+// a failed write, so a full disk is told apart from a dropped connection.
+type pieceWriter struct {
+	p   *piece
+	dst io.WriterAt
 	err error
 }
 
-func (t *writeTracker) Write(p []byte) (int, error) {
-	n, err := t.w.Write(p)
-	if err != nil {
-		t.err = err
+func (w *pieceWriter) Write(b []byte) (int, error) {
+	at, n := w.p.claim(len(b))
+	if n > 0 {
+		m, err := w.dst.WriteAt(b[:n], at)
+		w.p.conn.add(m)
+		if err != nil {
+			w.err = err
+			return m, err
+		}
 	}
-	return n, err
+	if n < len(b) {
+		return n, errPieceDone
+	}
+	return n, nil
 }
 
 // writeError is a range that arrived but could not be written: not worth

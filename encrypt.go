@@ -442,7 +442,7 @@ func filesPlaintext(srcs []payload.FileSource) *plaintext {
 // read.
 func fileSource(name, path string, info os.FileInfo) payload.FileSource {
 	return payload.FileSource{Name: name, Size: info.Size(), Mode: info.Mode(),
-		Open: func() (io.ReadCloser, error) { return os.Open(path) }}
+		Open: func() (io.ReadCloser, error) { return os.Open(path) }} // #nosec G304 -- a file the caller chose to send.
 }
 
 func maxPayloadSize(opt EncryptOptions) int64 {
@@ -494,20 +494,24 @@ func (s *sampleWriter) Write(p []byte) (int, error) {
 
 // countingWriter counts what passes through it.
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w  io.Writer
+	n  int64
+	on func(n int64) // optional: the count after each write
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	if c.on != nil {
+		c.on(c.n)
+	}
 	return n, err
 }
 
 // sealPlaintext writes p, compressed with algo unless it is None, through
 // crypto.Seal into dst. It returns the sealed manifest and wraps, and how
 // many bytes p wrote before compression. It stops when ctx is done.
-func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compress.Algorithm, sender *crypto.KeyPair, pubs []*crypto.PublicKeys, params crypto.SealParams) (*crypto.Sealed, int64, error) {
+func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compress.Algorithm, sender *crypto.KeyPair, pubs []*crypto.PublicKeys, params crypto.SealParams, onProgress func(done, total int64)) (*crypto.Sealed, int64, error) {
 	pr, pw := io.Pipe()
 	var written int64
 	done := make(chan error, 1)
@@ -522,11 +526,18 @@ func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compre
 				zw = w
 			}
 			cw := &countingWriter{w: zw}
+			if onProgress != nil {
+				cw.on = func(n int64) { onProgress(n, max(p.size, n)) }
+			}
 			if err := p.write(cw); err != nil {
-				zw.Close()
+				_ = zw.Close() // the write already failed and its error is returned; the sealed output is discarded.
 				return err
 			}
 			written = cw.n
+			if onProgress != nil {
+				// p.size may be an estimate: the end is what was written.
+				onProgress(written, written)
+			}
 			return zw.Close()
 		}()
 		pw.CloseWithError(err)
@@ -536,7 +547,7 @@ func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compre
 	bw := bufio.NewWriterSize(dst, 1<<20)
 	sealed, sealErr := crypto.Seal(bw, ctxReader{ctx, pr}, sender, pubs, params)
 	// Unblocks the writer when Seal stopped early.
-	pr.Close()
+	_ = pr.Close() // io.PipeReader.Close always returns nil.
 	writeErr := <-done
 	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
 		return nil, 0, writeErr
@@ -689,7 +700,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		PayloadType: p.payloadType,
 		Compressed:  algo != compress.None,
 		Compression: string(algo),
-	})
+	}, opt.OnEncryptProgress)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
@@ -827,6 +838,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 			Threads:    opt.UploadThreads,
 			OnProgress: opt.OnUploadProgress,
 			OnDebug:    opt.OnDebug,
+			Status:     opt.UploadStatus,
 		}); err != nil {
 			return nil, uploadFailed(sp, pending, err)
 		}
@@ -837,7 +849,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	} else {
 		debugf("plan", "upload: %s", api.SinglePutPlan(size, opt.PresignExpiryMinutes))
 		tUp := time.Now()
-		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes); err != nil {
+		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus); err != nil {
 			return nil, fmt.Errorf("upload: %w", err)
 		}
 		upElapsed := time.Since(tUp)

@@ -175,8 +175,8 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	renamed := false
 	defer func() {
 		if !renamed {
-			f.Close()
-			os.Remove(f.Name())
+			_ = f.Close()           // the send already failed, and its error is returned.
+			_ = os.Remove(f.Name()) // a 0600 temporary file of ciphertext; the send's error is returned.
 		}
 	}()
 	head := append(append([]byte{}, localMagicItem...), 0x5b, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -189,7 +189,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		PayloadType: p.payloadType,
 		Compressed:  algo != compress.None,
 		Compression: string(algo),
-	})
+	}, opt.OnEncryptProgress)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
@@ -198,7 +198,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	debugf("encrypt", "elapsed=%s", time.Since(tEnc).Round(time.Millisecond))
 
 	var length [8]byte
-	binary.BigEndian.PutUint64(length[:], uint64(m.CiphertextSize))
+	binary.BigEndian.PutUint64(length[:], uint64(m.CiphertextSize)) // #nosec G115 -- the byte count the seal just wrote, never negative.
 	if _, err := f.WriteAt(length[:], int64(len(localMagicItem))+1); err != nil {
 		return nil, fmt.Errorf("write %s: %w", out, err)
 	}
@@ -270,7 +270,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		}
 		opt.OnDebug(step, fmt.Sprintf(format, args...))
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the local file the caller asked to open; its contents are checked as untrusted.
 	if err != nil {
 		return nil, err
 	}
@@ -356,13 +356,13 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		return nil, err
 	}
 	debugf("plan", "local file: the %s payload is copied before it is checked, so the file cannot change under the checks, to %s", humanBytes(payloadSize), sp.plan(m.CiphertextSize))
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf}
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress}
 	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
 	if opt.OnDownloadProgress != nil {
 		src = &copyProgress{r: src, total: payloadSize, onProgress: opt.OnDownloadProgress}
 	}
 	if n, err := io.Copy(sp, ctxReader{o.ctx, src}); err != nil || n != payloadSize {
-		o.Close()
+		_ = o.Close() // the read error is returned; the spool holds ciphertext only, in a private (0700) directory.
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
@@ -409,7 +409,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 // which of its keys to open the file with, and OpenLocalFile checks the
 // file.
 func LocalFileRecipients(path string) ([]Recipient, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the local file the caller names; its header is parsed as untrusted.
 	if err != nil {
 		return nil, err
 	}
@@ -444,10 +444,10 @@ func readLocalHeader(r io.ReaderAt, size int64) (*localHeader, int64, error) {
 		return nil, 0, notLocal
 	}
 	n := binary.BigEndian.Uint64(prefix[len(localMagicItem)+1:])
-	if n > uint64(size-localPrefixLen) {
+	if n > uint64(size-localPrefixLen) { // #nosec G115 -- size >= localPrefixLen was checked above.
 		return nil, 0, errors.New("the file is truncated")
 	}
-	payloadSize := int64(n)
+	payloadSize := int64(n) // #nosec G115 -- n is at most size-localPrefixLen, an int64.
 	headerSize := size - localPrefixLen - payloadSize
 	if headerSize <= 0 || headerSize > maxLocalHeader {
 		return nil, 0, errors.New("malformed local file: missing or oversized header")

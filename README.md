@@ -2,7 +2,7 @@
 
 End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 
-**Version:** 0.3.0
+**Versions:** [semantic](#versions), one git tag per release
 **Protocol:** v4: one payload per revision (AES-256-GCM, 1 MiB chunks), a content-key wrap per recipient (HPKE X25519-ML-KEM-768 + HKDF-SHA256 + AES-256-GCM), and a manifest signed with Ed25519 + ML-DSA-65. See [PROTOCOL_V4.md](PROTOCOL_V4.md).
 **Payload:** CBOR (RFC 8949, canonical encoding)
 **Compression:** Zstandard only
@@ -105,24 +105,57 @@ network, so memory does not grow with part size or threads.
 
 - **Threads adapt.** A transfer doubles its connections while throughput
   rises by more than 10%, steps back when it does not, and halves them when
-  requests fail or are throttled. A download starts with 4. An upload starts
-  with one part and never runs more parts than finish within a minute at
-  the measured rate: storage keeps only finished parts, so on a slow link
-  they go one after another and an interrupted upload keeps nearly all it
-  sent. On a fast link it takes 4 after five seconds and climbs as a download
-  does. `UploadThreads` and `DownloadThreads` fix the number instead.
+  requests fail or are throttled. It measures every 2 seconds from 4 MB/s
+  and every 5 seconds below, where a short window measures noise. A download
+  starts with 4. An upload starts with one part and never runs more parts
+  than finish within a minute at the measured rate: storage keeps only
+  finished parts, so on a slow link they go one after another and an
+  interrupted upload keeps nearly all it sent. On a fast link it takes 4 as
+  soon as its first part finishes and climbs as a download does. Where one
+  connection cannot fill the link (high latency to storage, some VPNs,
+  per-connection shaping), one part measures slow and that bound would
+  hold the upload at one, so from one part an upload tries a second: it
+  keeps it when throughput rises by more than 10%, and otherwise goes back
+  to one and tries again five minutes later. `OnDebug` events with step
+  `threads` say each change and why a count holds. `UploadThreads` and
+  `DownloadThreads` fix the number instead.
+- **Connections.** Each part runs on its own HTTP/1.1 connection, so
+  parallel parts are parallel TCP streams, and a finished part's connection
+  carries the next part instead of a new TLS handshake.
+- **Tail.** Once every range of a download has started, a connection with
+  nothing left to fetch takes the second half of what the range in flight
+  with the most left has not fetched yet, while each half is at least 4
+  MiB. The end of a download is shared by every connection instead of
+  waiting on the last few, however slow they are.
 - **Retries.** Each part is tried 8 times with backoff up to a minute; a
-  part that moves no bytes for 90 seconds is cancelled and retried. Part
-  URLs come 100 per API call and are presigned again when storage refuses
-  them.
+  part that moves no bytes for 90 seconds is cancelled and retried. A
+  download range is retried from the first byte it lacks, an upload part
+  whole. Part URLs come 100 per API call and are presigned again when
+  storage refuses them.
 - **Resume.** With `EncryptOptions.ResumeDir` set, a large send keeps its
   ciphertext in `<ResumeDir>/<revision id>/` until the upload finishes. A
   failed or cancelled upload returns an `*UploadInterruptedError`;
   `ResumeUpload` finishes it later, keeping the parts storage holds.
   `ListPendingUploads` and `DiscardPendingUpload` manage them.
+- **Download resume.** With `DecryptOptions.ResumeDir` set, a large
+  download keeps its ciphertext in `<ResumeDir>/<revision id>/`, with a
+  record of the byte ranges it holds that is written only after they are
+  synced to disk. A failed or cancelled download returns a
+  `*DownloadInterruptedError`, and the next decrypt of that revision
+  fetches only the missing ranges. Kept bytes get no more trust than fresh
+  ones: the decrypt verifies the signed manifest first, still asks the
+  server for the download URL (where the secret's policies apply and the
+  download is recorded), and checks the whole ciphertext against the
+  signed digest before releasing any plaintext. The folder stays until the
+  payload is decrypted, and goes after a week unused.
+  `ListPendingDownloads` and `DiscardPendingDownload` manage them.
 - **Sessions.** A client authenticated with a `bearer:` session token
-  refreshes it before its one hour expiry. The server revokes the old
-  token, so set a `SessionStore` to save each new one.
+  renews it while in use: once an eighth of its lifetime has passed, and
+  shortly before it expires whatever its age. A session in use lasts until
+  the server's limit, seven days from login, and one left unused ends with
+  its token, after an hour.
+  The server revokes the old token, so set a `SessionStore` to save each
+  new one.
 
 ```go
 client.SetSessionStore(sdk.SessionStore{Load: loadToken, Save: saveToken})
@@ -131,6 +164,12 @@ _, err := client.EncryptFile(to, "backup.tar", sdk.EncryptOptions{ResumeDir: dir
 var interrupted *sdk.UploadInterruptedError
 if errors.As(err, &interrupted) {
     _, err = client.ResumeUpload(dir, interrupted.Upload.RevisionID, sdk.ResumeOptions{})
+}
+
+_, _, err = client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{ResumeDir: downloads}, sdk.WriteOptions{})
+var stopped *sdk.DownloadInterruptedError
+if errors.As(err, &stopped) {
+    // The same call later fetches only what stopped.Download lacks.
 }
 ```
 
@@ -207,6 +246,33 @@ Sender                                           Recipients
 ```bash
 go test ./... -v
 ```
+
+## Versions
+
+Releases follow [semantic versioning](https://semver.org). A release is an
+annotated `vMAJOR.MINOR.PATCH` git tag, which is how Go finds module
+versions:
+
+```bash
+go get github.com/deepsecret-io/sdk@v0.3.0
+```
+
+While the major version is 0 the API can still change: a breaking change
+bumps the minor version, anything else the patch version. From v1.0.0 a
+breaking change bumps the major version, and from v2 the module path ends
+in it (`github.com/deepsecret-io/sdk/v2`).
+
+To release, from a clean, pushed `main`:
+
+```bash
+task release VERSION=v0.3.1
+```
+
+It refuses a version that is not vMAJOR.MINOR.PATCH or not newer than the
+last release, a tree with uncommitted or untracked files, a commit that is
+not on `origin/main`, and a version already published. Then it runs vet,
+the tests and `task security`, tags the commit and pushes the tag. A pushed
+tag is permanent: the Go module mirror keeps it even if it is deleted.
 
 ## Cross-Language Porting
 

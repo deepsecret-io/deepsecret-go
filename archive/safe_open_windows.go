@@ -10,19 +10,14 @@ import (
 	"os"
 )
 
-// safeOpenForWrite opens target with O_CREATE|O_WRONLY plus either O_EXCL
-// (default) or O_TRUNC (allowOverwrite) on Windows. Windows has no
-// O_NOFOLLOW; reparse-point hardening would require GetFileAttributes-style
-// inspection that we do not implement. Operators who need the strongest
-// guarantees should run extraction on a Unix host.
-func safeOpenForWrite(target string, mode os.FileMode, allowOverwrite bool) (*os.File, error) {
-	flags := os.O_CREATE | os.O_WRONLY
-	if allowOverwrite {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	f, err := os.OpenFile(target, flags, mode)
+// safeCreate creates target with O_CREATE|O_EXCL|O_WRONLY on Windows, so it
+// never opens a file that is already there. Windows has no O_NOFOLLOW;
+// reparse-point hardening would require GetFileAttributes-style inspection
+// that we do not implement. Operators who need the strongest guarantees
+// should run extraction on a Unix host.
+func safeCreate(target string, mode os.FileMode) (*os.File, error) {
+	// #nosec G304 -- callers check target is inside the output directory (ensureInsideDir); see above for reparse points.
+	f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil, fmt.Errorf("destination already exists: %s", target)

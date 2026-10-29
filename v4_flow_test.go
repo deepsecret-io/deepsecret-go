@@ -84,7 +84,9 @@ type fakeAPI struct {
 	downloadPartSize int64
 	urlUses          int
 	presigns         int
-	tokens           map[string]int // uses left, by token
+	tokens           map[string]int        // uses left, by token
+	ranges           []string              // the Range of every object GET, in order
+	beforeRange      func(r *http.Request) // when set, runs before a range is served, and may hold it
 }
 
 // fakeUpload is a multipart upload: the parts storage holds.
@@ -408,7 +410,12 @@ func (f *fakeAPI) getObject(w http.ResponseWriter, r *http.Request) {
 		}
 		f.tokens[tok]--
 	}
+	f.ranges = append(f.ranges, r.Header.Get("Range"))
+	hold := f.beforeRange
 	f.mu.Unlock()
+	if hold != nil {
+		hold(r)
+	}
 	obj, err := os.Open(filepath.Join(f.objects, r.PathValue("key")))
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)

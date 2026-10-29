@@ -11,8 +11,9 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- MD5 only as S3 requires it: Content-MD5 and part ETags, transfer checksums, never a security control.
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -28,6 +29,45 @@ import (
 	"sync"
 	"time"
 )
+
+// Bounds on the response bodies the client holds in memory, so a hostile or
+// broken server cannot exhaust it. A body over its bound fails with
+// ErrResponseTooLarge; it is never cut short and used.
+const (
+	// maxAPIResponseSize bounds an API response. The largest the API sends
+	// is a secret's revision list: up to 100 revisions (the top tier's
+	// MaxRevisionsPerSecret), each listing the files of a send whose
+	// request the API caps at 2 MiB, with names JSON does not escape. That
+	// is about 210 MiB at the very most.
+	maxAPIResponseSize = 256 << 20
+
+	// maxHealthResponseSize bounds the /health probe, a few bytes of JSON.
+	maxHealthResponseSize = 64 << 10
+
+	// maxErrorExcerpt is how much of a failed storage request's body is
+	// read to quote in its error. Only the start explains the failure, so
+	// the rest is not read.
+	maxErrorExcerpt = 4096
+)
+
+// ErrResponseTooLarge is a response body over the client's bound for it.
+var ErrResponseTooLarge = errors.New("response too large")
+
+// readBody reads resp's body, refusing one that declares or turns out to
+// be longer than limit bytes.
+func readBody(resp *http.Response, limit int64) ([]byte, error) {
+	if resp.ContentLength > limit {
+		return nil, fmt.Errorf("%w: %d bytes, the limit is %d", ErrResponseTooLarge, resp.ContentLength, limit)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: over %d bytes", ErrResponseTooLarge, limit)
+	}
+	return b, nil
+}
 
 // Response is the backend's JSON response envelope.
 type Response struct {
@@ -121,12 +161,14 @@ type Client struct {
 	httpClient *http.Client
 
 	// apiKey is the credential: an API key, or "bearer:" and a session
-	// token, which the client refreshes before it expires (session.go).
-	// Guarded by authMu; refreshMu makes concurrent refreshes one.
-	apiKey    string
-	session   *SessionStore
-	authMu    sync.Mutex
-	refreshMu sync.Mutex
+	// token, which the client renews while in use (session.go). Guarded
+	// by authMu; refreshMu makes concurrent refreshes one and guards
+	// refreshedAt, when the client last asked for a refresh.
+	apiKey      string
+	session     *SessionStore
+	authMu      sync.Mutex
+	refreshMu   sync.Mutex
+	refreshedAt time.Time
 
 	// presignClient is a separate client used for object-storage presign
 	// uploads/downloads. It carries no auth headers (the presigned URL is the
@@ -142,6 +184,10 @@ type Client struct {
 	// the per-call timeout fires. Reads/writes are fenced behind ctxMu.
 	rootCtx context.Context
 	ctxMu   sync.RWMutex
+
+	// maxResponse bounds an API response body: maxAPIResponseSize, which
+	// tests lower.
+	maxResponse int64
 }
 
 // SetRootContext installs a base context that every subsequent HTTP request
@@ -278,11 +324,19 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 		},
 	}
 
+	// Storage transfers run many requests to one host at once. Each runs
+	// on its own HTTP/1.1 connection, so parallel parts are parallel TCP
+	// streams (HTTP/2 would carry them all on one connection, under one
+	// congestion window). A finished part's connection is kept for the
+	// next part rather than closed: Go keeps 2 idle per host by default,
+	// so about every other part would pay a new TLS handshake and TCP slow
+	// start.
 	presignTransport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          10,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+		MaxIdleConns:          2 * MaxDownloadConcurrency,
+		MaxIdleConnsPerHost:   MaxDownloadConcurrency,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -299,6 +353,7 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 		apiKey:        apiKey,
 		httpClient:    apiClient,
 		presignClient: presignClient,
+		maxResponse:   maxAPIResponseSize,
 	}, nil
 }
 
@@ -355,9 +410,9 @@ func (c *Client) CheckMaintenance() (bool, string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readBody(resp, maxHealthResponseSize)
 	if err != nil {
-		return false, "", err
+		return false, "", fmt.Errorf("health probe: %w", err)
 	}
 
 	if resp.StatusCode == http.StatusServiceUnavailable {
@@ -435,7 +490,7 @@ func (c *Client) send(method, path string, data []byte, key string) (*Response, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readBody(resp, c.maxResponse)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -618,8 +673,8 @@ func (c *Client) PresignDownloadReader(revisionID string, expiryMinutes int) (io
 		return nil, 0, fmt.Errorf("download: %w", err)
 	}
 	if httpResp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		httpResp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorExcerpt))
+		_ = httpResp.Body.Close() // the body was read or is discarded; closing only releases the connection.
 		return nil, 0, errors.New(storageFailure("download failed", httpResp.StatusCode, body))
 	}
 	return httpResp.Body, httpResp.ContentLength, nil
@@ -639,11 +694,12 @@ func (c *Client) PresignUpload(orgID, objectKey string, data []byte, expiryMinut
 
 // PresignUploadFrom uploads the size bytes of src to a presigned PUT URL
 // for objectKey, reading src once for the Content-MD5 and again for each
-// attempt, so it can be a file. onProgress is optional.
+// attempt, so it can be a file. onProgress and status are optional; status
+// follows the upload as one part on one connection.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadFrom(orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int) error {
-	h := md5.New()
+func (c *Client) PresignUploadFrom(orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int, status *TransferStatus) error {
+	h := md5.New() // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	if _, err := io.Copy(h, io.NewSectionReader(src, 0, size)); err != nil {
 		return fmt.Errorf("read payload: %w", err)
 	}
@@ -652,21 +708,18 @@ func (c *Client) PresignUploadFrom(orgID, objectKey string, src io.ReaderAt, siz
 	if err != nil {
 		return err
 	}
-	return c.putToPresignedURL(url, func() (io.Reader, error) {
+	status.start(size, 1, 0, 0, nil)
+	conn := status.begin(1, size)
+	err = c.putToPresignedURL(url, func() (io.Reader, error) {
 		return io.NewSectionReader(src, 0, size), nil
-	}, size, contentMD5, onProgress)
-}
-
-// PresignDownload gets a presigned GET URL and downloads data into memory.
-// For large downloads, use [PresignDownloadReader] to stream.
-//
-// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignDownload(revisionID string, expiryMinutes int) ([]byte, error) {
-	url, err := c.presignDownloadURL(revisionID, resolveExpiryMinutes(expiryMinutes))
-	if err != nil {
-		return nil, err
-	}
-	return c.downloadFromPresignedURL(url)
+	}, size, contentMD5, func(transferred, total int64) {
+		conn.set(transferred)
+		if onProgress != nil {
+			onProgress(transferred, total)
+		}
+	})
+	status.end(conn, err == nil)
+	return err
 }
 
 const maxRetries = 3
@@ -766,7 +819,7 @@ func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Read
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode >= 300 {
-				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorExcerpt))
 				return resp.StatusCode >= 500, errors.New(storageFailure("upload failed", resp.StatusCode, respBody))
 			}
 			return false, nil
@@ -798,7 +851,7 @@ func (c *Client) uploadReaderToPresignedURL(presignedURL string, r io.ReadSeeker
 }
 
 func (c *Client) uploadToPresignedURL(presignedURL string, data []byte) error {
-	md5Sum := md5.Sum(data)
+	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
 	return c.putToPresignedURL(presignedURL, func() (io.Reader, error) {
 		return bytes.NewReader(data), nil
@@ -833,130 +886,9 @@ func (c *Client) PresignUploadWithProgress(orgID, objectKey string, data []byte,
 	if err != nil {
 		return err
 	}
-	md5Sum := md5.Sum(data)
+	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
 	return c.putToPresignedURL(url, func() (io.Reader, error) {
 		return bytes.NewReader(data), nil
 	}, int64(len(data)), contentMD5, onProgress)
-}
-
-// PresignDownloadWithProgress downloads data with a progress callback.
-// onProgress is called with (bytesTransferred, totalBytes) during download.
-//
-// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignDownloadWithProgress(revisionID string, onProgress func(int64, int64), expiryMinutes int) ([]byte, error) {
-	presignedURL, err := c.presignDownloadURL(revisionID, resolveExpiryMinutes(expiryMinutes))
-	if err != nil {
-		return nil, err
-	}
-	return c.getFromPresignedURL(presignedURL, onProgress)
-}
-
-func (c *Client) downloadFromPresignedURL(presignedURL string) ([]byte, error) {
-	return c.getFromPresignedURL(presignedURL, nil)
-}
-
-// getFromPresignedURL downloads the full body, retrying on transient errors.
-//
-// Range-resume semantics: if a download is partially received and the
-// connection drops mid-body, the next retry uses HTTP `Range: bytes=N-` to
-// resume from where it stopped instead of restarting at byte zero. S3
-// supports Range natively on every GET, so this works without any
-// server-side change. The buffer is preserved across retries; the payload
-// digest and chunk AEAD checks happen at the client when the assembled bytes
-// are decrypted, so a Range-resumed body is no less secure than a single-shot
-// one.
-func (c *Client) getFromPresignedURL(presignedURL string, onProgress func(int64, int64)) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(c.reqCtx(), 10*time.Minute)
-	defer cancel()
-	var buf bytes.Buffer
-	var totalSize int64 = -1 // unknown until first response
-
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if attempt > 0 {
-			if err := retryBackoff(ctx, attempt); err != nil {
-				return nil, err
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		// On retry after a partial body, ask for the remainder via Range.
-		// S3 returns 206 Partial Content; we append to the buffer in place.
-		var rangeStart int64
-		if buf.Len() > 0 {
-			rangeStart = int64(buf.Len())
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeStart))
-		}
-
-		resp, err := c.doPresigned(req)
-		if err != nil {
-			lastErr = fmt.Errorf("download: %w", err)
-			continue
-		}
-		if resp.StatusCode >= 500 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			lastErr = errors.New(storageFailure("download failed", resp.StatusCode, body))
-			continue
-		}
-		if resp.StatusCode >= 300 && resp.StatusCode != http.StatusPartialContent {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			return nil, errors.New(storageFailure("download failed", resp.StatusCode, body))
-		}
-
-		// Pin total size from the first non-Range response. ContentLength on
-		// a 206 reflects only the requested range, not the whole object.
-		if totalSize < 0 {
-			if resp.StatusCode == http.StatusPartialContent {
-				// The server unexpectedly returned Range on the first call;
-				// treat as full reset.
-				buf.Reset()
-				rangeStart = 0
-			}
-			totalSize = resp.ContentLength
-		}
-		// Defense: if we asked for Range and got 200 (server ignored Range),
-		// reset the buffer so we don't double-count bytes.
-		if rangeStart > 0 && resp.StatusCode == http.StatusOK {
-			buf.Reset()
-		}
-
-		// Pin the buffer length BEFORE this attempt's read starts. The
-		// inner reader's onProgress already passes a cumulative count; if
-		// we recompute buf.Len() each call (instead of capturing once) it
-		// double-counts as io.Copy interleaves reads and buffer writes,
-		// producing the >100% progress observed on Range-resume retries.
-		startLen := int64(buf.Len())
-		var reader io.Reader = resp.Body
-		if onProgress != nil {
-			reader = &progressCallbackReader{r: reader, onProgress: func(n, _ int64) {
-				onProgress(startLen+n, totalSize)
-			}, total: totalSize}
-		}
-
-		// Stream into the buffer so a mid-body failure preserves what we
-		// already have for the next Range-resume attempt.
-		_, copyErr := io.Copy(&buf, reader)
-		resp.Body.Close()
-		if copyErr != nil {
-			lastErr = fmt.Errorf("download read: %w", copyErr)
-			continue
-		}
-		// Some S3-compatible backends may close the connection without
-		// reporting an error; if Content-Length tells us we're short, retry.
-		if totalSize > 0 && int64(buf.Len()) < totalSize+rangeStart {
-			lastErr = fmt.Errorf("short read: got %d of %d bytes", buf.Len(), totalSize+rangeStart)
-			continue
-		}
-		return buf.Bytes(), nil
-	}
-	return nil, fmt.Errorf("download failed after %d retries: %w", maxRetries, lastErr)
 }

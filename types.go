@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/identity"
 	"github.com/deepsecret-io/sdk/payload"
@@ -59,6 +60,21 @@ type SecretRecipient = secrets.SecretRecipient
 // ListOptions configures pagination and filtering for secret listing.
 type ListOptions = secrets.ListOptions
 
+// TransferStatus is the live state of an upload or a download, for a
+// progress display: pass one in the options and read it with Snapshot
+// while the call runs.
+type TransferStatus = api.TransferStatus
+
+// TransferSnapshot is a TransferStatus at one moment.
+type TransferSnapshot = api.TransferSnapshot
+
+// ConnectionStatus is what one connection of a transfer is doing.
+type ConnectionStatus = api.ConnectionStatus
+
+// TransferAttempts is how many times a transfer tries a part before it
+// fails.
+const TransferAttempts = api.TransferAttempts
+
 // DecryptedPayload holds the decrypted content of a secret.
 type DecryptedPayload = payload.Decrypted
 
@@ -99,6 +115,17 @@ type EncryptOptions struct {
 	// and total bytes. Use this for progress UI. Optional.
 	OnUploadProgress func(transferred, total int64)
 
+	// UploadStatus, when set, follows the upload for a progress display:
+	// what each connection is sending, retries, and how many connections
+	// the upload uses. Optional.
+	UploadStatus *TransferStatus
+
+	// OnEncryptProgress is called as the payload is read, archived,
+	// compressed and encrypted, with the bytes of plaintext done and in
+	// all. The total can be an estimate until the last call, where done
+	// equals it; done never passes it. Optional.
+	OnEncryptProgress func(done, total int64)
+
 	// OnDebug is called at each step of the encrypt/upload flow with a
 	// short context tag ("encrypt", "upload", "confirm", ...) and a message.
 	// Wire it to your CLI's debug logger. Optional.
@@ -123,7 +150,8 @@ type EncryptOptions struct {
 
 	// UploadThreads fixes the number of parallel part PUTs of a multipart
 	// upload, at most 32. 0 adapts it to the link: the upload starts with
-	// 4 and adds connections while they raise throughput. 1 = serial.
+	// one part and adds connections while they raise throughput. 1 =
+	// serial.
 	UploadThreads int
 
 	// ResumeDir keeps the ciphertext of a large (multipart) send in a
@@ -190,6 +218,18 @@ type DecryptOptions struct {
 	// transferred and total bytes. Use this for progress UI. Optional.
 	OnDownloadProgress func(transferred, total int64)
 
+	// DownloadStatus, when set, follows the download for a progress
+	// display: what each connection is fetching, retries, and how many
+	// connections the download uses. Optional.
+	DownloadStatus *TransferStatus
+
+	// OnDecryptProgress is called as the downloaded ciphertext is
+	// verified and decrypted, pass by pass: see DecryptStage. In each
+	// pass done runs up to total, the ciphertext's size; a pass reads it
+	// twice, for its signed digest and then to decrypt, each read half
+	// the way. Optional.
+	OnDecryptProgress func(stage DecryptStage, done, total int64)
+
 	// OnDebug is called at each step of the download/decrypt flow. Optional.
 	OnDebug func(step, message string)
 
@@ -208,6 +248,21 @@ type DecryptOptions struct {
 	// manifest before any plaintext is released. Empty means
 	// $DEEPSECRET_TMPDIR, else the system temp directory.
 	TempDir string
+
+	// ResumeDir keeps the ciphertext of a download over 4 MiB in a folder
+	// named after its revision under this directory, with a record of the
+	// byte ranges it holds, instead of in TempDir. A download that fails,
+	// is cancelled, or dies with the process then returns a
+	// DownloadInterruptedError, and the next decrypt of that revision with
+	// the same ResumeDir fetches only the ranges it lacks. The folder stays
+	// until the payload is decrypted, so a decrypt that fails after the
+	// download does not fetch it again; it is removed once decrypted, when
+	// the ciphertext fails its check against the signed manifest, and
+	// after a week unused. ListPendingDownloads and DiscardPendingDownload
+	// manage them. It is created (mode 0700) when missing, and refused when
+	// it is a symlink or, on Unix, another user's or open to other users.
+	// Payloads decrypted in memory (DecryptSecretFull) do not use it.
+	ResumeDir string
 
 	// MaxDownloadSize refuses a stored payload larger than this many bytes
 	// before downloading it. Zero means DefaultMaxDownloadSize.
@@ -235,6 +290,7 @@ type DecryptResult struct {
 	CipherSuite          string // from the signed manifest
 	PayloadDigest        string // hex SHA-256 of the stored payload, verified against the signed manifest
 	EncryptedSize        int64
+	ResumedBytes         int64 // bytes of the payload kept from an earlier download (DecryptOptions.ResumeDir), not fetched again
 }
 
 // RevokeResult is returned by RevokeRecipient.

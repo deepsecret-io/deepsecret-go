@@ -295,11 +295,11 @@ func DecodeFiles(r io.Reader, lim DecodeLimits, onData func(index int, size int6
 			if err != nil {
 				return nil, err
 			}
-			if count == 0 || count > uint64(lim.MaxFiles) {
+			if count == 0 || count > uint64(lim.MaxFiles) { // #nosec G115 -- resolve makes MaxFiles positive.
 				return nil, fmt.Errorf("payload lists %d files, the limit is %d", count, lim.MaxFiles)
 			}
 			out.Files = make([]FileInfo, 0, count)
-			for idx := 0; idx < int(count); idx++ {
+			for idx := 0; idx < int(count); idx++ { // #nosec G115 -- count is at most MaxFiles, an int.
 				f, err := d.file(idx, lim, &total, onData)
 				if err != nil {
 					return nil, err
@@ -415,7 +415,7 @@ func (d *streamDecoder) text(max int, what string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if n > uint64(max) {
+	if n > uint64(max) { // #nosec G115 -- max is a positive constant or a resolved limit.
 		return "", fmt.Errorf("%s is %d bytes, the limit is %d", what, n, max)
 	}
 	buf := make([]byte, n)
@@ -465,14 +465,16 @@ func (d *streamDecoder) file(idx int, lim DecodeLimits, total *int64, onData fun
 	// Marshal writes a nil Data as null; it is an empty file.
 	var size uint64
 	if b, err := d.r.Peek(1); err == nil && b[0] == cborNull {
-		d.r.ReadByte()
+		_, _ = d.r.ReadByte() // Peek just returned this byte, so reading it cannot fail.
 	} else if size, err = d.expect(majorBytes, "file data"); err != nil {
 		return FileInfo{}, err
 	}
-	if size > uint64(lim.MaxFileSize) {
+	if size > uint64(lim.MaxFileSize) { // #nosec G115 -- resolve makes MaxFileSize positive.
 		return FileInfo{}, fmt.Errorf("file %d is %d bytes, the limit is %d", idx, size, lim.MaxFileSize)
 	}
-	if *total+int64(size) > lim.MaxTotalSize {
+	// *total never exceeds MaxTotalSize, so the subtraction cannot
+	// overflow where *total+size could.
+	if int64(size) > lim.MaxTotalSize-*total {
 		return FileInfo{}, fmt.Errorf("files exceed the total size limit %d", lim.MaxTotalSize)
 	}
 	*total += int64(size)
@@ -498,7 +500,7 @@ func (d *streamDecoder) file(idx int, lim DecodeLimits, total *int64, onData fun
 	if err != nil {
 		return FileInfo{}, err
 	}
-	f.Mode = os.FileMode(mode)
+	f.Mode = os.FileMode(mode) // #nosec G115 -- d.uint refused anything over 0xffffffff.
 	if err := key("name"); err != nil {
 		return FileInfo{}, err
 	}
@@ -508,7 +510,7 @@ func (d *streamDecoder) file(idx int, lim DecodeLimits, total *int64, onData fun
 	if err := key("size"); err != nil {
 		return FileInfo{}, err
 	}
-	declared, err := d.uint(uint64(lim.MaxFileSize), "file size")
+	declared, err := d.uint(uint64(lim.MaxFileSize), "file size") // #nosec G115 -- resolve makes MaxFileSize positive.
 	if err != nil {
 		return FileInfo{}, err
 	}
