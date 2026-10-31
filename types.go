@@ -203,7 +203,8 @@ type EncryptResult struct {
 	PayloadType       string // "message", "data", "files"
 	FilesCount        int    // visible files sent to server metadata (0 when archived)
 	Archived          bool
-	ArchiveEntryCount int // original file count before archiving (set only when Archived=true)
+	ArchiveEntryCount int // entries in the archive, folders and links included (set only when Archived=true)
+	ArchiveFileCount  int // regular files in the archive (set only when Archived=true)
 }
 
 // DecryptOptions configures decrypt behavior.

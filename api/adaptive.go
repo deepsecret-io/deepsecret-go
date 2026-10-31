@@ -131,6 +131,11 @@ type limiter struct {
 
 	firstPart chan float64 // an upload's first finished part's rate, bytes/s
 
+	// waiting, when set, is how many parts have not started yet. Once none
+	// is waiting the tuning stops: throughput then falls as the last parts
+	// finish, which says nothing about the link. Set it before tune runs.
+	waiting func() int
+
 	// The tuning's timings, read when the transfer starts: its tuner can
 	// outlive it by a window, and tests change them between transfers.
 	win      windows
@@ -237,10 +242,18 @@ func (l *limiter) tune(ctx context.Context, report func(from, to int, bytesPerSe
 	if l.partSize == 0 {
 		lastRate = adaptiveFastRate
 	}
-	decide := func(rate float64, now time.Time) {
+	// decide judges a window, and reports false once every part has started,
+	// which ends the tuning.
+	decide := func(rate float64, now time.Time) bool {
 		moved, errs := l.moved.Load(), l.errors.Load()
 		if rate < 0 {
 			rate = float64(moved-lastMoved) / now.Sub(lastAt).Seconds()
+		}
+		if l.waiting != nil && l.waiting() == 0 {
+			if report != nil {
+				report(t.limit, t.limit, rate, "every part has started: the last ones finish at this count")
+			}
+			return false
 		}
 		before := t.limit
 		l.set(t.next(rate, errs-lastErrs))
@@ -248,19 +261,24 @@ func (l *limiter) tune(ctx context.Context, report func(from, to int, bytesPerSe
 			report(before, t.limit, rate, why)
 		}
 		lastMoved, lastErrs, lastAt, lastRate = moved, errs, now, rate
+		return true
 	}
 	if l.partSize > 0 {
 		t.start, t.settle, t.window = true, false, win.slow
 		timer := time.NewTimer(start)
+		judged := true
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case rate := <-l.firstPart:
 			timer.Stop()
-			decide(rate, time.Now())
+			judged = decide(rate, time.Now())
 		case now := <-timer.C:
-			decide(-1, now)
+			judged = decide(-1, now)
+		}
+		if !judged {
+			return
 		}
 	}
 	for {
@@ -271,7 +289,9 @@ func (l *limiter) tune(ctx context.Context, report func(from, to int, bytesPerSe
 			timer.Stop()
 			return
 		case now := <-timer.C:
-			decide(-1, now)
+			if !decide(-1, now) {
+				return
+			}
 		}
 	}
 }

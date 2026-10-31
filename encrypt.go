@@ -203,17 +203,34 @@ func emitArchiveDecision(opt EncryptOptions, archiveOn bool, reason string, expa
 	if opt.OnDebug == nil {
 		return
 	}
-	regular := 0
-	for _, ef := range expanded {
-		if !ef.IsDir && !ef.IsSymlink {
-			regular++
-		}
-	}
+	regular := regularFiles(expanded)
 	if archiveOn {
 		opt.OnDebug("archive", fmt.Sprintf("enabled: %s (entries=%d, regular_files=%d)", reason, len(expanded), regular))
 	} else {
 		opt.OnDebug("archive", fmt.Sprintf("disabled: flat per-file payload (regular_files=%d)", regular))
 	}
+}
+
+// regularFiles counts the regular files among expanded, without folders
+// and links.
+func regularFiles(expanded []archive.ExpandedFile) int {
+	n := 0
+	for _, ef := range expanded {
+		if !ef.IsDir && !ef.IsSymlink {
+			n++
+		}
+	}
+	return n
+}
+
+// archiveSizeNote says, for the debug log, what an archive's plaintext
+// size holds: its files and their tar headers, so it is more than the
+// files alone (EncryptResult.OriginalSize).
+func archiveSizeNote(p *plaintext) string {
+	if !p.archived {
+		return ""
+	}
+	return fmt.Sprintf(" (the archive: %s of files plus tar headers)", humanBytes(p.originalSize))
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -378,6 +395,7 @@ func (c *Client) encryptArchive(recipients []string, expanded []archive.Expanded
 		size:           tarSize + 512,
 		archived:       true,
 		archiveEntries: len(expanded),
+		archiveFiles:   regularFiles(expanded),
 		originalSize:   originalSize,
 	}
 	p.write = func(w io.Writer) error {
@@ -400,7 +418,8 @@ type plaintext struct {
 	files []secrets.FileMetaEntry
 
 	archived       bool
-	archiveEntries int
+	archiveEntries int   // an archive's entries, folders and links included
+	archiveFiles   int   // its regular files
 	originalSize   int64 // an archive's files, before tar and compression
 
 	// inMemory payloads are sealed in memory: they are already there,
@@ -618,7 +637,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		return nil, fmt.Errorf("payload is empty")
 	}
 	debugf("encrypt", "payload type=%s", p.payloadType)
-	debugf("encrypt", "plaintext size=%s", humanBytes(p.size))
+	debugf("encrypt", "plaintext size=%s%s", humanBytes(p.size), archiveSizeNote(p))
 	if p.archived {
 		debugf("encrypt", "archived=true")
 	}
@@ -899,7 +918,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		Archived:          p.archived,
 	}
 	if p.archived {
-		result.ArchiveEntryCount = p.archiveEntries
+		result.ArchiveEntryCount, result.ArchiveFileCount = p.archiveEntries, p.archiveFiles
 	}
 	return result, nil
 }

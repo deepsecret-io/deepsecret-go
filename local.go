@@ -134,7 +134,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		return nil, err
 	}
 	debugf("encrypt", "payload type=%s", p.payloadType)
-	debugf("encrypt", "plaintext size=%s", humanBytes(p.size))
+	debugf("encrypt", "plaintext size=%s%s", humanBytes(p.size), archiveSizeNote(p))
 	need := spoolNeed(p.size)
 	if free, ok := freeDiskBytes(dir); ok {
 		debugf("plan", "local file: %s, sealed into a private file beside it and renamed when complete; needs %s, %s free", out, humanBytes(need), humanBytes(free))
@@ -268,7 +268,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		Archived:          p.archived,
 	}
 	if p.archived {
-		result.ArchiveEntryCount = p.archiveEntries
+		result.ArchiveEntryCount, result.ArchiveFileCount = p.archiveEntries, p.archiveFiles
 	}
 	return result, nil
 }

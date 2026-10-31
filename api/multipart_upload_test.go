@@ -422,7 +422,7 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 	}
 	// The threads plan gives the settings only: each decision is a
 	// "threads" event with its own reason.
-	if want := "adaptive: start 1, up to 3 (limit 32, at most one per part); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%; parts in flight must each finish within 1m at the measured rate"; plans["threads"] != want {
+	if want := "adaptive: start 1, up to 3 (limit 32, at most one per part); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%; parts in flight must each finish within 1m at the measured rate; once every part has started, the count stays"; plans["threads"] != want {
 		t.Errorf("threads plan:\n got %q\nwant %q", plans["threads"], want)
 	}
 

@@ -306,6 +306,8 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 		debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxUploadThreads, "part"))
 		debugf("plan", "part URLs: %d per request, fetched again %s before they expire or when storage refuses one", partURLBatch, roundDuration(partURLRenewMargin))
 		debugf("plan", "retries: %s", retryPlan())
+		queue := &partQueue{parts: parts, items: work}
+		lim.waiting = queue.left
 		go lim.tune(ctx, func(from, to int, rate float64, reason string) {
 			debugf("threads", "%s", threadsChange(from, to, rate, reason))
 		})
@@ -319,7 +321,6 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 				progressMu.Unlock()
 			}
 		}
-		queue := &partQueue{parts: parts, items: work}
 		urls := &partURLCache{c: c, revisionID: revisionID, queue: queue, urls: map[int]cachedURL{}}
 		var wg sync.WaitGroup
 		for range lim.max {
@@ -475,6 +476,13 @@ func (q *partQueue) pop() (int, bool) {
 	}
 	q.next++
 	return q.items[q.next-1], true
+}
+
+// left is how many parts have not been handed out yet.
+func (q *partQueue) left() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items) - q.next
 }
 
 // near returns the numbers of the last back parts handed out, which may be

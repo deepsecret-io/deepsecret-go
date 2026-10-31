@@ -42,7 +42,7 @@ func threadsPlan(lim *limiter, requested, limit int, piece string) string {
 	plan := fmt.Sprintf("adaptive: start %d, up to %d (limit %d, at most one per %s); measured every %s (%s from %s/s); an increase stays only if throughput rises over %d%%",
 		lim.current(), lim.max, limit, piece, lim.win.slow, lim.win.fast, humanBytesLocal(int64(adaptiveFastRate)), adaptiveGainPct)
 	if lim.partSize > 0 {
-		plan += fmt.Sprintf("; %ss in flight must each finish within %s at the measured rate", piece, roundDuration(lim.partTime))
+		plan += fmt.Sprintf("; %ss in flight must each finish within %s at the measured rate; once every %s has started, the count stays", piece, roundDuration(lim.partTime), piece)
 	}
 	return plan
 }

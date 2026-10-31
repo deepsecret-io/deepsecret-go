@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -352,5 +353,49 @@ func TestTuner_ShedsPartsWhenTheLinkSlows(t *testing.T) {
 	}
 	if tu.reason != "at this rate parts would take over 1m each" {
 		t.Fatalf("reason %q", tu.reason)
+	}
+}
+
+// Once every part of an upload has started, the count stays: throughput
+// then falls only because fewer parts are left in flight, which says
+// nothing about the link. The tuner says so once and stops. Here a window
+// with nothing moved would otherwise cut 4 parts in flight to 2, as parts
+// taking over the time bound.
+func TestLimiter_HoldsTheCountOnceEveryPartHasStarted(t *testing.T) {
+	l := newLimiter(t.Context(), 0, 8, 8<<20)
+	l.win = windows{slow: 5 * time.Millisecond, fast: 5 * time.Millisecond}
+	l.startWin = 5 * time.Millisecond
+	l.set(4)
+	var calls atomic.Int32
+	l.waiting = func() int {
+		if calls.Add(1) == 1 {
+			return 5 // the first window: parts still to start
+		}
+		return 0
+	}
+	var said []string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.tune(t.Context(), func(from, to int, _ float64, reason string) {
+			said = append(said, fmt.Sprintf("%d->%d %s", from, to, reason))
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tuning went on after every part had started")
+	}
+	if l.current() != 4 {
+		t.Fatalf("the count changed to %d: %q", l.current(), said)
+	}
+	last := said[len(said)-1]
+	if last != "4->4 every part has started: the last ones finish at this count" {
+		t.Fatalf("said %q", said)
+	}
+	for _, s := range said {
+		if strings.Contains(s, "would take over") && !strings.HasPrefix(s, "4->4") {
+			t.Fatalf("cut the count in the tail: %q", said)
+		}
 	}
 }
