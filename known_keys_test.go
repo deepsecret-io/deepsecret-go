@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
 
 	"github.com/deepsecret-io/sdk/crypto"
 )
@@ -332,6 +335,77 @@ func TestDecryptOwnSecret(t *testing.T) {
 	}
 	if known := knownKeys(t, c, ""); len(known) != 1 || known[alice.fp].State != KeyOwn {
 		t.Fatalf("known keys %+v, want only alice's own", known)
+	}
+}
+
+// A key pair on this device does not let the server relabel the user's own
+// secret as sent by someone this device knows: the claimed sender's pins
+// still apply, on both the server path and local files. An email the
+// server gives with spaces is refused before the pins are read.
+func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "mallory@example.com")
+	alice, bob, mallory := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["mallory@example.com"]
+	cb := f.client(bob.email)
+	resA, err := f.client(alice.email).EncryptText([]string{bob.email}, "from alice", EncryptOptions{Name: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgetLocalKey(t, alice)
+	if _, err := cb.DecryptSecretFull(resA.Secret.ID, DecryptOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	note, err := cb.EncryptText([]string{bob.email}, "bob's note", EncryptOptions{Name: "n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
+	if _, err := cb.EncryptText([]string{bob.email}, "bob's note", EncryptOptions{LocalFile: path}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	f.secrets[note.Secret.ID].senderID = alice.id
+	alice.old = append(alice.old, bob.kp)
+	f.mu.Unlock()
+	var changed *KeyChangedError
+	if res, err := cb.DecryptSecretFull(note.Secret.ID, DecryptOptions{}); !errors.As(err, &changed) {
+		t.Fatalf("relabeled own secret: %+v, %v, want a KeyChangedError", res, err)
+	}
+	relabelLocalSender(t, path, alice.email)
+	if res, err := f.openLocal(bob.email, path); !errors.As(err, &changed) {
+		t.Fatalf("relabeled own local file: %+v, %v, want a KeyChangedError", res, err)
+	}
+
+	f.mu.Lock()
+	mallory.email = "alice@example.com "
+	f.actors[mallory.email] = mallory
+	f.actors["alice@example.com%20"] = mallory
+	mallory.old = append(mallory.old, bob.kp)
+	f.secrets[note.Secret.ID].senderID = mallory.id
+	f.mu.Unlock()
+	if _, err := cb.DecryptSecretFull(note.Secret.ID, DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "invalid sender email") {
+		t.Fatalf("sender email with a space: %v, want it refused", err)
+	}
+}
+
+// relabelLocalSender rewrites the unsigned sender label of a local file.
+func relabelLocalSender(t *testing.T, path, email string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, payloadSize, err := readLocalHeader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr.SenderEmail = email
+	enc, err := cbor.Marshal(hdr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw[:localPrefixLen+payloadSize:localPrefixLen+payloadSize], enc...), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

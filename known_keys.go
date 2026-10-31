@@ -130,6 +130,23 @@ func (e *KeyChangedError) Error() string {
 		e.Email, strings.Join(known, ", "), got)
 }
 
+// StaleRevisionError refuses the revision the server gives as a secret's
+// latest when this device already opened a revision of that secret, from
+// the same sender, signed later: the server may be rolling the secret back.
+// Requesting RevisionID explicitly opens it anyway.
+type StaleRevisionError struct {
+	SecretName  string
+	SenderEmail string
+	RevisionID  string    // the revision refused
+	SignedAt    time.Time // when it was signed
+	NewestSeen  time.Time // the signing time of the newest revision of the secret this device opened
+}
+
+func (e *StaleRevisionError) Error() string {
+	return fmt.Sprintf("the server gives revision %s, signed %s, as the latest of %q from %s, but this device already opened a revision of it signed %s: refusing a possible rollback (request the revision by id to open it anyway)",
+		e.RevisionID, e.SignedAt.UTC().Format(time.RFC3339), e.SecretName, e.SenderEmail, e.NewestSeen.UTC().Format(time.RFC3339))
+}
+
 // SetKnownKeysFile makes c keep known keys in path instead of
 // DefaultKnownKeysFile.
 func (c *Client) SetKnownKeysFile(path string) { c.knownKeysFile = path }
@@ -344,26 +361,75 @@ func (c *Client) recordFirstUse(people []Recipient, sender bool) error {
 
 // checkSenderKey checks fp, the key whose signatures on a secret from email
 // just verified, and logs why it is trusted. A key on this device is the
-// user's own and passes; anyone else's must pass checkKey. It changes
+// user's own and passes, unless this device knows email as someone else:
+// the server names the sender, so a local key must not make the user's own
+// secret pass as theirs. Anyone else's key must pass checkKey. It changes
 // nothing: a key new to this device is reported as first, for
 // recordFirstUse once the decrypt succeeds.
 func (c *Client) checkSenderKey(email, fp string, log *slog.Logger) (bool, error) {
 	verified := func(own, first bool) {
 		api.Module(log, "verify").Debug("sender key verified", "email", email, "fingerprint", fp, "trust", keyTrust(own, first))
 	}
-	if isLocalKey(fp) {
-		verified(true, false)
-		return false, nil
-	}
 	disk, err := c.knownKeys().read()
 	if err != nil {
 		return false, err
 	}
-	first, err := checkKey(disk.Servers[c.knownServer()], strings.ToLower(email), fp, true)
+	people := disk.Servers[c.knownServer()]
+	lower := strings.ToLower(email)
+	if isLocalKey(fp) {
+		if keys := people[lower]; len(keys) > 0 && !ownAccount(keys) {
+			if err := keyCheck(lower, fp, true, keys); err != nil {
+				return false, err
+			}
+		}
+		verified(true, false)
+		return false, nil
+	}
+	first, err := checkKey(people, lower, fp, true)
 	if err == nil {
 		verified(false, first)
 	}
 	return first, err
+}
+
+// checkNewest refuses m, the revision the server gives as its secret's
+// latest, when this device already opened a revision of the same secret
+// from email that was signed later.
+func (c *Client) checkNewest(email string, m *crypto.Manifest) error {
+	disk, err := c.knownKeys().read()
+	if err != nil {
+		return err
+	}
+	newest, ok := disk.Newest[c.knownServer()][strings.ToLower(email)][m.SecretName]
+	if ok && m.Timestamp < newest {
+		return &StaleRevisionError{SecretName: m.SecretName, SenderEmail: email, RevisionID: m.RevisionID,
+			SignedAt: time.Unix(m.Timestamp, 0), NewestSeen: time.Unix(newest, 0)}
+	}
+	return nil
+}
+
+// newestRecorder records m's signing time as the newest of its secret from
+// email, once a decrypt of it succeeded. It never lowers a recorded time.
+func (c *Client) newestRecorder(email string, m *crypto.Manifest) func() error {
+	server, sender, name, signed := c.knownServer(), strings.ToLower(email), m.SecretName, m.Timestamp
+	return func() error {
+		return c.knownKeys().update(func(d *knownKeysDisk) bool {
+			if newest, ok := d.Newest[server][sender][name]; ok && newest >= signed {
+				return false
+			}
+			if d.Newest == nil {
+				d.Newest = map[string]map[string]map[string]int64{}
+			}
+			if d.Newest[server] == nil {
+				d.Newest[server] = map[string]map[string]int64{}
+			}
+			if d.Newest[server][sender] == nil {
+				d.Newest[server][sender] = map[string]int64{}
+			}
+			d.Newest[server][sender][name] = signed
+			return true
+		})
+	}
 }
 
 // checkKey checks fp, the key the server lists for email (or, when sender
@@ -461,6 +527,10 @@ type knownKeysDisk struct {
 	// Servers holds, by API base URL, each person's accepted keys by
 	// lower-case email.
 	Servers map[string]map[string][]knownKeyDisk `json:"servers"`
+	// Newest holds, by API base URL, sender's lower-case email and secret
+	// name, the signing time (Unix seconds) of the newest revision this
+	// device opened. A latest revision signed earlier is refused.
+	Newest map[string]map[string]map[string]int64 `json:"newest,omitempty"`
 }
 
 type knownKeyDisk struct {

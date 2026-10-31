@@ -103,8 +103,10 @@ func main() {
 	// Seal once for every recipient. The revision id is bound into the
 	// payload, the wraps and the manifest; the API assigns it at create.
 	revisionID := "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70"
+	secretName := "lowlevel-example"
 	sealedPayload, sealed, err := crypto.SealBytes(plaintext, senderKP, []*crypto.PublicKeys{recipientPub}, crypto.SealParams{
 		RevisionID:  revisionID,
+		SecretName:  secretName,
 		PayloadType: "message",
 	})
 	if err != nil {
@@ -126,6 +128,7 @@ func main() {
 	wrap, _ := sealed.Wrap(recipientFP)
 	opened, err := crypto.Open(sealed.ManifestData, wrap, recipientKP, crypto.OpenParams{
 		RevisionID:    revisionID,
+		SecretName:    secretName,
 		SenderED25519: senderKP.ED25519Public,
 	})
 	if err != nil {
@@ -153,6 +156,7 @@ func main() {
 
 	compPayload, compSealed, err := crypto.SealBytes(compressed, senderKP, []*crypto.PublicKeys{recipientPub}, crypto.SealParams{
 		RevisionID:  revisionID,
+		SecretName:  secretName,
 		PayloadType: "message",
 		Compressed:  true,
 		Compression: "zstd",
@@ -162,7 +166,7 @@ func main() {
 	}
 
 	compWrap, _ := compSealed.Wrap(recipientFP)
-	compOpened, err := crypto.Open(compSealed.ManifestData, compWrap, recipientKP, crypto.OpenParams{RevisionID: revisionID})
+	compOpened, err := crypto.Open(compSealed.ManifestData, compWrap, recipientKP, crypto.OpenParams{RevisionID: revisionID, SecretName: secretName})
 	if err != nil {
 		log.Fatal("open compressed: ", err)
 	}

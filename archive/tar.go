@@ -715,6 +715,9 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 		if err := ensureInsideDir(outputDir, target); err != nil {
 			return count, fmt.Errorf("symlink escape for %q: %w", cleanName, err)
 		}
+		if err := noLinkBetween(outputDir, target); err != nil {
+			return count, fmt.Errorf("entry %q: %w", cleanName, err)
+		}
 
 		if hdr.Typeflag == tar.TypeDir {
 			// A directory that is already there stays as it is: the
@@ -757,13 +760,8 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return count, fmt.Errorf("mkdir for symlink %q: %w", cleanName, err)
 			}
-			if _, err := os.Lstat(target); err == nil {
-				if !lim.AllowOverwrite {
-					return count, fmt.Errorf("destination already exists: %s", target)
-				}
-				if rmErr := os.Remove(target); rmErr != nil {
-					return count, fmt.Errorf("remove existing %s: %w", target, rmErr)
-				}
+			if err := replaceLeaf(target, lim.AllowOverwrite); err != nil {
+				return count, err
 			}
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return count, fmt.Errorf("symlink %q: %w", cleanName, err)
@@ -795,16 +793,17 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			if err := ensureInsideDir(outputDir, linkSrc); err != nil {
 				return count, fmt.Errorf("hardlink target escape for %q: %w", cleanName, err)
 			}
+			if err := noLinkBetween(outputDir, linkSrc); err != nil {
+				return count, fmt.Errorf("hardlink %q: %w", cleanName, err)
+			}
+			if info, err := os.Lstat(linkSrc); err != nil || !info.Mode().IsRegular() {
+				return count, fmt.Errorf("hardlink %q: %q is not a regular file", cleanName, linkSrcRel)
+			}
 			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return count, fmt.Errorf("mkdir for hardlink %q: %w", cleanName, err)
 			}
-			if _, err := os.Lstat(target); err == nil {
-				if !lim.AllowOverwrite {
-					return count, fmt.Errorf("destination already exists: %s", target)
-				}
-				if rmErr := os.Remove(target); rmErr != nil {
-					return count, fmt.Errorf("remove existing %s: %w", target, rmErr)
-				}
+			if err := replaceLeaf(target, lim.AllowOverwrite); err != nil {
+				return count, err
 			}
 			if err := os.Link(linkSrc, target); err != nil {
 				return count, fmt.Errorf("hardlink %q -> %q: %w", cleanName, linkSrcRel, err)
@@ -876,7 +875,9 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 	// Apply directory mtimes from deepest to shallowest so writing into a
 	// child doesn't roll the parent's mtime forward after we restore it.
 	for i := len(dirTimes) - 1; i >= 0; i-- {
-		_ = os.Chtimes(dirTimes[i].path, dirTimes[i].mtime, dirTimes[i].mtime)
+		if info, err := os.Lstat(dirTimes[i].path); err == nil && info.IsDir() {
+			_ = os.Chtimes(dirTimes[i].path, dirTimes[i].mtime, dirTimes[i].mtime)
+		}
 	}
 
 	return count, nil
@@ -937,6 +938,9 @@ func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize in
 	if err := ensureInsideDir(outputDir, target); err != nil {
 		return "", 0, fmt.Errorf("symlink escape for %q: %w", cleanName, err)
 	}
+	if err := noLinkBetween(outputDir, target); err != nil {
+		return "", 0, fmt.Errorf("file %q: %w", cleanName, err)
+	}
 	targetDir := filepath.Dir(target)
 	if err := undo.MkdirAll(targetDir, 0o700); err != nil {
 		return "", 0, fmt.Errorf("mkdir for %q: %w", cleanName, err)
@@ -954,6 +958,55 @@ func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize in
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+// noLinkBetween refuses target when an existing component between dir and
+// target's parent is not a real directory: extraction never creates, links
+// or records anything through a link, so no later entry can redirect a
+// path it already used (undo, directory times).
+func noLinkBetween(dir, target string) error {
+	rel, err := filepath.Rel(dir, filepath.Dir(target))
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	p := dir
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		p = filepath.Join(p, part)
+		info, err := os.Lstat(p)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", p)
+		}
+	}
+	return nil
+}
+
+// replaceLeaf makes room for a link at target: nothing there is fine; an
+// existing file or link is removed only with allowOverwrite; a directory is
+// never removed, so no path an earlier entry used can change meaning.
+func replaceLeaf(target string, allowOverwrite bool) error {
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !allowOverwrite || info.IsDir() {
+		return fmt.Errorf("destination already exists: %s", target)
+	}
+	if err := os.Remove(target); err != nil {
+		return fmt.Errorf("remove existing %s: %w", target, err)
+	}
+	return nil
+}
 
 // zeroReader yields zeros forever.
 type zeroReader struct{}

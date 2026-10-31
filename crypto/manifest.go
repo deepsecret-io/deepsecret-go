@@ -9,6 +9,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
 )
@@ -25,6 +28,10 @@ const (
 
 	// maxRevisionIDLen bounds the revision id (a UUID is 36 characters).
 	maxRevisionIDLen = 64
+
+	// maxSecretNameLen bounds the secret name in bytes. The API allows 255
+	// characters, at most 1020 bytes of UTF-8.
+	maxSecretNameLen = 1024
 )
 
 // ManifestRecipient lists one wrap in the manifest.
@@ -37,7 +44,8 @@ type ManifestRecipient struct {
 // is signed by the sender with Ed25519 and ML-DSA-65. Every recipient holds
 // the content key and could encrypt other content under it, so only this
 // signature over the payload digest shows who wrote the payload. Covering
-// the recipient list stops a recipient being added, removed or swapped.
+// the recipient list stops a recipient being added, removed or swapped, and
+// covering the secret name stops a revision passing as another secret's.
 //
 // The sender's full public key bundle is embedded and bound by fingerprint,
 // so a manifest verifies without an external key lookup. Trust in the
@@ -46,6 +54,7 @@ type Manifest struct {
 	Version           string              `cbor:"version"`
 	CipherSuite       string              `cbor:"cipher_suite"`
 	RevisionID        string              `cbor:"revision_id"`
+	SecretName        string              `cbor:"secret_name"` // the secret the revision belongs to, as the API stores its name
 	SenderFingerprint string              `cbor:"sender_fp"`
 	SenderED25519     []byte              `cbor:"sender_ed25519"`
 	SenderX25519      []byte              `cbor:"sender_x25519"`
@@ -74,6 +83,7 @@ func (m *Manifest) SignableBytes() []byte {
 	writeField(h, []byte(m.Version))
 	writeField(h, []byte(m.CipherSuite))
 	writeField(h, []byte(m.RevisionID))
+	writeField(h, []byte(m.SecretName))
 	writeField(h, []byte(m.SenderFingerprint))
 	writeField(h, m.SenderED25519)
 	writeField(h, m.SenderX25519)
@@ -152,6 +162,9 @@ func (m *Manifest) validate() error {
 	if m.RevisionID == "" || len(m.RevisionID) > maxRevisionIDLen {
 		return fmt.Errorf("malformed manifest: revision id must be 1 to %d bytes", maxRevisionIDLen)
 	}
+	if err := validateSecretName(m.SecretName); err != nil {
+		return fmt.Errorf("malformed manifest: %w", err)
+	}
 	if err := validatePayloadParams(m.PayloadType, m.Compressed, m.Compression); err != nil {
 		return fmt.Errorf("malformed manifest: %w", err)
 	}
@@ -219,6 +232,42 @@ func verifySenderBundle(fp string, ed, x, mlkem, mldsa []byte) error {
 			ShortFingerprint(computed), ShortFingerprint(fp))
 	}
 	return nil
+}
+
+// validateSecretName holds a secret name to the protocol's rule (§5): 1 to
+// maxSecretNameLen bytes of UTF-8, no surrounding white space, and nothing
+// that could break or reorder the lines it is shown on.
+func validateSecretName(name string) error {
+	if name == "" || len(name) > maxSecretNameLen {
+		return fmt.Errorf("secret name must be 1 to %d bytes", maxSecretNameLen)
+	}
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("secret name is not valid UTF-8")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("secret name must not start or end with white space")
+	}
+	for _, r := range name {
+		if isLayoutControl(r) {
+			return fmt.Errorf("secret name must not contain control, line-break or bidi formatting characters")
+		}
+	}
+	return nil
+}
+
+// isLayoutControl reports whether r is a control character, a line or
+// paragraph separator, or a bidi formatting character. The API refuses the
+// same characters in secret names.
+func isLayoutControl(r rune) bool {
+	switch {
+	case unicode.IsControl(r), unicode.In(r, unicode.Zl, unicode.Zp):
+		return true
+	case r == 0x061C, r == 0x200E, r == 0x200F:
+		return true
+	case r >= 0x202A && r <= 0x202E, r >= 0x2066 && r <= 0x2069:
+		return true
+	}
+	return false
 }
 
 // isFingerprint reports whether s is a full lower-case hex fingerprint.

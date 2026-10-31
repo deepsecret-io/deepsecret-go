@@ -63,18 +63,19 @@ The manifest is a canonical-CBOR map, signed by the sender:
 | `version` | `"4"` |
 | `cipher_suite` | `"DS4_HPKE_X25519MLKEM768_HKDFSHA256_AES256GCM_STREAM1M_ED25519_MLDSA65"` |
 | `revision_id` | The revision UUID the API assigned before upload |
+| `secret_name` | The name of the secret the revision belongs to, exactly as the API stores it. Every revision of a secret carries the same name |
 | `sender_fp`, `sender_ed25519`, `sender_x25519`, `sender_mlkem`, `sender_mldsa65` | The sender's fingerprint and full public key bundle, as in v3 |
 | `payload_type`, `compressed`, `compression` | As in v3 |
 | `chunk_size` | `C` |
 | `plaintext_size`, `ciphertext_size` | Sizes in bytes |
 | `payload_digest` | §3 |
-| `timestamp` | Unix seconds |
+| `timestamp` | Unix seconds, by the sender's clock when sealing |
 | `recipients` | Every wrap's `(recipient_fp, wrap_digest)`, sorted by `recipient_fp` |
 | `sig`, `sig_mldsa65` | Ed25519 and ML-DSA-65 signatures over `SignableBytes` |
 
 - **`SignableBytes`** is SHA-256 over every field above except the two signatures, in table order, each written with `writeField`. Strings are UTF-8 and booleans one byte. The integers `chunk_size`, `plaintext_size`, `ciphertext_size` and `timestamp` are 8 bytes big-endian. `recipients` is a 4-byte big-endian count, then each pair's `recipient_fp` and `wrap_digest` as two fields.
-- **Limits.** 1 to 1000 recipients, sorted by fingerprint with no duplicates. A serialized manifest is at most 1 MiB; readers refuse anything larger before parsing. A wrap's `enc` is exactly 1120 bytes and its `ct` 48. `ciphertext_size` must equal `plaintext_size` plus 16 bytes per chunk, counting an empty payload as one chunk.
-- **What the signature proves.** Every recipient holds `K` and could encrypt different content under it, so the AEAD alone cannot show who wrote the payload. The signature binds the payload digest to the sender's identity key. Covering the recipient list stops anyone adding, removing or swapping a recipient unnoticed.
+- **Limits.** 1 to 1000 recipients, sorted by fingerprint with no duplicates. A serialized manifest is at most 1 MiB; readers refuse anything larger before parsing. A wrap's `enc` is exactly 1120 bytes and its `ct` 48. `ciphertext_size` must equal `plaintext_size` plus 16 bytes per chunk, counting an empty payload as one chunk. `secret_name` is 1 to 1024 bytes of UTF-8 with no leading or trailing white space (Unicode `White_Space`) and no control character (`Cc`), line or paragraph separator (`Zl`, `Zp`) or bidi formatting character (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
+- **What the signature proves.** Every recipient holds `K` and could encrypt different content under it, so the AEAD alone cannot show who wrote the payload. The signature binds the payload digest to the sender's identity key. Covering the recipient list stops anyone adding, removing or swapping a recipient unnoticed. Covering `secret_name` stops a revision passing as part of another secret.
 - **Who sees the recipient list.** Every recipient sees the full list of recipient fingerprints. This was approved as an accepted trade-off on 2026-10-25.
 
 ## 6. Opening a revision
@@ -83,11 +84,18 @@ A recipient MUST perform these steps in order and stop at the first failure:
 
 1. Fetch the manifest and their own wrap.
 2. Recompute `sender_fp` from the embedded bundle, then verify both signatures with the embedded keys, as in v3. Trust decisions about the sender (primary key, fingerprint status) are unchanged.
-3. Check that `revision_id` is the revision requested, that their own fingerprint appears in `recipients`, and that their wrap's digest matches the listed one. The structural checks of §5 (limits, sorting, sizes) come before the signatures.
+3. Check that `revision_id` is the revision requested, that `secret_name` is the name of the secret requested, that their own fingerprint appears in `recipients`, and that their wrap's digest matches the listed one. The structural checks of §5 (limits, sorting, sizes, the name rule) come before the signatures.
 4. Open the wrap with HPKE using the `info` from §4, which yields `K`. Derive `PK`.
 5. Download the payload. Check `ciphertext_size`, and check SHA-256 against `payload_digest`, **before releasing any plaintext**. Clients buffer to memory or to a private temporary file for this.
 6. Decrypt the chunks in order. Require the last-chunk flag on the final chunk only, and accept no bytes after it.
 7. Decompress and extract as in v3.
+
+**Which revision is the latest.** The server says which revision is a secret's latest and what the secret is called, so neither answer is trusted on its own:
+
+- A client shows the signed `secret_name` and `timestamp` with what it opened, so a server that also lies about the name is visible.
+- A client that opens a secret's latest revision keeps, per server, sender and `secret_name`, the newest `timestamp` it has opened, and refuses a latest revision signed earlier than that: the server may be rolling the secret back. It records the time only after step 5 passed, and never lowers it. Opening a revision requested by id is not refused, so an older revision stays reachable on purpose.
+
+The sender is the authority for their own content, so ordering by the sender's signed clock adds no trust in anyone else.
 
 ## 7. What the server stores and checks
 
@@ -95,7 +103,7 @@ This section is informative; the API contract is `api/docs/design/2026-10-25-pro
 
 - **One payload object per revision** in storage, counted once against quotas.
 - **The manifest** on the revision row, and **each wrap** in its own row (`revision_wraps`). The API returns a recipient only their own wrap.
-- **When a revision is sent, the API checks** that the manifest parses and is version 4, that its `revision_id`, `ciphertext_size`, `payload_digest`, `sender_fp` and `payload_type` match the request, and that it lists exactly the request's recipients, each at their current primary key and with the digest of the wrap sent for them. It verifies no signature: recipients do.
+- **When a revision is sent, the API checks** that the manifest parses and is version 4, that its `revision_id`, `secret_name`, `ciphertext_size`, `payload_digest`, `sender_fp` and `payload_type` match the request (`secret_name` against the request's name with surrounding white space removed, the name the secret is stored under), and that it lists exactly the request's recipients, each at their current primary key and with the digest of the wrap sent for them. It verifies no signature: recipients do.
 - **At upload confirmation** it checks the stored object's size, and access becomes the revision's wrap holders.
 - **Revoking a recipient** deletes their access row and wraps. A revision nobody with access can open, and a secret with no recipients left, are deleted under the hard-delete policy.
 
@@ -103,6 +111,7 @@ This section is informative; the API contract is `api/docs/design/2026-10-25-pro
 
 - **Confidentiality** against everyone except the listed recipients, with hybrid post-quantum protection, as in v3.
 - **Sender authenticity and payload integrity** for every recipient, through both signatures over the manifest.
+- **Secret binding:** a revision opens only as the secret its sender named, so the server cannot present one secret's revision as another's. A client that keeps the newest signing time per secret (§6) also refuses a rollback to a revision older than one it has opened. A rollback before the client has seen the newer revision is not detectable, because only the server knows a revision exists.
 - **Integrity of the stream:** no reordering, dropping, truncation or appending of chunks.
 - **Unchanged from v3:**
   - A recipient can re-share plaintext they decrypted.

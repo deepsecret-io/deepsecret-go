@@ -51,11 +51,15 @@
 //
 // Extraction is hardened against:
 //   - Path traversal (../ in entry names)
-//   - Symlink escape (entries that resolve through symlinks; note: not
-//     race-free against concurrent local filesystem attackers)
+//   - Symlink traversal: no entry, hard link source or recorded path may
+//     pass through a symlink or other non-directory below the output
+//     directory, and AllowOverwrite never replaces a directory, so cleanup
+//     and directory times only touch what extraction created (not race-free
+//     against concurrent local filesystem attackers)
 //   - Archive bombs (configurable size and entry count limits, pre-checked
 //     before writing)
-//   - Dangerous entry types (symlinks, hardlinks, devices — all rejected)
+//   - Dangerous entry types (devices, FIFOs and sockets are rejected;
+//     symlinks and hard links are created only at the leaf)
 //   - Duplicate entry names (rejected on both creation and extraction)
 //
 // # Determinism

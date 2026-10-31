@@ -66,12 +66,13 @@
 //	// Seal once for every recipient
 //	payload, sealed, _ := crypto.SealBytes(plaintext, senderKP, []*crypto.PublicKeys{alicePub, bobPub}, crypto.SealParams{
 //	    RevisionID:  revisionID,
+//	    SecretName:  "db-password",
 //	    PayloadType: "message",
 //	})
 //
 //	// Open as one recipient, then decrypt the payload
 //	wrap, _ := sealed.Wrap(aliceFP)
-//	opened, _ := crypto.Open(sealed.ManifestData, wrap, aliceKP, crypto.OpenParams{RevisionID: revisionID})
+//	opened, _ := crypto.Open(sealed.ManifestData, wrap, aliceKP, crypto.OpenParams{RevisionID: revisionID, SecretName: "db-password"})
 //	defer opened.Close()
 //	plaintext, _ = opened.Decrypt(payload)
 package crypto

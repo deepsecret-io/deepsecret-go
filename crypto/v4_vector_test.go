@@ -18,6 +18,7 @@ import (
 var (
 	vecContentKey  = seq(0x00, 32)
 	vecRevisionID  = "00000000-0000-4000-8000-000000000000"
+	vecSecretName  = "prod database · token"
 	vecPayloadType = "message"
 	vecPlaintext   = []byte("hello, protocol v4")
 	vecSenderFP    = strings.Repeat("a1", 32)
@@ -37,6 +38,7 @@ func vecManifest(digest []byte, ctSize int64) *Manifest {
 		Version:           ProtocolVersion,
 		CipherSuite:       CipherSuite,
 		RevisionID:        vecRevisionID,
+		SecretName:        vecSecretName,
 		SenderFingerprint: vecSenderFP,
 		SenderED25519:     bytes.Repeat([]byte{0x01}, ED25519PubKeySize),
 		SenderX25519:      bytes.Repeat([]byte{0x02}, X25519PubKeySize),
@@ -89,7 +91,7 @@ func TestProtocolV4Vectors(t *testing.T) {
 		"payload_digest":    "3041ecd979c95f894064abbd6ae21b75774e4e8395e028fb9c865aadcd8c9a9e",
 		"wrap_info":         "ac64b46219d05d2ece03bd615ba5fcb1aa560d6e873a235800f1093f08b1b288",
 		"wrap_digest":       "c7590017027e790b898533ccbead4bbbca69cefae3a511afa16a77c743c52d30",
-		"manifest_signable": "e4b399964ca3012cc3e269d2c6a2442865846e4223f5d7f138ba4c2c9fafa7ef",
+		"manifest_signable": "78046c933d4c1d7204637cdc123371653439e7342490cef668b800eecfb739cc",
 	}
 	for k, v := range want {
 		if got[k] != v {

@@ -193,6 +193,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	tEnc := time.Now()
 	sealed, written, err := sealPlaintext(c.api.Context(), f, p, algo, kp, pubs, crypto.SealParams{
 		RevisionID:  uuid.New().String(),
+		SecretName:  secretName(opt),
 		PayloadType: p.payloadType,
 		Compressed:  algo != compress.None,
 		Compression: string(algo),
@@ -331,8 +332,12 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if err != nil {
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
 	}
+	// A local file is opened by path, not by a name or id the server
+	// gives, so its manifest's own revision and name are the ones asked
+	// for. Result shows the signed name.
 	opened, err := crypto.Open(hdr.Manifest, wrap, kp, crypto.OpenParams{
 		RevisionID:    peek.RevisionID,
+		SecretName:    peek.SecretName,
 		SenderED25519: senderED25519,
 	})
 	if err != nil {
@@ -405,6 +410,8 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	}
 	o.Result = DecryptResult{
 		RevisionID:           m.RevisionID,
+		SecretName:           m.SecretName,
+		SignedAt:             time.Unix(m.Timestamp, 0),
 		SenderFingerprint:    m.SenderFingerprint,
 		SenderEmail:          hdr.SenderEmail,
 		SenderFirstUse:       senderFirst,

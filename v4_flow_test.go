@@ -300,8 +300,9 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err.Error())
 		return
 	}
+	name := strings.TrimSpace(req.Name) // the name the API stores the secret under
 	if m.Version != req.ProtocolVersion || m.CipherSuite != req.CipherSuite || req.KDF != crypto.KDF ||
-		m.RevisionID != req.RevisionID || m.CiphertextSize != req.Size ||
+		m.RevisionID != req.RevisionID || m.SecretName != name || m.CiphertextSize != req.Size ||
 		hex.EncodeToString(m.PayloadDigest) != req.ChecksumSHA256 || m.SenderFingerprint != req.KeyFingerprint {
 		fail(w, 400, "manifest does not agree with the request")
 		return
@@ -329,9 +330,9 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var revoked []map[string]string
-	s := f.secretByName(sender.id, req.Name)
+	s := f.secretByName(sender.id, name)
 	if s == nil {
-		s = &fakeSecret{id: fmt.Sprintf("10000000-0000-4000-8000-%012d", len(f.secrets)+1), name: req.Name, senderID: sender.id}
+		s = &fakeSecret{id: fmt.Sprintf("10000000-0000-4000-8000-%012d", len(f.secrets)+1), name: name, senderID: sender.id}
 		f.secrets[s.id] = s
 	} else {
 		var missing []string
@@ -715,6 +716,94 @@ func TestSendOnceToManyRecipients(t *testing.T) {
 
 	if _, err := f.client(alice.email).DecryptSecret(res.Secret.ID); err == nil || !strings.Contains(err.Error(), "not encrypted for your key") {
 		t.Fatalf("sender who is not a recipient: %v", err)
+	}
+}
+
+// nextSecond waits for the clock's next second, so a revision sealed after
+// it is signed later than one sealed before.
+func nextSecond() {
+	for now := time.Now().Unix(); time.Now().Unix() == now; {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A server controls which revision it names as a secret's latest, and what
+// it calls the secret. It cannot pass off another secret's revision from
+// the same sender, because the manifest signs the secret's name. It cannot
+// roll a secret back past a revision this device opened, because the
+// device keeps the newest signing time per secret. A revision requested by
+// id still opens.
+func TestServerCannotSwapOrRollBackRevisions(t *testing.T) {
+	f := newFakeAPI(t, "carol@example.com", "dave@example.com")
+	carol, dave := f.actors["carol@example.com"], f.actors["dave@example.com"]
+	send := func(name, text string) *EncryptResult {
+		t.Helper()
+		res, err := f.client(carol.email).EncryptText([]string{dave.email}, text, EncryptOptions{Name: name})
+		if err != nil {
+			t.Fatalf("send %s: %v", name, err)
+		}
+		return res
+	}
+	v1 := send("api-token", "TOKEN=v1-revoked")
+	nextSecond()
+	v2 := send(" api-token ", "TOKEN=v2-active") // the same secret: the name is signed and stored trimmed
+	other := send("other-app", "TOKEN=other-app")
+	if v2.Secret.ID != v1.Secret.ID || other.Secret.ID == v1.Secret.ID {
+		t.Fatalf("secrets %s, %s, %s", v1.Secret.ID, v2.Secret.ID, other.Secret.ID)
+	}
+	secret := f.secrets[v1.Secret.ID]
+	honest := slices.Clone(secret.revisions)
+	serve := func(revs ...*fakeRevision) {
+		f.mu.Lock()
+		secret.revisions = revs
+		f.mu.Unlock()
+	}
+	open := func(opt DecryptOptions) (*DecryptResult, error) {
+		return f.client(dave.email).DecryptSecretFull(v1.Secret.ID, opt)
+	}
+
+	got, err := open(DecryptOptions{})
+	if err != nil || got.Decrypted.Message != "TOKEN=v2-active" || got.RevisionID != v2.Secret.RevisionID ||
+		got.SecretName != "api-token" || got.SignedAt.IsZero() {
+		t.Fatalf("honest: %+v, %v", got, err)
+	}
+
+	// Rollback: the server names the first revision as the latest.
+	serve(honest[1], honest[0])
+	var stale *StaleRevisionError
+	if _, err := open(DecryptOptions{}); !errors.As(err, &stale) ||
+		stale.RevisionID != v1.Secret.RevisionID || stale.SecretName != "api-token" || stale.SenderEmail != carol.email {
+		t.Fatalf("rollback: %v", err)
+	}
+	// Requested by id, the older revision opens, and opening it does not
+	// make it the newest.
+	if got, err := open(DecryptOptions{Revision: v1.Secret.RevisionID}); err != nil || got.Decrypted.Message != "TOKEN=v1-revoked" {
+		t.Fatalf("older revision by id: %+v, %v", got, err)
+	}
+	if _, err := open(DecryptOptions{}); !errors.As(err, &stale) {
+		t.Fatalf("rollback after opening the older revision by id: %v", err)
+	}
+
+	// Swap: the server names other-app's revision as api-token's latest.
+	serve(honest[0], honest[1], f.revs[other.Secret.RevisionID])
+	if _, err := open(DecryptOptions{}); err == nil || !strings.Contains(err.Error(), `signed for secret "other-app"`) {
+		t.Fatalf("swap: %v", err)
+	}
+	// A server that also renames the secret gets the revision opened, but
+	// the result names the secret its sender signed.
+	f.mu.Lock()
+	secret.name = "other-app"
+	f.mu.Unlock()
+	if got, err := open(DecryptOptions{}); err != nil || got.SecretName != "other-app" {
+		t.Fatalf("swap with the name changed too: %+v, %v", got, err)
+	}
+
+	f.mu.Lock()
+	secret.name = "api-token"
+	f.mu.Unlock()
+	serve(honest...)
+	if got, err := open(DecryptOptions{}); err != nil || got.Decrypted.Message != "TOKEN=v2-active" {
+		t.Fatalf("honest again: %+v, %v", got, err)
 	}
 }
 

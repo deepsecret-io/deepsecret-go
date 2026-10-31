@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/deepsecret-io/sdk/compress"
 )
@@ -101,5 +102,102 @@ func TestWriteFileReportsFileLeftBehind(t *testing.T) {
 	_, _, err := WriteFile(out, "sub/a.txt", 0o600, r, 3, false, nil)
 	if err == nil || !strings.Contains(err.Error(), "size limit") || !strings.Contains(err.Error(), "left behind") {
 		t.Errorf("write: %v, want the size error and the file left behind", err)
+	}
+}
+
+// outsideVictim makes <base>/victim/f outside the output directory
+// <base>/out and returns both paths.
+func outsideVictim(t *testing.T) (out, victim string) {
+	t.Helper()
+	base := t.TempDir()
+	out = filepath.Join(base, "out")
+	victim = filepath.Join(base, "victim", "f")
+	mkdirOrFatal(t, out)
+	mkdirOrFatal(t, filepath.Dir(victim))
+	writeOrFatal(t, victim, []byte("victim"))
+	old := time.Date(2024, 2, 2, 2, 2, 2, 0, time.UTC)
+	if err := os.Chtimes(victim, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return out, victim
+}
+
+// With AllowOverwrite, an archive that writes through one of its own
+// symlinks, retargets that symlink outside and then fails must not make
+// the cleanup delete the file the retargeted path now names.
+func TestExtractTarCleanupStaysInsideOutputDir(t *testing.T) {
+	out, victim := outsideVictim(t)
+	data := buildTar(t,
+		tarTestEntry{typ: tar.TypeDir, name: "c/", mode: 0o755},
+		tarTestEntry{typ: tar.TypeDir, name: "a/", mode: 0o755},
+		tarTestEntry{typ: tar.TypeSymlink, name: "a/b", link: "../c"},
+		tarTestEntry{typ: tar.TypeReg, name: "a/b/f", mode: 0o644, data: []byte("inside")},
+		tarTestEntry{typ: tar.TypeSymlink, name: "l2", link: "a"},
+		tarTestEntry{typ: tar.TypeSymlink, name: "l2/b", link: "../../victim"},
+		tarTestEntry{typ: tar.TypeSymlink, name: "dot", link: "."},
+		tarTestEntry{typ: tar.TypeSymlink, name: "dot/l2", link: "zzz"},
+		tarTestEntry{typ: tar.TypeFifo, name: "trigger"},
+	)
+	if _, err := ExtractTar(data, out, compress.None, &Limits{AllowOverwrite: true}); err == nil {
+		t.Fatal("extraction through an in-archive symlink succeeded")
+	}
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "victim" {
+		t.Fatalf("file outside the output directory: %q, %v", got, err)
+	}
+}
+
+// Directory times are restored only on real directories: a symlink an
+// archive put on a recorded directory path cannot redirect the restore.
+func TestExtractTarDirectoryTimesStayInside(t *testing.T) {
+	out, victim := outsideVictim(t)
+	before, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := buildTar(t,
+		tarTestEntry{typ: tar.TypeDir, name: "real/", mode: 0o755},
+		tarTestEntry{typ: tar.TypeSymlink, name: "link", link: "real"},
+		tarTestEntry{typ: tar.TypeDir, name: "link/sub/", mode: 0o755, mtime: time.Date(2000, 1, 2, 3, 4, 5, 0, time.UTC)},
+		tarTestEntry{typ: tar.TypeSymlink, name: "real/sub", link: "../../victim/f"},
+	)
+	_, _ = ExtractTar(data, out, compress.None, &Limits{AllowOverwrite: true})
+	after, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("mtime of the file outside changed from %v to %v", before.ModTime(), after.ModTime())
+	}
+}
+
+// An entry is never created through a symlink, whether the archive made it
+// or it was already in the output directory.
+func TestExtractTarRefusesEntriesThroughSymlinks(t *testing.T) {
+	out, _ := outsideVictim(t)
+	mkdirOrFatal(t, filepath.Join(out, "real"))
+	if err := os.Symlink("real", filepath.Join(out, "link")); err != nil {
+		t.Fatal(err)
+	}
+	data := buildTar(t, tarTestEntry{typ: tar.TypeReg, name: "link/f", mode: 0o644, data: []byte("x")})
+	_, err := ExtractTar(data, out, compress.None, &Limits{AllowOverwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "is not a directory") {
+		t.Fatalf("entry through an existing symlink: %v, want a refusal", err)
+	}
+	if _, err := os.Lstat(filepath.Join(out, "real", "f")); !os.IsNotExist(err) {
+		t.Errorf("file was written through the symlink: %v", err)
+	}
+}
+
+// With AllowOverwrite a symlink may replace a file but never a directory.
+func TestExtractTarNeverReplacesDirectories(t *testing.T) {
+	out, _ := outsideVictim(t)
+	mkdirOrFatal(t, filepath.Join(out, "d"))
+	data := buildTar(t, tarTestEntry{typ: tar.TypeSymlink, name: "d", link: "elsewhere"})
+	_, err := ExtractTar(data, out, compress.None, &Limits{AllowOverwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("symlink over a directory: %v, want a refusal", err)
+	}
+	if info, err := os.Lstat(filepath.Join(out, "d")); err != nil || !info.IsDir() {
+		t.Errorf("directory was replaced: %v", err)
 	}
 }

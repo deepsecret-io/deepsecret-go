@@ -233,9 +233,20 @@ belongs to:
   (`KeyChangedError.Replaced`) until it is accepted again. `KnownKeys`
   lists what this device knows, your own accounts included.
 
-Known keys are kept per API server in `~/.deepsecret/known_keys.json`
-(mode 0600; `SetKnownKeysFile` moves it). A damaged file refuses sends
-rather than accepting any key again.
+- **Which secret, which version.** Every revision's manifest signs the
+  name of the secret it belongs to, and a decrypt refuses a revision
+  signed for another secret than the one opened. The server names the
+  secret too, so `DecryptResult.SecretName` and `SignedAt` carry what the
+  sender signed: show them, or compare the name with the secret you meant
+  to open. Opening a secret's latest revision also refuses one signed
+  before a revision of that secret this device already opened, with a
+  `*StaleRevisionError` (a possible rollback by the server). Setting
+  `DecryptOptions.Revision` opens an older revision on purpose.
+
+Known keys, and the newest signing time opened per secret, are kept per
+API server in `~/.deepsecret/known_keys.json` (mode 0600;
+`SetKnownKeysFile` moves it). A damaged file refuses sends rather than
+accepting any key again.
 
 ## Packages
 

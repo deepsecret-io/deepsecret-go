@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/deepsecret-io/sdk/compress"
 )
@@ -100,7 +101,7 @@ func buildTar(t *testing.T, entries ...tarTestEntry) []byte {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	for _, e := range entries {
-		hdr := &tar.Header{Format: tar.FormatPAX, Typeflag: e.typ, Name: e.name, Linkname: e.link, Mode: e.mode, Size: int64(len(e.data)), PAXRecords: e.pax}
+		hdr := &tar.Header{Format: tar.FormatPAX, Typeflag: e.typ, Name: e.name, Linkname: e.link, Mode: e.mode, Size: int64(len(e.data)), ModTime: e.mtime, PAXRecords: e.pax}
 		if e.typ != tar.TypeReg {
 			hdr.Size = 0
 		}
@@ -120,12 +121,13 @@ func buildTar(t *testing.T, entries ...tarTestEntry) []byte {
 }
 
 type tarTestEntry struct {
-	typ  byte
-	name string
-	link string // a symlink's or hard link's target
-	mode int64
-	data []byte
-	pax  map[string]string
+	typ   byte
+	name  string
+	link  string // a symlink's or hard link's target
+	mode  int64
+	data  []byte
+	pax   map[string]string
+	mtime time.Time
 }
 
 // A directory entry that names a directory already there leaves it as it

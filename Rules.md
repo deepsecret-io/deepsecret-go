@@ -85,6 +85,7 @@ Never expose raw endpoint logic to callers.
   - signature verification
   - AAD binding
   - payload digest verified against the signed manifest before plaintext is released
+  - the signed secret name checked against the secret opened, and a latest revision signed before one already opened refused
 
 10. Forward secrecy
 - Always use ephemeral sender keys

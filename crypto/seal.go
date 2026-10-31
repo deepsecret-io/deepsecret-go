@@ -21,6 +21,7 @@ import (
 // SealParams describes the revision being sealed.
 type SealParams struct {
 	RevisionID  string // the revision id the payload is bound to
+	SecretName  string // the name of the secret the revision belongs to, as the API stores it
 	PayloadType string // "message", "data" or "files"
 	Compressed  bool   // whether the plaintext was compressed first
 	Compression string // "zstd" or ""
@@ -53,6 +54,9 @@ func (s *Sealed) Wrap(fp string) (*Wrap, bool) {
 func Seal(dst io.Writer, src io.Reader, sender *KeyPair, recipients []*PublicKeys, p SealParams) (*Sealed, error) {
 	if p.RevisionID == "" || len(p.RevisionID) > maxRevisionIDLen {
 		return nil, fmt.Errorf("revision id must be 1 to %d bytes", maxRevisionIDLen)
+	}
+	if err := validateSecretName(p.SecretName); err != nil {
+		return nil, err
 	}
 	if err := validatePayloadParams(p.PayloadType, p.Compressed, p.Compression); err != nil {
 		return nil, err
@@ -99,6 +103,7 @@ func Seal(dst io.Writer, src io.Reader, sender *KeyPair, recipients []*PublicKey
 		Version:           ProtocolVersion,
 		CipherSuite:       CipherSuite,
 		RevisionID:        p.RevisionID,
+		SecretName:        p.SecretName,
 		SenderFingerprint: signer.fp,
 		SenderED25519:     signer.edPub,
 		SenderX25519:      signer.x25519Pub,
@@ -147,10 +152,11 @@ func SealBytes(plaintext []byte, sender *KeyPair, recipients []*PublicKeys, p Se
 	return out.Bytes(), sealed, nil
 }
 
-// OpenParams says which revision the caller asked for and, optionally,
-// which Ed25519 key the sender is expected to hold.
+// OpenParams says which revision of which secret the caller asked for and,
+// optionally, which Ed25519 key the sender is expected to hold.
 type OpenParams struct {
 	RevisionID    string // required: the manifest must be for this revision
+	SecretName    string // required: the manifest must be signed for this secret name
 	SenderED25519 string // optional base64 key, cross-checked against the manifest
 }
 
@@ -163,8 +169,8 @@ type Opened struct {
 
 // Open performs steps 2 to 4 of opening a revision: it verifies the
 // manifest's sender binding and both signatures, checks that the manifest
-// is for the requested revision and lists the caller with this exact wrap,
-// and opens the wrap. The payload is checked and decrypted afterwards with
+// is for the requested revision of the requested secret and lists the
+// caller with this exact wrap, and opens the wrap. The payload is checked and decrypted afterwards with
 // Decrypt or DecryptTo.
 func Open(manifestData []byte, w *Wrap, kp *KeyPair, p OpenParams) (*Opened, error) {
 	if kp == nil {
@@ -188,6 +194,9 @@ func Open(manifestData []byte, w *Wrap, kp *KeyPair, p OpenParams) (*Opened, err
 	}
 	if p.RevisionID == "" || m.RevisionID != p.RevisionID {
 		return nil, fmt.Errorf("manifest is for revision %q, not the requested %q", m.RevisionID, p.RevisionID)
+	}
+	if p.SecretName == "" || m.SecretName != p.SecretName {
+		return nil, fmt.Errorf("manifest is signed for secret %q, not the requested %q", m.SecretName, p.SecretName)
 	}
 
 	localFP, err := Fingerprint(kp)

@@ -682,8 +682,10 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	api.Module(log, "encrypt").Debug("ciphertext storage", sp.logArgs(spoolNeed(p.size))...)
 
 	tEnc := time.Now()
+	name := secretName(opt)
 	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
 		RevisionID:  revisionID,
+		SecretName:  name,
 		PayloadType: p.payloadType,
 		Compressed:  algo != compress.None,
 		Compression: string(algo),
@@ -717,12 +719,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		sentTo[i] = Recipient{Email: recipients[i], Fingerprint: pub.Fingerprint}
 	}
 
-	name := opt.Name
-	if name == "" {
-		name = fmt.Sprintf("sdk-%d", time.Now().Unix())
-	}
-
-	// The server checks the manifest against revision_id, size,
+	// The server checks the manifest against revision_id, name, size,
 	// checksum_sha256 and key_fingerprint, so they are taken from it.
 	req := &secrets.CreateRequest{
 		OrgID:           actorInfo.OrgID,
@@ -920,6 +917,16 @@ func keyTrust(own, first bool) string {
 		return "first_use"
 	}
 	return "known"
+}
+
+// secretName is the name a send goes under: opt.Name without surrounding
+// white space, as the API stores it, or "sdk-" and the Unix time. The
+// manifest signs it, so it is chosen before sealing.
+func secretName(opt EncryptOptions) string {
+	if name := strings.TrimSpace(opt.Name); name != "" {
+		return name
+	}
+	return fmt.Sprintf("sdk-%d", time.Now().Unix())
 }
 
 // chooseCompression picks how p is compressed, and logs why. An archive is

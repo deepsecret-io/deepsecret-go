@@ -137,18 +137,27 @@ type OpenedSecret struct {
 	// decrypt succeeds (Result.SenderFirstUse); nil when there is nothing
 	// to record or it is done.
 	recordSender func() error
+	// recordNewest records the revision's signing time as the newest of
+	// its secret once a decrypt succeeds; nil for a local file or when it
+	// is done.
+	recordNewest func() error
 }
 
 // decrypted records, once a decrypt succeeded, the sender's key it relied
-// on as new to this device.
+// on as new to this device and the revision's signing time.
 func (o *OpenedSecret) decrypted() error {
-	if o.recordSender == nil {
-		return nil
+	if o.recordSender != nil {
+		if err := o.recordSender(); err != nil {
+			return fmt.Errorf("recording the sender's key on this device failed: %w", err)
+		}
+		o.recordSender = nil
 	}
-	if err := o.recordSender(); err != nil {
-		return fmt.Errorf("recording the sender's key on this device failed: %w", err)
+	if o.recordNewest != nil {
+		if err := o.recordNewest(); err != nil {
+			return fmt.Errorf("recording the revision's signing time on this device failed: %w", err)
+		}
+		o.recordNewest = nil
 	}
-	o.recordSender = nil
 	return nil
 }
 
@@ -240,13 +249,22 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
+	// The server names the sender: hold its email to the rule local files
+	// follow, so a lookalike with spaces or controls cannot dodge the pins.
+	if !plausibleEmail(senderEmail) {
+		return nil, fmt.Errorf("the server gave an invalid sender email %q", senderEmail)
+	}
 	senderED25519, err := identity.ResolveED25519ByEmail(c.api, senderEmail, peek.SenderFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
 
+	// The manifest must be signed for this secret's name, so a revision of
+	// another secret from the same sender is refused. The server names the
+	// secret too, so Result carries the signed name to show.
 	opened, err := crypto.Open(rm.Manifest, wrap, kp, crypto.OpenParams{
 		RevisionID:    targetRevID,
+		SecretName:    secretInfo.Name,
 		SenderED25519: senderED25519,
 	})
 	if err != nil {
@@ -258,6 +276,14 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	if err != nil {
 		opened.Close()
 		return nil, fmt.Errorf("check sender %s: %w", senderEmail, err)
+	}
+	// The server picks the latest revision: one signed before a revision
+	// of this secret already opened here is refused as a rollback.
+	if opt.Revision == "" {
+		if err := c.checkNewest(senderEmail, m); err != nil {
+			opened.Close()
+			return nil, err
+		}
 	}
 
 	maxSize := opt.MaxDownloadSize
@@ -300,7 +326,8 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		}
 	}
 	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), log: log, onProgress: opt.OnDecryptProgress,
-		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, senderFirst)}
+		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, senderFirst),
+		recordNewest: c.newestRecorder(senderEmail, m)}
 
 	// Download the ciphertext into the spool, or the ranges a kept
 	// download lacks.
@@ -341,6 +368,8 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 
 	o.Result = DecryptResult{
 		RevisionID:           targetRevID,
+		SecretName:           m.SecretName,
+		SignedAt:             time.Unix(m.Timestamp, 0),
 		SenderFingerprint:    m.SenderFingerprint,
 		SenderEmail:          senderEmail,
 		SenderFirstUse:       senderFirst,

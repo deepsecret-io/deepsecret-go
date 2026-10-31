@@ -5,6 +5,7 @@ package sdk
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/compress"
@@ -90,6 +91,10 @@ type KeyValue = payload.KeyValue
 
 // EncryptOptions configures encryption and upload behavior.
 type EncryptOptions struct {
+	// Name is the secret's name, without surrounding white space: a send
+	// under a name the sender already has adds a revision to that secret.
+	// The manifest signs it, so recipients can tell which secret a revision
+	// belongs to. Empty means "sdk-" and the Unix time.
 	Name       string
 	Compress   compress.Algorithm
 	Archive    bool
@@ -300,7 +305,9 @@ type UpcomingDownload struct {
 // the verified manifest.
 type DecryptResult struct {
 	Decrypted            *payload.Decrypted
-	RevisionID           string // UUID of the revision that was decrypted (resolved if Revision was empty)
+	RevisionID           string    // UUID of the revision that was decrypted (resolved if Revision was empty)
+	SecretName           string    // the secret name the sender signed: the server names the secret too, so show it or compare it with the secret you meant to open
+	SignedAt             time.Time // when the sender signed the revision, by their clock
 	SenderFingerprint    string
 	SenderEmail          string      // the sender, whose registered key signed the manifest
 	SenderFirstUse       bool        // the sender's key was new to this device, accepted on first use: worth comparing with them

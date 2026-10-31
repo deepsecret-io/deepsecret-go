@@ -41,7 +41,7 @@ func randomBytes(t *testing.T, n int) []byte {
 	return b
 }
 
-var msgParams = SealParams{RevisionID: "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70", PayloadType: "message"}
+var msgParams = SealParams{RevisionID: "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70", SecretName: "db-password", PayloadType: "message"}
 
 func seal(t *testing.T, plaintext []byte, sender party, p SealParams, recipients ...party) ([]byte, *Sealed) {
 	t.Helper()
@@ -67,7 +67,7 @@ func wrapData(t *testing.T, s *Sealed, fp string) *Wrap {
 
 func open(t *testing.T, s *Sealed, r party, revisionID string) *Opened {
 	t.Helper()
-	o, err := Open(s.ManifestData, wrapData(t, s, r.fp), r.kp, OpenParams{RevisionID: revisionID})
+	o, err := Open(s.ManifestData, wrapData(t, s, r.fp), r.kp, OpenParams{RevisionID: revisionID, SecretName: msgParams.SecretName})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -111,8 +111,14 @@ func TestSealRejectsBadInput(t *testing.T) {
 	}{
 		"no recipients":     {nil, msgParams, "recipients"},
 		"duplicate":         {[]*PublicKeys{alice.pub, alice.pub}, msgParams, "listed twice"},
-		"no revision":       {[]*PublicKeys{alice.pub}, SealParams{PayloadType: "message"}, "revision id"},
-		"bad payload type":  {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", PayloadType: "exe"}, "payload type"},
+		"no revision":       {[]*PublicKeys{alice.pub}, SealParams{SecretName: "n", PayloadType: "message"}, "revision id"},
+		"no secret name":    {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", PayloadType: "message"}, "secret name"},
+		"padded name":       {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token ", PayloadType: "message"}, "white space"},
+		"line break":        {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\nRun: rm", PayloadType: "message"}, "control"},
+		"bidi override":     {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "invoice‮txt.exe", PayloadType: "message"}, "bidi"},
+		"name not utf-8":    {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\xff", PayloadType: "message"}, "UTF-8"},
+		"name too long":     {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: strings.Repeat("a", maxSecretNameLen+1), PayloadType: "message"}, "secret name"},
+		"bad payload type":  {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "n", PayloadType: "exe"}, "payload type"},
 		"wrong fingerprint": {[]*PublicKeys{{ED25519: alice.pub.ED25519, X25519: alice.pub.X25519, MLKEM768: alice.pub.MLKEM768, MLDSA65: alice.pub.MLDSA65, Fingerprint: strings.Repeat("a", 64)}}, msgParams, "fingerprint mismatch"},
 	}
 	for name, c := range cases {
@@ -123,25 +129,32 @@ func TestSealRejectsBadInput(t *testing.T) {
 }
 
 // Open refuses anyone not listed, a wrap made for someone else, a wrap from
-// another revision, and a manifest for another revision.
+// another revision, a manifest for another revision, and one signed for
+// another secret: a server cannot pass one secret's revision off as
+// another's, even from the same sender.
 func TestOpenRefusesWrongRecipientWrapOrRevision(t *testing.T) {
 	sender, alice, bob, eve := newParty(t), newParty(t), newParty(t), newParty(t)
 	_, sealed := seal(t, []byte("payload"), sender, msgParams, alice, bob)
 
-	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), eve.kp, OpenParams{RevisionID: msgParams.RevisionID}); err == nil || !strings.Contains(err.Error(), "not encrypted for your key") {
+	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), eve.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); err == nil || !strings.Contains(err.Error(), "not encrypted for your key") {
 		t.Errorf("non-recipient: %v", err)
 	}
-	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), bob.kp, OpenParams{RevisionID: msgParams.RevisionID}); err == nil || !strings.Contains(err.Error(), "wrap does not match") {
+	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), bob.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); err == nil || !strings.Contains(err.Error(), "wrap does not match") {
 		t.Errorf("someone else's wrap: %v", err)
 	}
 	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: "another-revision"}); err == nil || !strings.Contains(err.Error(), "not the requested") {
 		t.Errorf("other revision: %v", err)
 	}
+	for _, name := range []string{"api-token", ""} {
+		if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: name}); err == nil || !strings.Contains(err.Error(), "signed for secret") {
+			t.Errorf("other secret %q: %v", name, err)
+		}
+	}
 
 	other := msgParams
 	other.RevisionID = "5a0d2f6b-9c3e-4d4f-8a2b-3c4d5e6f7081"
 	_, sealed2 := seal(t, []byte("payload"), sender, other, alice)
-	if _, err := Open(sealed.ManifestData, wrapData(t, sealed2, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID}); err == nil || !strings.Contains(err.Error(), "wrap does not match") {
+	if _, err := Open(sealed.ManifestData, wrapData(t, sealed2, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); err == nil || !strings.Contains(err.Error(), "wrap does not match") {
 		t.Errorf("wrap moved from another revision: %v", err)
 	}
 }
@@ -163,6 +176,7 @@ func TestOpenRefusesTamperedManifest(t *testing.T) {
 		"payload digest": func(m *Manifest) { m.PayloadDigest[0] ^= 1 },
 		"payload type":   func(m *Manifest) { m.PayloadType = "data" },
 		"timestamp":      func(m *Manifest) { m.Timestamp++ },
+		"secret name":    func(m *Manifest) { m.SecretName = "api-token" },
 	}
 	for name, change := range tamper {
 		m, err := UnmarshalManifest(sealed.ManifestData)
@@ -174,7 +188,7 @@ func TestOpenRefusesTamperedManifest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Open(data, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID}); err == nil || !strings.Contains(err.Error(), "signature verification failed") {
+		if _, err := Open(data, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); err == nil || !strings.Contains(err.Error(), "signature verification failed") {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -186,7 +200,7 @@ func TestOpenRefusesTamperedManifest(t *testing.T) {
 		t.Errorf("unsorted recipients: %v", err)
 	}
 
-	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SenderED25519: bob.kp.ED25519Public}); err == nil || !strings.Contains(err.Error(), "does not match the expected key") {
+	if _, err := Open(sealed.ManifestData, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName, SenderED25519: bob.kp.ED25519Public}); err == nil || !strings.Contains(err.Error(), "does not match the expected key") {
 		t.Errorf("unexpected sender key: %v", err)
 	}
 }

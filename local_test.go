@@ -38,7 +38,7 @@ func TestLocalFileRoundTrip(t *testing.T) {
 	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
 	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
 
-	res, err := f.client(alice.email).EncryptText([]string{bob.email, carol.email}, "offline hello", EncryptOptions{LocalFile: path})
+	res, err := f.client(alice.email).EncryptText([]string{bob.email, carol.email}, "offline hello", EncryptOptions{Name: "note", LocalFile: path})
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
@@ -63,6 +63,9 @@ func TestLocalFileRoundTrip(t *testing.T) {
 		}
 		if out.Decrypted.Message != "offline hello" || out.SenderEmail != alice.email || out.SenderFingerprint != alice.fp || out.RecipientFingerprint != r.fp {
 			t.Fatalf("%s: got %+v", r.email, out)
+		}
+		if out.SecretName != "note" || out.SignedAt.IsZero() {
+			t.Fatalf("%s: signed name %q at %v", r.email, out.SecretName, out.SignedAt)
 		}
 		for _, sr := range out.Recipients {
 			if (sr.Fingerprint == bob.fp) != (sr.Email == bob.email) || sr.Email == "" {
