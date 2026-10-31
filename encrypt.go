@@ -159,10 +159,7 @@ func (c *Client) EncryptDir(recipients []string, dirPath string, opt EncryptOpti
 		return nil, err
 	}
 
-	archiveOn, archiveReason, err := c.shouldArchive(expanded, opt)
-	if err != nil {
-		return nil, err
-	}
+	archiveOn, archiveReason := shouldArchive(expanded, opt)
 	emitArchiveDecision(opt, archiveOn, archiveReason, expanded)
 	if archiveOn {
 		return c.encryptArchive(recipients, expanded, opt)
@@ -185,10 +182,7 @@ func (c *Client) EncryptPaths(recipients []string, paths []string, opt EncryptOp
 		return nil, err
 	}
 
-	archiveOn, archiveReason, err := c.shouldArchive(expanded, opt)
-	if err != nil {
-		return nil, err
-	}
+	archiveOn, archiveReason := shouldArchive(expanded, opt)
 	emitArchiveDecision(opt, archiveOn, archiveReason, expanded)
 	if archiveOn {
 		return c.encryptArchive(recipients, expanded, opt)
@@ -272,9 +266,10 @@ func preflightExpandedSize(expanded []archive.ExpandedFile, limit int64) (int64,
 //  2. Any expanded entry is a SYMLINK: the flat per-file payload format
 //     has no encoding for link targets, so a tree containing symlinks
 //     can only round-trip through tar.
-//  3. opt.AutoArchive is on AND the total file count exceeds the org's
-//     tier MaxFilesPerSecret: auto-bundling lets users send larger
-//     trees within their tier, at the cost of per-file metadata privacy.
+//  3. opt.AutoArchive is on AND there are more than autoArchiveFiles
+//     regular files: one archive keeps a large tree to one upload and one
+//     download, at the cost of the per-file metadata the server would
+//     otherwise see.
 //
 // Notes intentionally NOT triggering archive:
 //   - Plain directory entries: the flat path preserves directory structure
@@ -284,50 +279,37 @@ func preflightExpandedSize(expanded []archive.ExpandedFile, limit int64) (int64,
 //   - Empty directories: lost in the flat path. Operators who need them
 //     preserved can pass --archive.
 //
-// Server-side tier enforcement still applies: CheckFilesQuota rejects any
-// CreateSecret request whose declared files_count exceeds tier.MaxFilesPerSecret.
-// A modified client that skips auto-archive and submits an over-tier file
-// count is rejected at the API boundary.
+// The server enforces the tier's file limit on its own: CheckFilesQuota
+// rejects a CreateSecret whose files_count exceeds tier.MaxFilesPerSecret,
+// whatever the client decided here.
 //
-// Returns (archive, reason, err).
-func (c *Client) shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions) (bool, string, error) {
+// Returns (archive, reason).
+func shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions) (bool, string) {
 	if opt.Archive {
-		return true, "requested", nil
+		return true, "requested"
 	}
 	for _, ef := range expanded {
 		if ef.IsSymlink {
-			return true, fmt.Sprintf("%s is a symbolic link, and only an archive carries link targets", ef.RelPath), nil
+			return true, fmt.Sprintf("%s is a symbolic link, and only an archive carries link targets", ef.RelPath)
 		}
 	}
 	if !opt.AutoArchive {
-		return false, "not requested", nil
+		return false, "not requested"
 	}
-	info, err := identity.WhoAmI(c.api)
-	if err != nil {
-		return false, "", fmt.Errorf("fetch tier info: %w", err)
+	// Directory entries only place the files: count the regular files.
+	n := regularFiles(expanded)
+	if n > autoArchiveFiles {
+		return true, fmt.Sprintf("%d files: more than %d are sent as one archive", n, autoArchiveFiles)
 	}
-	// Phase 5 removed per-tier limits from /api/me (the spec keeps the
-	// authz state on actors, billing-display on subscriptions). The
-	// SDK no longer mirrors max_files_per_secret client-side; the
-	// server CreateSecret handler enforces the cap. Use a generous
-	// default for the auto-archive heuristic so legitimate large
-	// directories still trip auto-archive without an extra fetch.
-	_ = info
-	maxFiles := 50
-	// Count only regular file entries against the tier cap; directory
-	// entries are structural placeholders, not files the server would
-	// charge.
-	regularCount := 0
-	for _, ef := range expanded {
-		if !ef.IsDir {
-			regularCount++
-		}
+	if n == 1 {
+		return false, fmt.Sprintf("1 file: up to %d are sent without an archive", autoArchiveFiles)
 	}
-	if regularCount > maxFiles {
-		return true, fmt.Sprintf("%d files, more than the %d sent without an archive", regularCount, maxFiles), nil
-	}
-	return false, fmt.Sprintf("%d files, at most the %d sent without an archive", regularCount, maxFiles), nil
+	return false, fmt.Sprintf("%d files: up to %d are sent without an archive", n, autoArchiveFiles)
 }
+
+// autoArchiveFiles is the most regular files a send with AutoArchive
+// sends one by one; more go in one archive.
+const autoArchiveFiles = 50
 
 func (c *Client) encryptExpandedFiles(recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
 	if _, err := preflightExpandedSize(expanded, maxPayloadSize(opt)); err != nil {
@@ -793,7 +775,9 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if len(req.AllowedIPs) > 0 {
 		createArgs = append(createArgs, "allowed_ips", len(req.AllowedIPs))
 	}
-	secretLog.Debug("creating secret", createArgs...)
+	// The server adds a revision to a secret of this name the sender has,
+	// or creates the secret with this as its first revision.
+	secretLog.Debug("creating revision", createArgs...)
 	secret, revoked, err := secrets.Create(c.api, req)
 	if err != nil {
 		// A send under an existing name that leaves out people who have
@@ -805,7 +789,11 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		}
 		return nil, err
 	}
-	secretLog.Info("secret created", "secret_id", secret.ID, "revision_id", revisionID, "multipart", secret.IsMultipart)
+	if secret.RevisionNumber > 1 {
+		secretLog.Info("revision added", "secret_id", secret.ID, "revision_id", revisionID, "revision", secret.RevisionNumber, "multipart", secret.IsMultipart)
+	} else {
+		secretLog.Info("secret created", "secret_id", secret.ID, "revision_id", revisionID, "multipart", secret.IsMultipart)
+	}
 	for _, r := range revoked {
 		secretLog.Info("access revoked", "secret_id", secret.ID, "actor_id", r.ID, "email", r.Email)
 	}

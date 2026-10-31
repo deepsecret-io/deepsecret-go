@@ -359,7 +359,7 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 	rev.secretID = s.id
 	s.revisions = append(s.revisions, rev)
 	f.revs[rev.id] = rev
-	revision := map[string]any{"id": rev.id, "is_multipart": false}
+	revision := map[string]any{"id": rev.id, "revision_number": len(s.revisions), "is_multipart": false}
 	if req.Size >= f.multipartAt {
 		revision["is_multipart"], revision["multipart_part_size"] = true, f.partSize
 	}

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/sdk/archive"
 )
 
 // flowLog keeps every record a flow logs, at every level: its module
@@ -51,6 +52,13 @@ func (l *flowLog) has(t *testing.T, level slog.Level, module, msg string, fields
 		return
 	}
 	t.Errorf("no %q record in %q", msg, module)
+}
+
+// find reports whether a record of module with message msg was logged.
+func (l *flowLog) find(module, msg string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.ContainsFunc(l.records, func(r flowRecord) bool { return r.module == module && r.msg == msg })
 }
 
 type flowHandler struct {
@@ -93,7 +101,7 @@ func TestFlowLogs(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	const text = "the vault code is 7319-alpha"
 	var sent, opened flowLog
-	res, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, text, EncryptOptions{Logger: sent.logger()})
+	res, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: sent.logger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +116,7 @@ func TestFlowLogs(t *testing.T) {
 	sent.has(t, slog.LevelDebug, "encrypt", "ciphertext storage", "where=memory")
 	sent.has(t, slog.LevelInfo, "encrypt", "payload encrypted")
 	sent.has(t, slog.LevelDebug, "manifest", "manifest signed", "revision_id="+res.Secret.RevisionID, "recipients=1")
+	sent.has(t, slog.LevelDebug, "secret", "creating revision", "name=vault code")
 	sent.has(t, slog.LevelInfo, "secret", "secret created", "secret_id="+res.Secret.ID, "multipart=false")
 	sent.has(t, slog.LevelDebug, "upload", "plan", "transfer=single", "url_expiry=30m0s")
 	sent.has(t, slog.LevelInfo, "upload", "upload complete", "parts=1")
@@ -120,12 +129,59 @@ func TestFlowLogs(t *testing.T) {
 	opened.has(t, slog.LevelDebug, "verify", "payload verified")
 	opened.has(t, slog.LevelInfo, "decrypt", "payload decrypted")
 
-	for _, l := range []*flowLog{&sent, &opened} {
+	// A send under the same name adds a revision to the secret, and says
+	// so rather than that it created one.
+	var again flowLog
+	res2, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: again.logger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Secret.RevisionNumber != 1 || res2.Secret.ID != res.Secret.ID || res2.Secret.RevisionNumber != 2 {
+		t.Fatalf("revisions: first %d of %s, second %d of %s", res.Secret.RevisionNumber, res.Secret.ID, res2.Secret.RevisionNumber, res2.Secret.ID)
+	}
+	again.has(t, slog.LevelInfo, "secret", "revision added", "secret_id="+res.Secret.ID, "revision=2")
+	if again.find("secret", "secret created") {
+		t.Fatal("a second revision was logged as a new secret")
+	}
+
+	for _, l := range []*flowLog{&sent, &opened, &again} {
 		for _, r := range l.records {
 			line := r.module + ": " + r.msg + ": " + r.fields
 			if strings.Contains(line, "7319") || strings.Contains(line, "?t=") {
 				t.Fatalf("logged a secret: %s", line)
 			}
 		}
+	}
+}
+
+// Up to autoArchiveFiles regular files go without an archive and more in
+// one; directory entries do not count, and the reason counts the files in
+// the right number.
+func TestShouldArchive(t *testing.T) {
+	files := func(n int) []archive.ExpandedFile {
+		out := []archive.ExpandedFile{{RelPath: "dir", IsDir: true}}
+		for i := range n {
+			out = append(out, archive.ExpandedFile{RelPath: fmt.Sprintf("dir/f%d", i)})
+		}
+		return out
+	}
+	for _, c := range []struct {
+		n   int
+		on  bool
+		why string
+	}{
+		{1, false, "1 file: up to 50 are sent without an archive"},
+		{50, false, "50 files: up to 50 are sent without an archive"},
+		{51, true, "51 files: more than 50 are sent as one archive"},
+	} {
+		if on, why := shouldArchive(files(c.n), EncryptOptions{AutoArchive: true}); on != c.on || why != c.why {
+			t.Errorf("%d files: %v %q, want %v %q", c.n, on, why, c.on, c.why)
+		}
+	}
+	if on, why := shouldArchive(files(1), EncryptOptions{Archive: true}); !on || why != "requested" {
+		t.Errorf("--archive: %v %q", on, why)
+	}
+	if on, why := shouldArchive(files(60), EncryptOptions{}); on || why != "not requested" {
+		t.Errorf("without AutoArchive: %v %q", on, why)
 	}
 }

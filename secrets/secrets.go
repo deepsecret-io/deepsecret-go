@@ -22,11 +22,14 @@ import (
 // via the /multipart/* flow: the single-PUT presign endpoint rejects the
 // revision with a 409 Conflict.
 type Secret struct {
-	ID                string `json:"id"`
-	Name              string `json:"name"`
-	RevisionID        string `json:"revision_id"`
-	IsMultipart       bool   `json:"is_multipart"`
-	MultipartPartSize int64  `json:"multipart_part_size,omitempty"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	RevisionID string `json:"revision_id"`
+	// RevisionNumber is the revision's place in the secret, from 1: a send
+	// under the name of a secret the sender has adds a revision to it.
+	RevisionNumber    int   `json:"revision_number"`
+	IsMultipart       bool  `json:"is_multipart"`
+	MultipartPartSize int64 `json:"multipart_part_size,omitempty"`
 }
 
 // SecretInfo holds detailed metadata about a secret (returned by list/describe).
@@ -203,6 +206,7 @@ type CreateResponse struct {
 	} `json:"secret"`
 	Revision struct {
 		ID                string `json:"id"`
+		RevisionNumber    int    `json:"revision_number"`
 		IsMultipart       bool   `json:"is_multipart"`
 		MultipartState    string `json:"multipart_state,omitempty"`
 		MultipartPartSize int64  `json:"multipart_part_size,omitempty"`
@@ -229,6 +233,7 @@ func Create(c *api.Client, req *CreateRequest) (*Secret, []SecretRecipient, erro
 		ID:                created.Secret.ID,
 		Name:              created.Secret.Name,
 		RevisionID:        created.Revision.ID,
+		RevisionNumber:    created.Revision.RevisionNumber,
 		IsMultipart:       created.Revision.IsMultipart,
 		MultipartPartSize: created.Revision.MultipartPartSize,
 	}, created.Revoked, nil

@@ -199,20 +199,20 @@ func (c ctxReader) Read(p []byte) (int, error) {
 }
 
 // logArgs says where the spool keeps the ciphertext, as log fields: in
-// memory, or in its private directory, with when that is removed and the
-// free space its filesystem reports against need.
+// memory, or in its private directory, with when that is removed
+// (removed_when) and the free space its filesystem reports against need.
 func (s *spool) logArgs(need int64) []any {
 	if s.file == nil {
 		return []any{"where", "memory"}
 	}
-	removed := "when done"
+	removed := "done"
 	switch s.resume {
 	case "upload":
-		removed = "when done, unless a multipart upload fails and can resume"
+		removed = "done, unless a multipart upload fails and can resume"
 	case "download":
-		removed = "once the payload is decrypted or fails its check"
+		removed = "the payload is decrypted or fails its check"
 	}
-	args := []any{"where", s.dir, "removed", removed, "need", api.Bytes(need)}
+	args := []any{"where", s.dir, "removed_when", removed, "need", api.Bytes(need)}
 	if free, ok := freeDiskBytes(s.dir); ok {
 		args = append(args, "free", api.Bytes(free))
 	}
