@@ -150,7 +150,10 @@ func TestInterruptedDownloadResumes(t *testing.T) {
 
 // A download that finished, but whose files could not be written, stays:
 // the next decrypt fetches nothing, yet still presigns, which is where the
-// server applies the secret's policies and records the download.
+// server applies the secret's policies and records the download. Writing
+// goes through OpenSecret and WriteFiles here, without the destination
+// check DecryptToDir makes before downloading, as for a failure that check
+// could not predict.
 func TestFinishedDownloadIsKeptUntilDecrypted(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	dir := privateDir(t)
@@ -159,8 +162,15 @@ func TestFinishedDownloadIsKeptUntilDecrypted(t *testing.T) {
 	writeFile(t, filepath.Join(out, "backup.bin"), []byte("already here"), 0o600)
 
 	bob := f.client("bob@example.com")
-	if _, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("decrypt onto an existing file: %v", err)
+	o, err := bob.OpenSecret(secretID, DecryptOptions{ResumeDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.WriteFiles(out, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("write onto an existing file: %v", err)
+	}
+	if err := o.Close(); err != nil {
+		t.Fatal(err)
 	}
 	pending, err := ListPendingDownloads(dir)
 	if err != nil || len(pending) != 1 || pending[0].Downloaded() != pending[0].Size {

@@ -91,6 +91,20 @@ func (c *Client) DecryptRevisionFull(secretID string, opt DecryptOptions) (*Decr
 // DecryptToDir downloads a files secret and writes its files, or extracts
 // its archive, into dir, in constant memory. See OpenedSecret.WriteFiles.
 func (c *Client) DecryptToDir(secretID, dir string, opt DecryptOptions, w WriteOptions) (*DecryptResult, *WriteResult, error) {
+	// Check the destination before downloading, as WriteFiles will again
+	// with the payload's own names.
+	before := opt.BeforeDownload
+	opt.BeforeDownload = func(p UpcomingDownload) error {
+		if p.PayloadType == "files" {
+			if err := CheckDestination(dir, p.Files, w.Overwrite); err != nil {
+				return err
+			}
+		}
+		if before != nil {
+			return before(p)
+		}
+		return nil
+	}
 	o, err := c.OpenSecret(secretID, opt)
 	if err != nil {
 		return nil, nil, err
@@ -271,6 +285,13 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		opened.Close()
 		return nil, fmt.Errorf("the payload is %s, too large to decrypt in memory: write it to disk with DecryptToDir or WriteFiles",
 			humanBytes(m.CiphertextSize))
+	}
+	if opt.BeforeDownload != nil {
+		pending := UpcomingDownload{RevisionID: targetRevID, PayloadType: m.PayloadType, Size: m.CiphertextSize, Files: rev.FilesMeta}
+		if err := opt.BeforeDownload(pending); err != nil {
+			opened.Close()
+			return nil, err
+		}
 	}
 	var sp *spool
 	var journal *downloadJournal // a download kept under ResumeDir
@@ -544,6 +565,65 @@ func (w WriteOptions) limits() (payload.DecodeLimits, *archive.Limits) {
 	}
 	return payload.DecodeLimits{MaxFiles: files, MaxFileSize: size, MaxTotalSize: total},
 		&archive.Limits{MaxEntries: files, MaxEntrySize: size, MaxTotalSize: total, AllowOverwrite: w.Overwrite}
+}
+
+// CheckDestination checks, before a download, that the files of a pending
+// one (UpcomingDownload.Files) can be written into dir: dir, or the nearest
+// directory above it that exists, accepts new files; none of the files
+// exists there already unless overwrite; and the disk holds them. The list
+// comes from the server and is only a prediction: a name that is not a
+// safe relative path is skipped here, and WriteFiles checks the payload's
+// own names again before writing anything.
+func CheckDestination(dir string, files []FileMeta, overwrite bool) error {
+	if err := checkWritable(dir); err != nil {
+		return err
+	}
+	var total int64
+	for _, f := range files {
+		total += max(f.Size, 0)
+		name, err := archive.ValidateArchivePath(f.Name)
+		if err != nil {
+			continue
+		}
+		if err := checkDestination(dir, name, overwrite); err != nil {
+			return err
+		}
+	}
+	return checkFreeSpace(dir, total+total/100, "the decrypted files", "")
+}
+
+// checkWritable checks that dir, or the nearest directory above it that
+// exists, is a directory this process can create files in, by creating
+// and removing one.
+func checkWritable(dir string) error {
+	probe := filepath.Clean(dir)
+	for {
+		info, err := os.Stat(probe) // #nosec G703 -- the directory the caller writes to, or its parent.
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("cannot write into %s: %s is not a directory", dir, probe)
+			}
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check destination %s: %w", probe, err)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return fmt.Errorf("check destination %s: no existing directory above it", dir)
+		}
+		probe = parent
+	}
+	f, err := os.CreateTemp(probe, ".deepsecret-write-check-*")
+	if err != nil {
+		return fmt.Errorf("cannot write into %s: %w", probe, err)
+	}
+	name := f.Name()
+	_ = f.Close() // empty; removed next.
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("remove write check %s: %w", name, err)
+	}
+	return nil
 }
 
 // checkDestination refuses a payload entry that could not be written under

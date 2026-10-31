@@ -51,6 +51,7 @@ type fakeRevision struct {
 	id, secretID string
 	manifest     []byte
 	wraps        map[string]fakeWrap // by actor id
+	filesMeta    any                 // the files_meta of the create request, served back as the API does
 }
 
 type fakeSecret struct {
@@ -309,7 +310,7 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "manifest lists a different set of recipients")
 		return
 	}
-	rev := &fakeRevision{id: req.RevisionID, manifest: req.Manifest, wraps: map[string]fakeWrap{}}
+	rev := &fakeRevision{id: req.RevisionID, manifest: req.Manifest, wraps: map[string]fakeWrap{}, filesMeta: req.FilesMeta}
 	var ids []string
 	for _, in := range req.Recipients {
 		a := f.byID(in.RecipientID)
@@ -616,7 +617,7 @@ func (f *fakeAPI) revisions(w http.ResponseWriter, r *http.Request) {
 		for id, wr := range rev.wraps {
 			recipients = append(recipients, map[string]string{"id": id, "email": f.byID(id).email, "key_fingerprint": wr.fp})
 		}
-		out = append(out, map[string]any{"id": rev.id, "revision_number": i + 1,
+		out = append(out, map[string]any{"id": rev.id, "revision_number": i + 1, "files_meta": rev.filesMeta,
 			"integrity": map[string]any{"protocol_version": crypto.ProtocolVersion, "recipients": recipients}})
 	}
 	ok(w, map[string]any{"revisions": out, "total": len(out)})

@@ -273,6 +273,25 @@ type DecryptOptions struct {
 	// the download. Allowed range is 1-30 (server clamps at 30). 0 = default
 	// (DefaultPresignExpiryMinutes, currently 30).
 	PresignExpiryMinutes int
+
+	// BeforeDownload, when set, is called once the revision is verified
+	// and before its payload is downloaded, with what the download holds.
+	// An error from it stops the decrypt with nothing downloaded: a caller
+	// checks there that it can write the result, with CheckDestination for
+	// files. It is not called for a local file, which needs no download.
+	BeforeDownload func(UpcomingDownload) error
+}
+
+// UpcomingDownload is a verified revision about to be downloaded.
+type UpcomingDownload struct {
+	RevisionID  string
+	PayloadType string // from the signed manifest: "files", "message", ...
+	Size        int64  // ciphertext bytes, from the signed manifest
+	// Files is the server's list of the revision's files: empty for an
+	// archive sent without its names. It is not signed, so it only
+	// predicts what WriteFiles writes; WriteFiles checks the payload's own
+	// names again.
+	Files []FileMeta
 }
 
 // DecryptResult is returned by full decrypt methods with the metadata of
