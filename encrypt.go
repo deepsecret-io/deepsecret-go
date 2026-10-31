@@ -656,24 +656,36 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	debugf("identity", "sender fingerprint=%s", crypto.ShortFingerprint(senderFP))
 	debugf("verify", "sender identity loaded (X25519+Ed25519, ML-KEM-768+ML-DSA-65)")
 
-	// Resolve every recipient's primary keys and actor id. The sender is a
-	// recipient only when the caller listed them.
+	// Resolve every recipient's actor id and primary keys. The sender is a
+	// recipient only when the caller listed them: by one of their accounts
+	// this device recorded, the caller's among them, or by an address the
+	// server resolves to the caller's account.
+	known, err := c.recordOwnAccount(actorInfo.Email, senderFP, false)
+	if err != nil {
+		return nil, err
+	}
 	pubs := make([]*crypto.PublicKeys, len(recipients))
 	actorIDs := make([]string, len(recipients))
+	var firstUse []Recipient
 	for i, email := range recipients {
-		keys, err := c.recipientKeys(email)
-		if err != nil {
-			return nil, err
-		}
 		actorID, err := identity.ResolveRecipientID(c.api, email)
 		if err != nil {
 			return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
 		}
+		self := ownAccount(known[strings.ToLower(email)]) || (actorID != "" && actorID == actorInfo.ID)
+		keys, first, err := c.recipientKeys(known, email, self, senderFP)
+		if err != nil {
+			return nil, err
+		}
 		pubs[i], actorIDs[i] = keys, actorID
+		if first {
+			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: keys.Fingerprint})
+		}
 		debugf("recipient", "email=%s fingerprint=%s actor_id=%s",
 			sanitizeForLog(email), crypto.ShortFingerprint(keys.Fingerprint), actorID)
+		debugf("verify", "recipient %s: %s", sanitizeForLog(email), recipientKeyNote(keys.Fingerprint, self, first))
 	}
-	debugf("verify", "recipient public keys resolved from server (%d)", len(recipients))
+	debugf("verify", "recipient key bundles from the server (%d): fingerprint and both self-signatures checked; not proof the keys are the recipient's (compare fingerprints with them)", len(recipients))
 
 	algo, err := chooseCompression(p, opt.Compress, debugf)
 	if err != nil {
@@ -866,11 +878,17 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		debugf("verify", "server confirmed upload (HEAD-verified size and etag)")
 	}
 
+	// Sent: the keys new to this device that it went to are accepted now.
+	if err := c.recordFirstUse(firstUse, false); err != nil {
+		return nil, fmt.Errorf("secret %s was sent, but recording its recipients' keys on this device failed: %w", secret.ID, err)
+	}
+
 	result := &EncryptResult{
 		Secret:            *secret,
 		EncryptedSize:     size,
 		SenderFingerprint: senderFP,
 		Recipients:        sentTo,
+		FirstUse:          firstUse,
 		Revoked:           revoked,
 		Compressed:        compressionLabel != "",
 		Compression:       compressionLabel,
@@ -905,19 +923,40 @@ func (c *Client) loadIdentity(fp, password string) (*crypto.KeyPair, string, err
 }
 
 // recipientKeys fetches a recipient's primary public keys, verified against
-// their self-signature, with the fingerprint computed when the server sent
-// none.
-func (c *Client) recipientKeys(email string) (*crypto.PublicKeys, error) {
-	keys, err := identity.GetRecipientKeys(c.api, email)
-	if err != nil {
-		return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
+// their fingerprint and both self-signatures. When the recipient is the
+// sender (self), the keys must also be a key pair on this device, the
+// sending identity senderFP or another: see identity.CheckOwnKeys.
+// Anyone else's must pass checkKey against known, what this device knows
+// on the server; a key new to it is reported as first, for recordFirstUse
+// once the send succeeds.
+func (c *Client) recipientKeys(known map[string][]knownKeyDisk, email string, self bool, senderFP string) (keys *crypto.PublicKeys, first bool, err error) {
+	if keys, err = identity.GetRecipientKeys(c.api, email); err != nil {
+		return nil, false, fmt.Errorf("resolve recipient %s: %w", email, err)
 	}
-	if keys.Fingerprint == "" {
-		if keys.Fingerprint, err = crypto.FingerprintFromPubs(keys.ED25519, keys.X25519, keys.MLKEM768, keys.MLDSA65); err != nil {
-			return nil, fmt.Errorf("resolve recipient %s: compute fingerprint: %w", email, err)
+	if self {
+		err = identity.CheckOwnKeys(keys, senderFP)
+		if err != nil && ownAccount(known[strings.ToLower(email)]) {
+			err = fmt.Errorf("%w (%s is recorded as your own account on this device; if it is not yours, forget it)", err, email)
 		}
+	} else {
+		first, err = checkKey(known, strings.ToLower(email), keys.Fingerprint, false)
 	}
-	return keys, nil
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve recipient %s: %w", email, err)
+	}
+	return keys, first, nil
+}
+
+// recipientKeyNote says, for the debug log, why a recipient's key fp was
+// trusted.
+func recipientKeyNote(fp string, self, first bool) string {
+	switch {
+	case self:
+		return fmt.Sprintf("you: key %s is on this device", crypto.ShortFingerprint(fp))
+	case first:
+		return fmt.Sprintf("key %s is new to this device: accepted on first use once the send succeeds (compare fingerprints with them)", crypto.ShortFingerprint(fp))
+	}
+	return fmt.Sprintf("key %s is the one this device accepted for them", crypto.ShortFingerprint(fp))
 }
 
 // chooseCompression picks how p is compressed. An archive is always

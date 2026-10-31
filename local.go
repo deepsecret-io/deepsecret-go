@@ -153,12 +153,24 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
 	debugf("identity", "sender fingerprint=%s", crypto.ShortFingerprint(senderFP))
+	known, err := c.recordOwnAccount(me.Email, senderFP, false)
+	if err != nil {
+		return nil, err
+	}
 	pubs := make([]*crypto.PublicKeys, len(recipients))
+	var firstUse []Recipient
 	for i, email := range recipients {
-		if pubs[i], err = c.recipientKeys(email); err != nil {
+		self := ownAccount(known[strings.ToLower(email)])
+		keys, first, err := c.recipientKeys(known, email, self, senderFP)
+		if err != nil {
 			return nil, err
 		}
-		debugf("recipient", "email=%s fingerprint=%s", sanitizeForLog(email), crypto.ShortFingerprint(pubs[i].Fingerprint))
+		pubs[i] = keys
+		if first {
+			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: keys.Fingerprint})
+		}
+		debugf("recipient", "email=%s fingerprint=%s", sanitizeForLog(email), crypto.ShortFingerprint(keys.Fingerprint))
+		debugf("verify", "recipient %s: %s", sanitizeForLog(email), recipientKeyNote(keys.Fingerprint, self, first))
 	}
 	algo, err := chooseCompression(p, opt.Compress, debugf)
 	if err != nil {
@@ -232,6 +244,12 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		return nil, fmt.Errorf("write %s: %w", out, err)
 	}
 	renamed = true
+	// Written: the keys new to this device that it went to are accepted
+	// now. If that fails, the file goes too.
+	if err := c.recordFirstUse(firstUse, false); err != nil {
+		_ = os.Remove(out) // the file was just written by this send, and its error is returned.
+		return nil, fmt.Errorf("recording the recipients' keys on this device failed, so %s was removed: %w", out, err)
+	}
 	debugf("local", "wrote %s", humanBytes(localPrefixLen+m.CiphertextSize+int64(len(data))))
 
 	label, ratio, original := compressionSummary(p, algo, m, written)
@@ -240,6 +258,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		EncryptedSize:     m.CiphertextSize,
 		SenderFingerprint: senderFP,
 		Recipients:        sentTo,
+		FirstUse:          firstUse,
 		Compressed:        label != "",
 		Compression:       label,
 		CompressionRatio:  ratio,
@@ -334,6 +353,11 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	m := opened.Manifest
 	debugf("verify", "sender bundle bound to fingerprint, Ed25519 + ML-DSA-65 signatures verified")
 	debugf("verify", "wrap matches the signed digest and opened (HPKE X25519 + ML-KEM-768)")
+	senderFirst, err := c.checkSenderKey(hdr.SenderEmail, m.SenderFingerprint, debugf)
+	if err != nil {
+		opened.Close()
+		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
+	}
 	if m.CiphertextSize != payloadSize {
 		opened.Close()
 		return nil, fmt.Errorf("%s: the payload is %d bytes, the signed manifest says %d", path, payloadSize, m.CiphertextSize)
@@ -356,7 +380,8 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		return nil, err
 	}
 	debugf("plan", "local file: the %s payload is copied before it is checked, so the file cannot change under the checks, to %s", humanBytes(payloadSize), sp.plan(m.CiphertextSize))
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress}
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress,
+		recordSender: c.senderRecorder(hdr.SenderEmail, m.SenderFingerprint, senderFirst)}
 	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
 	if opt.OnDownloadProgress != nil {
 		src = &copyProgress{r: src, total: payloadSize, onProgress: opt.OnDownloadProgress}
@@ -391,6 +416,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		RevisionID:           m.RevisionID,
 		SenderFingerprint:    m.SenderFingerprint,
 		SenderEmail:          hdr.SenderEmail,
+		SenderFirstUse:       senderFirst,
 		RecipientFingerprint: localFP,
 		Recipients:           recipients,
 		Compressed:           m.Compressed,

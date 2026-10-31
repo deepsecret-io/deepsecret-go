@@ -298,6 +298,16 @@ func TestTuner_SaysWhyItHolds(t *testing.T) {
 	}
 }
 
+// A download's threads plan gives its settings, without the bound on parts
+// in flight that only an upload has.
+func TestThreadsPlan_Download(t *testing.T) {
+	lim := newLimiter(t.Context(), 0, 8, 0)
+	want := "adaptive: start 4, up to 8 (limit 64, at most one per range); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%"
+	if got := threadsPlan(lim, 0, MaxDownloadConcurrency, "range"); got != want {
+		t.Fatalf("download threads plan:\n got %q\nwant %q", got, want)
+	}
+}
+
 // On a fast link the bound is far above the ceiling: the upload takes the
 // usual start after its first window and climbs as a download does.
 func TestTuner_FastLinkClimbsAsBefore(t *testing.T) {

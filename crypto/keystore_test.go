@@ -230,3 +230,42 @@ func TestSaveKeyPairFileIsPrivate(t *testing.T) {
 		t.Errorf("the keys directory holds %d entries, want the key alone", len(entries))
 	}
 }
+
+// The public keys of a stored key pair are read without its password, by
+// its full fingerprint only, and only when they hash to that fingerprint.
+func TestLoadPublicKeysFrom(t *testing.T) {
+	kp, _ := GenerateKeyPair()
+	fp, _ := Fingerprint(kp)
+	dir := t.TempDir()
+	if err := SaveKeyPairTo(dir, fp, kp, "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+
+	pub, err := LoadPublicKeysFrom(dir, strings.ToUpper(fp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pub.Fingerprint != fp || pub.ED25519 != kp.ED25519Public || pub.X25519 != kp.X25519Public ||
+		pub.MLKEM768 != kp.MLKEM768PK || pub.MLDSA65 != kp.MLDSA65PK {
+		t.Fatalf("public keys %+v do not match the stored key pair", pub)
+	}
+
+	// A prefix finds a key for LoadKeyPairFrom, but not here: the caller
+	// asks whether this exact key is on the device.
+	if _, err := LoadPublicKeysFrom(dir, fp[:16]); err == nil {
+		t.Error("prefix accepted")
+	}
+	other, _ := GenerateKeyPair()
+	otherFP, _ := Fingerprint(other)
+	if _, err := LoadPublicKeysFrom(dir, otherFP); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("missing key: %v, want not exist", err)
+	}
+
+	// A file whose keys are not the ones its name says is refused.
+	if err := SaveKeyPairTo(dir, otherFP, kp, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPublicKeysFrom(dir, otherFP); err == nil || !strings.Contains(err.Error(), "holds the keys of") {
+		t.Errorf("mislabelled key file: %v, want refused", err)
+	}
+}

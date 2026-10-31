@@ -413,7 +413,6 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 	}
 	for key, want := range map[string]string{
 		"upload":    "multipart, 15.00 MiB in 3 part(s) of 5.00 MiB",
-		"threads":   "adaptive: start 1, 3 once the first part finishes (or after 5s) if each part finishes within 1m at the measured rate, up to 3 (limit 32, at most one per part)",
 		"part URLs": "100 per request",
 		"retries":   "8 attempts per request, waits doubling from 2s up to 1m; a request that moves no bytes for 1m30s restarts",
 	} {
@@ -421,8 +420,10 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 			t.Errorf("plan %q: got %q, want it to start with %q", key, plans[key], want)
 		}
 	}
-	if !strings.Contains(plans["threads"], "from one part it tries a second, kept if throughput rises over 10% even where that bound would hold one, else tried again after 5m") {
-		t.Errorf("the threads plan does not say how a held upload tries a second part: %q", plans["threads"])
+	// The threads plan gives the settings only: each decision is a
+	// "threads" event with its own reason.
+	if want := "adaptive: start 1, up to 3 (limit 32, at most one per part); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%; parts in flight must each finish within 1m at the measured rate"; plans["threads"] != want {
+		t.Errorf("threads plan:\n got %q\nwant %q", plans["threads"], want)
 	}
 
 	plans = map[string]string{}

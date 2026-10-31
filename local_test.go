@@ -213,7 +213,7 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	// that signed.
 	relabeled := variant("relabeled", clone())
 	rewriteHeader(t, relabeled, func(h *localHeader) { h.SenderEmail = "mallory@example.com" })
-	cases["sender relabeled"] = struct{ path, want string }{relabeled, "no key matching"}
+	cases["sender relabeled"] = struct{ path, want string }{relabeled, "has no registered key"}
 	// A path-changing email is refused before any lookup.
 	pathy := variant("pathy", clone())
 	rewriteHeader(t, pathy, func(h *localHeader) { h.SenderEmail = "../../actors/me@x" })

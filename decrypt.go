@@ -117,6 +117,24 @@ type OpenedSecret struct {
 	ctx        context.Context
 	debugf     func(step, format string, args ...any)
 	onProgress func(stage DecryptStage, done, total int64) // optional
+
+	// recordSender records the sender's key, new to this device, once a
+	// decrypt succeeds (Result.SenderFirstUse); nil when there is nothing
+	// to record or it is done.
+	recordSender func() error
+}
+
+// decrypted records, once a decrypt succeeded, the sender's key it relied
+// on as new to this device.
+func (o *OpenedSecret) decrypted() error {
+	if o.recordSender == nil {
+		return nil
+	}
+	if err := o.recordSender(); err != nil {
+		return fmt.Errorf("recording the sender's key on this device failed: %w", err)
+	}
+	o.recordSender = nil
+	return nil
 }
 
 // DecryptStage names a pass over the downloaded ciphertext. Payload makes
@@ -213,7 +231,11 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	debugf("manifest", "payload_type=%s", peek.PayloadType)
 	debugf("manifest", "sender fingerprint=%s", crypto.ShortFingerprint(peek.SenderFingerprint))
 	debugf("manifest", "recipients=%d", len(peek.Recipients))
-	senderED25519, err := identity.ResolveSenderED25519(c.api, secretInfo.SenderID, peek.SenderFingerprint)
+	senderEmail, err := identity.ResolveActorEmail(c.api, secretInfo.SenderID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve sender key: %w", err)
+	}
+	senderED25519, err := identity.ResolveED25519ByEmail(c.api, senderEmail, peek.SenderFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
@@ -230,6 +252,11 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	debugf("verify", "sender bundle bound to fingerprint, Ed25519 + ML-DSA-65 signatures verified")
 	debugf("verify", "manifest is for this revision and lists your key")
 	debugf("verify", "wrap matches the signed digest and opened (HPKE X25519 + ML-KEM-768)")
+	senderFirst, err := c.checkSenderKey(senderEmail, m.SenderFingerprint, debugf)
+	if err != nil {
+		opened.Close()
+		return nil, fmt.Errorf("check sender %s: %w", senderEmail, err)
+	}
 
 	maxSize := opt.MaxDownloadSize
 	if maxSize <= 0 {
@@ -263,7 +290,8 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 			return nil, err
 		}
 	}
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress}
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress,
+		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, senderFirst)}
 
 	// Download the ciphertext into the spool, or the ranges a kept
 	// download lacks.
@@ -313,6 +341,8 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	o.Result = DecryptResult{
 		RevisionID:           targetRevID,
 		SenderFingerprint:    m.SenderFingerprint,
+		SenderEmail:          senderEmail,
+		SenderFirstUse:       senderFirst,
 		RecipientFingerprint: localFP,
 		Recipients:           signedRecipients(m, rev),
 		Compressed:           m.Compressed,
@@ -459,6 +489,9 @@ func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
 	o.debugf("verify", "every chunk authenticated, in order, ending on the last-chunk flag")
 	o.debugf("decrypt", "plaintext=%s", humanBytes(int64(len(plaintext))))
 	o.debugf("decrypt", "elapsed=%s", time.Since(tDec).Round(time.Millisecond))
+	if err := o.decrypted(); err != nil {
+		return nil, err
+	}
 
 	var p payload.Payload
 	if err := payload.Unmarshal(plaintext, &p); err != nil {
@@ -674,8 +707,21 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	if err != nil {
 		return nil, undo.Remove(fmt.Errorf("write files: %w", err))
 	}
+	if err := o.decrypted(); err != nil {
+		return nil, undo.Remove(err)
+	}
 	o.spool.keep = false // decrypted: a kept download has done its job
 	return result, nil
+}
+
+// senderRecorder returns what records email's key fp, which signed a secret
+// from them, once it is decrypted, when the key was new to this device
+// (first); nil otherwise.
+func (c *Client) senderRecorder(email, fp string, first bool) func() error {
+	if !first {
+		return nil
+	}
+	return func() error { return c.recordFirstUse([]Recipient{{Email: email, Fingerprint: fp}}, true) }
 }
 
 // signedRecipients lists every recipient fingerprint the sender signed

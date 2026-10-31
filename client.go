@@ -16,6 +16,10 @@ import (
 // Client is the high-level DeepSecret SDK client.
 type Client struct {
 	api *api.Client
+
+	// knownKeysFile is where the keys accepted for other people are kept:
+	// DefaultKnownKeysFile when empty. See SetKnownKeysFile.
+	knownKeysFile string
 }
 
 // NewClient creates a new DeepSecret SDK client.
@@ -83,8 +87,23 @@ func (c *Client) ListRemoteKeys() ([]RemoteKey, error) {
 	return identity.ListRemoteKeys(c.api)
 }
 
-// SyncIdentity uploads a key pair's public keys to the server.
+// SyncIdentity records the account on this device as the user's own, used
+// with kp: from then on only key pairs on this device pass for it (see
+// AcceptKey). Then it uploads kp's public keys to the server. Nothing is
+// uploaded when the server says the account is someone this device knows
+// as another person.
 func (c *Client) SyncIdentity(kp *crypto.KeyPair) error {
+	fp, err := crypto.Fingerprint(kp)
+	if err != nil {
+		return fmt.Errorf("compute fingerprint: %w", err)
+	}
+	me, err := identity.WhoAmI(c.api)
+	if err != nil {
+		return fmt.Errorf("fetch your account: %w", err)
+	}
+	if _, err := c.recordOwnAccount(me.Email, fp, true); err != nil {
+		return err
+	}
 	return identity.SyncIdentity(c.api, kp)
 }
 

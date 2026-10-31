@@ -39,6 +39,7 @@ type fakeActor struct {
 	id, email string
 	kp        *crypto.KeyPair
 	fp        string
+	old       []*crypto.KeyPair // keys that were primary before, still listed
 }
 
 type fakeWrap struct {
@@ -69,6 +70,16 @@ type fakeAPI struct {
 	creates int
 	puts    int
 	lastReq createBody
+
+	// editBundle, when set, edits the primary key bundle listed for an
+	// email before it is served, as a hostile server would.
+	editBundle func(email string, bundle map[string]any)
+	// whoAmI, when set, is the email /actors/me answers with, whoever
+	// calls: a server lying about who the caller is.
+	whoAmI string
+	// known holds each client's known keys file, as each person's own
+	// device would.
+	known string
 
 	// Multipart: a create at or above multipartAt bytes answers
 	// is_multipart with partSize parts.
@@ -135,7 +146,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	t.Setenv("HOME", t.TempDir())
 	f := &fakeAPI{t: t, actors: map[string]*fakeActor{}, secrets: map[string]*fakeSecret{},
 		revs: map[string]*fakeRevision{}, objects: t.TempDir(), multipartAt: 1 << 62,
-		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}}
+		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}, known: t.TempDir()}
 	for i, email := range emails {
 		kp, err := crypto.GenerateKeyPair()
 		if err != nil {
@@ -154,6 +165,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("GET /api/v1/actors/email/{email}", f.actorByEmail)
 	mux.HandleFunc("GET /api/v1/actors/{id}", f.actorByID)
 	mux.HandleFunc("GET /api/v1/identities/{$}", f.ownKeys)
+	mux.HandleFunc("POST /api/v1/identities/{$}", func(w http.ResponseWriter, _ *http.Request) { ok(w, map[string]string{}) })
 	mux.HandleFunc("GET /api/v1/identities/actor/{email}", f.publicKeys)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/secrets", f.create)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
@@ -187,8 +199,12 @@ func (f *fakeAPI) client(email string) *Client {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	c.SetKnownKeysFile(f.knownFile(email))
 	return c
 }
+
+// knownFile is the known keys file of email's client.
+func (f *fakeAPI) knownFile(email string) string { return filepath.Join(f.known, email+".json") }
 
 func ok(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -214,6 +230,9 @@ func (f *fakeAPI) byID(id string) *fakeActor {
 
 func (f *fakeAPI) me(w http.ResponseWriter, r *http.Request) {
 	a := f.caller(r)
+	if f.whoAmI != "" {
+		a = f.actors[f.whoAmI]
+	}
 	ok(w, map[string]any{"actor": map[string]string{"id": a.id, "email": a.email},
 		"membership": map[string]string{"org_id": "org-1", "role": "owner"}})
 }
@@ -242,16 +261,25 @@ func (f *fakeAPI) publicKeys(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "Actor not found")
 		return
 	}
-	edSig, mldsaSig, err := crypto.SignKeyBundle(a.kp)
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
+	var keys []map[string]any
+	for i, kp := range append([]*crypto.KeyPair{a.kp}, a.old...) {
+		edSig, mldsaSig, err := crypto.SignKeyBundle(kp)
+		if err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		fp, _ := crypto.Fingerprint(kp)
+		bundle := map[string]any{
+			"ed25519": kp.ED25519Public, "x25519": kp.X25519Public, "mlkem768": kp.MLKEM768PK,
+			"mldsa65": kp.MLDSA65PK, "fingerprint": fp, "signature": edSig, "signature_mldsa65": mldsaSig,
+			"is_primary": i == 0,
+		}
+		if i == 0 && f.editBundle != nil {
+			f.editBundle(r.PathValue("email"), bundle)
+		}
+		keys = append(keys, bundle)
 	}
-	ok(w, map[string]any{"keys": []map[string]any{{
-		"ed25519": a.kp.ED25519Public, "x25519": a.kp.X25519Public, "mlkem768": a.kp.MLKEM768PK,
-		"mldsa65": a.kp.MLDSA65PK, "fingerprint": a.fp, "signature": edSig, "signature_mldsa65": mldsaSig,
-		"is_primary": true,
-	}}})
+	ok(w, map[string]any{"keys": keys})
 }
 
 // create makes the checks of the API contract §3 before storing anything.

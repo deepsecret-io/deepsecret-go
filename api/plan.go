@@ -26,7 +26,9 @@ func SinglePutPlan(size int64, expiryMinutes int) string {
 }
 
 // threadsPlan describes how a limiter runs a transfer's parts or ranges
-// (piece): at the caller's fixed count, or adapting below limit.
+// (piece): at the caller's fixed count, or adapting below limit. An
+// adaptive plan gives only the settings; each decision is reported, with
+// its reason, as a "threads" event when it is made.
 func threadsPlan(lim *limiter, requested, limit int, piece string) string {
 	if requested > 0 {
 		if lim.max < requested {
@@ -37,18 +39,12 @@ func threadsPlan(lim *limiter, requested, limit int, piece string) string {
 	if lim.current() >= lim.max {
 		return fmt.Sprintf("%d, one per %s (too few %ss to adapt; up to %d otherwise)", lim.max, piece, piece, limit)
 	}
+	plan := fmt.Sprintf("adaptive: start %d, up to %d (limit %d, at most one per %s); measured every %s (%s from %s/s); an increase stays only if throughput rises over %d%%",
+		lim.current(), lim.max, limit, piece, lim.win.slow, lim.win.fast, humanBytesLocal(int64(adaptiveFastRate)), adaptiveGainPct)
 	if lim.partSize > 0 {
-		return fmt.Sprintf("adaptive: start 1, %d once the first %s finishes (or after %s) if each %s finishes within %s at the measured rate, up to %d (limit %d, at most one per %s); %s it doubles while throughput rises over %d%% and %ss still finish within %s, steps back when it does not, and halves on failures or throttling; from one %s it tries a second, kept if throughput rises over %d%% even where that bound would hold one, else tried again after %s",
-			min(adaptiveStartThreads, lim.max), piece, adaptiveStartWindow, piece, roundDuration(partTimeLimit), lim.max, limit, piece, windowsPlan(), adaptiveGainPct, piece, roundDuration(partTimeLimit),
-			piece, adaptiveGainPct, roundDuration(secondPartRetry))
+		plan += fmt.Sprintf("; %ss in flight must each finish within %s at the measured rate", piece, roundDuration(lim.partTime))
 	}
-	return fmt.Sprintf("adaptive: start %d, up to %d (limit %d, at most one per %s); %s it doubles while throughput rises over %d%%, steps back when it does not, and halves on failures or throttling",
-		lim.current(), lim.max, limit, piece, windowsPlan(), adaptiveGainPct)
-}
-
-// windowsPlan says how often the tuner measures.
-func windowsPlan() string {
-	return fmt.Sprintf("every %s (every %s from %s/s)", adaptiveWindow, adaptiveFastWindow, humanBytesLocal(int64(adaptiveFastRate)))
+	return plan
 }
 
 // retryPlan describes how a failed request of a transfer is retried.

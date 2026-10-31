@@ -173,6 +173,42 @@ if errors.As(err, &stopped) {
 }
 ```
 
+## Recipient Keys
+
+The server lists everyone's public keys. A key bundle is used only when it
+carries its fingerprint and both self-signatures (Ed25519 and ML-DSA-65),
+the fingerprint is the hash of its keys, and both signatures verify. That
+proves the bundle is whole, not whose it is, so the SDK also checks who it
+belongs to:
+
+- **Your own keys.** Any account this device registers a key for
+  (`SyncIdentity`), and the one it first sends from on a server, is
+  recorded as yours, so what the server later says about who you are cannot
+  change it. For one of your accounts only key pairs on this device pass: a
+  send to it must use one, and a secret from it must be signed by one. If
+  the server says you are someone this device knows as another person, the
+  send or registration is refused. A secret signed by a key on this device
+  is yours.
+- **Everyone else's: trust on first use.** The first send to someone, or
+  the first secret from them, accepts their key and reports it
+  (`EncryptResult.FirstUse`, `DecryptResult.SenderFirstUse`) so you can
+  compare fingerprints with them. The key is recorded once that send or
+  decrypt succeeds. After that, a send to them or a secret from them under
+  any other key is refused with a `*KeyChangedError`, before anything is
+  sealed or downloaded.
+- **A changed key.** Once the new key is confirmed with its owner,
+  `AcceptKey(email, fingerprint)` accepts it, and `VerifyKey` records a key
+  you compared. Both take the full fingerprint of a key the server lists
+  for them, and both replace their other keys: sends go to the accepted key
+  alone, while a replaced key still checks the secrets it signed until
+  `ForgetKey` drops it. A send to a replaced key is refused
+  (`KeyChangedError.Replaced`) until it is accepted again. `KnownKeys`
+  lists what this device knows, your own accounts included.
+
+Known keys are kept per API server in `~/.deepsecret/known_keys.json`
+(mode 0600; `SetKnownKeysFile` moves it). A damaged file refuses sends
+rather than accepting any key again.
+
 ## Packages
 
 ### `sdk/crypto`: Cryptographic Primitives

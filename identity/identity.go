@@ -7,7 +7,9 @@ package identity
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 
 	"github.com/deepsecret-io/sdk/api"
@@ -212,7 +214,14 @@ func LoadPrimaryIdentity(c *api.Client, password string) (*crypto.KeyPair, strin
 	return kp, fp, nil
 }
 
-// GetRecipientKeys fetches a recipient's primary public keys by email.
+// GetRecipientKeys fetches a recipient's primary public keys by email. The
+// bundle must carry its fingerprint and both self-signatures (Ed25519 and
+// ML-DSA-65): the fingerprint must be the hash of its public keys, and both
+// signatures must verify. A bundle missing any of them is refused.
+//
+// These checks prove the bundle is whole and self-consistent, not that it
+// belongs to the recipient: a server can still list a bundle of its own.
+// When the recipient is the caller, CheckOwnKeys closes that gap.
 func GetRecipientKeys(c *api.Client, email string) (*crypto.PublicKeys, error) {
 	resp, err := c.Get("/api/v1/identities/actor/" + url.PathEscape(email))
 	if err != nil {
@@ -220,16 +229,7 @@ func GetRecipientKeys(c *api.Client, email string) (*crypto.PublicKeys, error) {
 	}
 
 	var keys struct {
-		Keys []struct {
-			ED25519          string `json:"ed25519"`
-			X25519           string `json:"x25519"`
-			MLKEM768         string `json:"mlkem768"`
-			MLDSA65          string `json:"mldsa65"`
-			Fingerprint      string `json:"fingerprint"`
-			Signature        string `json:"signature"`
-			SignatureMLDSA65 string `json:"signature_mldsa65"`
-			IsPrimary        bool   `json:"is_primary"`
-		} `json:"keys"`
+		Keys []signedKeyBundle `json:"keys"`
 	}
 	if err := json.Unmarshal(resp.Data, &keys); err != nil {
 		return nil, fmt.Errorf("parse keys: %w", err)
@@ -246,20 +246,18 @@ func GetRecipientKeys(c *api.Client, email string) (*crypto.PublicKeys, error) {
 		}
 	}
 
-	if rk.Fingerprint != "" {
-		computed, err := crypto.FingerprintFromPubs(rk.ED25519, rk.X25519, rk.MLKEM768, rk.MLDSA65)
-		if err != nil {
-			return nil, fmt.Errorf("compute recipient fingerprint: %w", err)
-		}
-		if computed != rk.Fingerprint {
-			return nil, fmt.Errorf("recipient key fingerprint mismatch (possible tampering)")
-		}
+	if rk.Fingerprint == "" {
+		return nil, fmt.Errorf("recipient key bundle has no fingerprint: refusing to use it")
 	}
-
-	if rk.Signature != "" {
-		if err := crypto.VerifyKeyBundleSignature(rk.ED25519, rk.X25519, rk.MLKEM768, rk.MLDSA65, rk.Signature, rk.SignatureMLDSA65); err != nil {
-			return nil, fmt.Errorf("recipient key verification failed: %w", err)
-		}
+	computed, err := crypto.FingerprintFromPubs(rk.ED25519, rk.X25519, rk.MLKEM768, rk.MLDSA65)
+	if err != nil {
+		return nil, fmt.Errorf("compute recipient fingerprint: %w", err)
+	}
+	if computed != rk.Fingerprint {
+		return nil, fmt.Errorf("recipient key fingerprint mismatch (possible tampering)")
+	}
+	if err := verifySignedBundle(rk); err != nil {
+		return nil, fmt.Errorf("recipient key verification failed: %w", err)
 	}
 
 	return &crypto.PublicKeys{
@@ -269,6 +267,29 @@ func GetRecipientKeys(c *api.Client, email string) (*crypto.PublicKeys, error) {
 		MLDSA65:     rk.MLDSA65,
 		Fingerprint: rk.Fingerprint,
 	}, nil
+}
+
+// CheckOwnKeys checks keys the server returned for the caller's own
+// account, as when they send to themselves: the keys must be the sending
+// identity (senderFP) or another key pair stored on this device. Otherwise
+// a server could list a key of its own as the caller's and read what they
+// sealed for themselves.
+func CheckOwnKeys(keys *crypto.PublicKeys, senderFP string) error {
+	fp, err := crypto.FingerprintFromPubs(keys.ED25519, keys.X25519, keys.MLKEM768, keys.MLDSA65)
+	if err != nil {
+		return fmt.Errorf("compute own key fingerprint: %w", err)
+	}
+	if fp == senderFP {
+		return nil
+	}
+	if _, err := crypto.LoadPublicKeys(fp); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("the server lists key %s as your own, but it is not a key on this device: refusing to encrypt to it (possible key substitution)",
+				crypto.ShortFingerprint(fp))
+		}
+		return fmt.Errorf("check your key %s on this device: %w", crypto.ShortFingerprint(fp), err)
+	}
+	return nil
 }
 
 // ResolveActorID returns the current authenticated user's actor ID.
@@ -332,14 +353,20 @@ type signedKeyBundle struct {
 	X25519           string `json:"x25519"`
 	MLKEM768         string `json:"mlkem768"`
 	MLDSA65          string `json:"mldsa65"`
+	Fingerprint      string `json:"fingerprint"`
 	Signature        string `json:"signature"`
 	SignatureMLDSA65 string `json:"signature_mldsa65"`
 	IsPrimary        bool   `json:"is_primary"`
 }
 
+// verifySignedBundle checks both of a bundle's self-signatures: each must
+// be present, and each must verify.
 func verifySignedBundle(k signedKeyBundle) error {
-	if k.Signature == "" {
-		return fmt.Errorf("key bundle is unsigned")
+	switch {
+	case k.Signature == "":
+		return fmt.Errorf("key bundle has no Ed25519 self-signature")
+	case k.SignatureMLDSA65 == "":
+		return fmt.Errorf("key bundle has no ML-DSA-65 self-signature")
 	}
 	return crypto.VerifyKeyBundleSignature(k.ED25519, k.X25519, k.MLKEM768, k.MLDSA65, k.Signature, k.SignatureMLDSA65)
 }
@@ -350,6 +377,15 @@ func verifySignedBundle(k signedKeyBundle) error {
 // before its Ed25519 component is returned, so a compromised identities
 // endpoint cannot substitute an attacker key into the sender path.
 func ResolveSenderED25519(c *api.Client, actorID, fingerprint string) (string, error) {
+	email, err := ResolveActorEmail(c, actorID)
+	if err != nil {
+		return "", err
+	}
+	return ResolveED25519ByEmail(c, email, fingerprint)
+}
+
+// ResolveActorEmail returns the email of the actor with id actorID.
+func ResolveActorEmail(c *api.Client, actorID string) (string, error) {
 	resp, err := c.Get("/api/v1/actors/" + url.PathEscape(actorID))
 	if err != nil {
 		return "", err
@@ -360,7 +396,10 @@ func ResolveSenderED25519(c *api.Client, actorID, fingerprint string) (string, e
 	if err := json.Unmarshal(resp.Data, &actor); err != nil {
 		return "", fmt.Errorf("parse actor: %w", err)
 	}
-	return ResolveED25519ByEmail(c, actor.Email, fingerprint)
+	if actor.Email == "" {
+		return "", fmt.Errorf("actor %s has no email", actorID)
+	}
+	return actor.Email, nil
 }
 
 // ResolveED25519ByEmail is ResolveSenderED25519 for someone known by email:
@@ -379,7 +418,7 @@ func ResolveED25519ByEmail(c *api.Client, email, fingerprint string) (string, er
 		return "", fmt.Errorf("parse keys: %w", err)
 	}
 	if len(keys.Keys) == 0 {
-		return "", fmt.Errorf("sender has no registered keys")
+		return "", fmt.Errorf("%s has no registered keys", email)
 	}
 
 	if fingerprint != "" {
@@ -389,24 +428,24 @@ func ResolveED25519ByEmail(c *api.Client, email, fingerprint string) (string, er
 				continue
 			}
 			if err := verifySignedBundle(k); err != nil {
-				return "", fmt.Errorf("sender key verification failed for %s: %w", fingerprint, err)
+				return "", fmt.Errorf("key %s of %s failed verification: %w", fingerprint, email, err)
 			}
 			return k.ED25519, nil
 		}
-		return "", fmt.Errorf("sender has no key matching fingerprint %s", fingerprint)
+		return "", fmt.Errorf("%s has no registered key %s", email, fingerprint)
 	}
 
 	for _, k := range keys.Keys {
 		if k.IsPrimary {
 			if err := verifySignedBundle(k); err != nil {
-				return "", fmt.Errorf("sender primary key verification failed: %w", err)
+				return "", fmt.Errorf("primary key of %s failed verification: %w", email, err)
 			}
 			return k.ED25519, nil
 		}
 	}
 	first := keys.Keys[0]
 	if err := verifySignedBundle(first); err != nil {
-		return "", fmt.Errorf("sender key verification failed: %w", err)
+		return "", fmt.Errorf("key of %s failed verification: %w", email, err)
 	}
 	return first.ED25519, nil
 }

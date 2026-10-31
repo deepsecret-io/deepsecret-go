@@ -157,18 +157,9 @@ func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	resolved := resolveFingerprint(dir, fingerprint)
-	data, err := os.ReadFile(filepath.Join(dir, resolved+".json")) // #nosec G304 -- resolved is hex only: validKeyName above, or a file name read from dir.
+	disk, err := readKeyFile(dir, resolveFingerprint(dir, fingerprint))
 	if err != nil {
 		return nil, err
-	}
-	var disk keyPairOnDisk
-	if err := json.Unmarshal(data, &disk); err != nil {
-		return nil, err
-	}
-	if disk.StorageVersion != KeyStorageVersion {
-		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports version %d only); regenerate the key",
-			disk.StorageVersion, KeyStorageVersion)
 	}
 
 	kp := &KeyPair{
@@ -200,6 +191,58 @@ func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
 		kp.MLDSA65Seed = disk.MLDSA65Seed
 	}
 	return kp, nil
+}
+
+// LoadPublicKeys reads the public keys of the key pair stored under the
+// full fingerprint in the default keys directory: see LoadPublicKeysFrom.
+func LoadPublicKeys(fingerprint string) (*PublicKeys, error) {
+	return LoadPublicKeysFrom(DefaultKeysDir(), fingerprint)
+}
+
+// LoadPublicKeysFrom reads the public keys of the key pair stored in
+// <dir>/<fingerprint>.json, without its password: the private keys are not
+// read. fingerprint must be a full one, not a prefix, and the stored public
+// keys must hash to it.
+func LoadPublicKeysFrom(dir, fingerprint string) (*PublicKeys, error) {
+	fingerprint = strings.ToLower(fingerprint)
+	if len(fingerprint) != FingerprintLen || !validKeyName(fingerprint) {
+		return nil, errors.New("a full key fingerprint is 64 hex characters")
+	}
+	disk, err := readKeyFile(dir, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	pub := &PublicKeys{
+		ED25519:  disk.ED25519Public,
+		X25519:   disk.X25519Public,
+		MLKEM768: disk.MLKEM768PK,
+		MLDSA65:  disk.MLDSA65PK,
+	}
+	if pub.Fingerprint, err = FingerprintFromPubs(pub.ED25519, pub.X25519, pub.MLKEM768, pub.MLDSA65); err != nil {
+		return nil, fmt.Errorf("key file %s: %w", ShortFingerprint(fingerprint), err)
+	}
+	if pub.Fingerprint != fingerprint {
+		return nil, fmt.Errorf("key file %s holds the keys of %s", ShortFingerprint(fingerprint), ShortFingerprint(pub.Fingerprint))
+	}
+	return pub, nil
+}
+
+// readKeyFile reads <dir>/<name>.json, a key file of the current storage
+// version. name must be hex only, so it cannot change the path.
+func readKeyFile(dir, name string) (*keyPairOnDisk, error) {
+	data, err := os.ReadFile(filepath.Join(dir, name+".json")) // #nosec G304 -- name is hex only: checked with validKeyName, or a file name read from dir.
+	if err != nil {
+		return nil, err
+	}
+	var disk keyPairOnDisk
+	if err := json.Unmarshal(data, &disk); err != nil {
+		return nil, err
+	}
+	if disk.StorageVersion != KeyStorageVersion {
+		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports version %d only); regenerate the key",
+			disk.StorageVersion, KeyStorageVersion)
+	}
+	return &disk, nil
 }
 
 // ListLocalKeys returns fingerprints of all key pairs stored in the default

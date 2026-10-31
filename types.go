@@ -194,6 +194,7 @@ type EncryptResult struct {
 	EncryptedSize     int64
 	SenderFingerprint string
 	Recipients        []Recipient       // everyone the revision was sealed for, in the order given
+	FirstUse          []Recipient       // recipients whose key was new to this device, accepted on first use: worth comparing with them
 	Revoked           []SecretRecipient // people a send with RevokeMissing removed
 	Compressed        bool
 	Compression       string  // "zstd", "tar+zstd", ""
@@ -280,7 +281,8 @@ type DecryptResult struct {
 	Decrypted            *payload.Decrypted
 	RevisionID           string // UUID of the revision that was decrypted (resolved if Revision was empty)
 	SenderFingerprint    string
-	SenderEmail          string      // for a local file: the sender, whose registered key signed the manifest
+	SenderEmail          string      // the sender, whose registered key signed the manifest
+	SenderFirstUse       bool        // the sender's key was new to this device, accepted on first use: worth comparing with them
 	RecipientFingerprint string      // the caller's own key, which the wrap was made for
 	Recipients           []Recipient // every recipient the sender signed for; Email is the server's label for each fingerprint, or for a local file the file's label when that account registered the key
 	Compressed           bool
