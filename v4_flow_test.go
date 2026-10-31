@@ -907,7 +907,7 @@ func TestValidateRecipientsRefusesHostileEmails(t *testing.T) {
 	for _, bad := range []string{
 		"a b@example.com", "alice@example.com\r\nX-Injected: 1", "../../actors/me@x.io",
 		"a/b@example.com", "a?b@example.com", "a#b@example.com", "a%2f@example.com",
-		"a\x1b[31m@example.com", "a‮@example.com", "a\u009b@example.com",
+		"a\x1b[31m@example.com", "a\u202e@example.com", "a\u009b@example.com",
 		"alice@localhost", "alice@", "@example.com", strings.Repeat("a", 250) + "@example.com",
 	} {
 		if err := ValidateRecipients([]string{bad}); err == nil {

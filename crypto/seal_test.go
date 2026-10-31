@@ -115,7 +115,7 @@ func TestSealRejectsBadInput(t *testing.T) {
 		"no secret name":    {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", PayloadType: "message"}, "secret name"},
 		"padded name":       {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token ", PayloadType: "message"}, "white space"},
 		"line break":        {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\nRun: rm", PayloadType: "message"}, "control"},
-		"bidi override":     {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "invoice‮txt.exe", PayloadType: "message"}, "bidi"},
+		"bidi override":     {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "invoice\u202etxt.exe", PayloadType: "message"}, "bidi"},
 		"name not utf-8":    {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\xff", PayloadType: "message"}, "UTF-8"},
 		"name too long":     {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: strings.Repeat("a", maxSecretNameLen+1), PayloadType: "message"}, "secret name"},
 		"bad payload type":  {[]*PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "n", PayloadType: "exe"}, "payload type"},
