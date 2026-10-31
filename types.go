@@ -132,9 +132,9 @@ type EncryptOptions struct {
 	// api.ModuleKey). Optional: nil logs nothing.
 	Logger *slog.Logger
 
-	// AutoArchive bundles files into a tar archive when the file count
-	// exceeds the tier's MaxFilesPerSecret limit. When true, the SDK fetches
-	// tier info and auto-archives if needed.
+	// AutoArchive bundles the files into one tar archive when there are
+	// more than 50 regular files. The server still enforces the plan's
+	// files-per-secret limit on what is sent.
 	AutoArchive bool
 
 	// ValidateTier pre-checks tier limits (MaxUploadBytes, policy flags)
