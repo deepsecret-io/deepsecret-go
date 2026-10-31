@@ -32,7 +32,9 @@ import (
 // within partTimeLimit at the measured rate. On a fast link that bound is
 // far above the ceiling. The first decision waits for the first part to
 // finish, whose rate is exact, or for adaptiveStartWindow: a shorter window
-// would count the socket buffer filling as bytes sent.
+// would count the socket buffer filling as bytes sent. A window in which
+// nothing was sent (the part URLs and the connection to storage can take
+// that long) measures nothing, so the decision waits for the next one.
 //
 // The bound takes the rate of the parts in flight as the link's, which
 // holds when they share it. A path that limits each connection on its own
@@ -399,17 +401,23 @@ func (t *tuner) next(rate float64, errs int64) int {
 			t.trying, t.floor = false, 0
 		}
 		t.reason = fmt.Sprintf("%d request(s) failed or were throttled", errs)
+	case t.start && rate == 0:
+		// Nothing sent yet: no rate to decide from, so stay at one part
+		// and make the first decision on the next window.
+		t.stay = "nothing sent yet: the first decision waits for the next window"
 	case t.start:
-		// An upload's first decision, at one part: take the usual start
-		// if the link finishes that many parts in time, else stay at one
-		// and probe.
+		// An upload's first decision, at one part: take the usual start,
+		// or every part when there are fewer, if the link finishes that
+		// many parts in time, else stay at one and probe. top is at most
+		// the transfer's ceiling, so the start is judged against it too.
 		t.start, t.settle = false, true
+		start := min(t.max, adaptiveStartThreads)
 		switch {
-		case top >= adaptiveStartThreads:
-			t.limit = min(t.max, adaptiveStartThreads)
-			t.reason = fmt.Sprintf("the link can finish %d parts at once within %s", adaptiveStartThreads, roundDuration(t.partLimit()))
+		case top >= start:
+			t.limit = start
+			t.reason = fmt.Sprintf("the link can finish %d parts at once within %s", start, roundDuration(t.partLimit()))
 		case top > 1:
-			t.stay = fmt.Sprintf("starting from one part: at this rate %d at once would not each finish within %s", adaptiveStartThreads, roundDuration(t.partLimit()))
+			t.stay = fmt.Sprintf("starting from one part: at this rate %d at once would not each finish within %s", start, roundDuration(t.partLimit()))
 		default:
 			t.stay = fmt.Sprintf("one part at a time: at this rate a second would make each take over %s", roundDuration(t.partLimit()))
 		}

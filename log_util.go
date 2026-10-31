@@ -4,15 +4,19 @@
 package sdk
 
 import (
+	"encoding/hex"
 	"fmt"
-	"strconv"
-	"strings"
+	"log/slog"
 	"time"
-	"unicode/utf8"
+
+	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/sdk/compress"
+	"github.com/deepsecret-io/sdk/crypto"
 )
 
-// humanBytes renders a byte count in IEC units ("12.5 MiB"). Returns "0 B"
-// for zero or negative values so debug output is never blank.
+// humanBytes renders a byte count in IEC units ("12.50 MiB") for error
+// messages. Returns "0 B" for zero or negative values so a message never
+// shows a blank size.
 func humanBytes(b int64) string {
 	if b <= 0 {
 		return "0 B"
@@ -34,66 +38,74 @@ func humanBytes(b int64) string {
 	}
 }
 
-// threadLabel renders a thread-count value for debug logs. 0 means "use
-// SDK default"; render that explicitly so the log doesn't read as "no
-// threads".
-func threadLabel(v, sdkDefault int) string {
-	if v <= 0 {
-		return fmt.Sprintf("default(%d)", sdkDefault)
+// ── Logs the send and decrypt flows share ───────────────────────────────────
+
+// logPayload logs what a send is about to seal: the payload's type, its
+// size before compression (an estimate until it is written, since a file
+// payload adds headers to the files), and for an archive the size of the
+// files in it.
+func logPayload(log *slog.Logger, p *plaintext) {
+	args := []any{"type", p.payloadType, "estimated_size", api.Bytes(p.size), "archived", p.archived}
+	if p.archived {
+		args = append(args, "files_size", api.Bytes(p.originalSize))
 	}
-	return fmt.Sprintf("%d", v)
+	api.Module(log, "encrypt").Debug("payload", args...)
 }
 
-// formatRate returns a human-readable bytes-per-second rate ("12.4 MiB/s").
-// Returns "n/a" for zero/negative durations or zero bytes so debug output
-// never shows misleading "Inf" / "NaN" values when timing measurements are
-// too coarse to be meaningful.
-func formatRate(bytes int64, elapsed time.Duration) string {
-	if elapsed <= 0 || bytes <= 0 {
-		return "n/a"
+// logKeyPair logs the key pair a flow uses, by its fingerprint: the one
+// the caller asked for (requested), or the primary key the server lists.
+func logKeyPair(log *slog.Logger, fp, requested string) {
+	source := "primary"
+	if requested != "" {
+		source = "requested"
 	}
-	bps := float64(bytes) / elapsed.Seconds()
-	switch {
-	case bps >= 1024*1024*1024:
-		return fmt.Sprintf("%.2f GiB/s", bps/(1024*1024*1024))
-	case bps >= 1024*1024:
-		return fmt.Sprintf("%.2f MiB/s", bps/(1024*1024))
-	case bps >= 1024:
-		return fmt.Sprintf("%.2f KiB/s", bps/1024)
-	default:
-		return fmt.Sprintf("%.0f B/s", bps)
-	}
+	api.Module(log, "identity").Debug("key pair loaded", "fingerprint", fp, "source", source)
 }
 
-// sanitizeForLog escapes control characters in caller-supplied strings
-// (secret names, recipient emails, TTL strings) before they reach the
-// debug callback. ANSI escapes, NUL bytes, and other non-printable runes
-// can corrupt terminal output if a debug consumer prints them verbatim,
-// so we render them as Go-style escaped sequences.
-//
-// The result is intentionally NOT identical to %q output: we keep the
-// original visible content but only escape what's actually unsafe to
-// print. The caller still wraps the result in %q for display.
-func sanitizeForLog(s string) string {
-	if s == "" {
-		return s
+// logRecipientKeys logs the keys a send seals for a recipient: what was
+// checked of the bundle the server lists, and why the key is trusted
+// (keyTrust). actorID is "" when the send creates no secret.
+func logRecipientKeys(log *slog.Logger, email, actorID, fp string, own, first bool) {
+	args := []any{"email", email}
+	if actorID != "" {
+		args = append(args, "actor_id", actorID)
 	}
-	const maxLen = 256
-	if len(s) > maxLen {
-		s = s[:maxLen] + "...[truncated]"
+	args = append(args, "fingerprint", fp, "checked", "fingerprint and both self-signatures", "trust", keyTrust(own, first))
+	api.Module(log, "recipient").Debug("recipient keys verified", args...)
+}
+
+// logEncryptPlan logs how a payload is sealed for n recipients: the
+// protocol's cipher suite and chunk size, under a fresh content key.
+func logEncryptPlan(log *slog.Logger, n int) {
+	api.Module(log, "encrypt").Debug("plan", "cipher_suite", crypto.CipherSuite, "chunk_size", api.Bytes(crypto.ChunkSize), "recipients", n)
+}
+
+// logSealed logs a sealed payload: its compression, its encryption and the
+// signed manifest. written is what the payload wrote before compression,
+// in elapsed.
+func logSealed(log *slog.Logger, algo compress.Algorithm, sealed *crypto.Sealed, written int64, elapsed time.Duration) {
+	m := sealed.Manifest
+	if algo != compress.None {
+		api.Module(log, "compress").Debug("payload compressed", "algorithm", algo, "size", api.Bytes(written), "compressed", api.Bytes(m.PlaintextSize))
 	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		switch {
-		case r == utf8.RuneError:
-			b.WriteString(`�`)
-		case r < 0x20 || r == 0x7f:
-			b.WriteString(`\x`)
-			b.WriteString(strconv.FormatInt(int64(r), 16))
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
+	api.Module(log, "encrypt").Info("payload encrypted", "size", api.Bytes(written), "ciphertext", api.Bytes(m.CiphertextSize),
+		"elapsed", elapsed.Round(time.Millisecond), "rate", api.RateOf(written, elapsed))
+	api.Module(log, "manifest").Debug("manifest signed", "revision_id", m.RevisionID, "size", api.Bytes(int64(len(sealed.ManifestData))),
+		"payload_sha256", hex.EncodeToString(m.PayloadDigest), "recipients", len(m.Recipients))
+}
+
+// logManifestVerified logs a manifest crypto.Open verified, and the wrap
+// it opened for this device's key.
+func logManifestVerified(log *slog.Logger, m *crypto.Manifest, size int) {
+	api.Module(log, "manifest").Debug("manifest verified", "revision_id", m.RevisionID, "size", api.Bytes(int64(size)),
+		"version", m.Version, "cipher_suite", m.CipherSuite, "payload_type", m.PayloadType,
+		"sender_fingerprint", m.SenderFingerprint, "recipients", len(m.Recipients), "ciphertext", api.Bytes(m.CiphertextSize),
+		"checked", "sender fingerprint, both signatures, sender key, revision and wrap")
+}
+
+// logPayloadVerified logs a payload whose ciphertext a decrypt pass
+// checked against the signed manifest.
+func logPayloadVerified(log *slog.Logger, m *crypto.Manifest) {
+	api.Module(log, "verify").Debug("payload verified", "payload_sha256", hex.EncodeToString(m.PayloadDigest),
+		"checked", "size and digest, then every chunk in order to the last-chunk flag")
 }

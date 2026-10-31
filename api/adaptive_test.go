@@ -256,6 +256,44 @@ func TestTuner_KeepsASecondPartThatPaysOff(t *testing.T) {
 	}
 }
 
+// A start window in which nothing was sent, while the first part fetches
+// its URL and connects to storage, measures nothing: the upload stays at
+// one part, says so once, and makes its first decision on the first window
+// that moved bytes.
+func TestTuner_FirstDecisionWaitsForTheFirstBytes(t *testing.T) {
+	tu := uploadTuner()
+	var said []string
+	for _, rate := range []float64{0, 0, 66e6} {
+		before := tu.limit
+		tu.next(rate, 0)
+		if why, ok := tu.said(before); ok {
+			said = append(said, fmt.Sprintf("%d->%d %s", before, tu.limit, why))
+		}
+	}
+	want := []string{
+		"1->1 nothing sent yet: the first decision waits for the next window",
+		"1->4 the link can finish 4 parts at once within 1m",
+	}
+	if !slices.Equal(said, want) {
+		t.Fatalf("said %q\nwant %q", said, want)
+	}
+}
+
+// An upload of fewer parts than the usual start takes all of them on a
+// fast link, rather than holding at one as if the link were slow; on a
+// slow one it says how many it judged.
+func TestTuner_FewPartsStartWithAll(t *testing.T) {
+	fast := &tuner{limit: 1, max: 3, partSize: 8 << 20, start: true}
+	if fast.next(66e6, 0) != 3 || fast.reason != "the link can finish 3 parts at once within 1m" {
+		t.Fatalf("3 parts on a fast link: %d (%q)", fast.limit, fast.reason)
+	}
+	// 300 KB/s finishes 2 parts of 8 MiB a minute, not 3.
+	slow := &tuner{limit: 1, max: 3, partSize: 8 << 20, start: true}
+	if slow.next(300e3, 0) != 1 || slow.stay != "starting from one part: at this rate 3 at once would not each finish within 1m" {
+		t.Fatalf("3 parts on a slow link: %d (%q)", slow.limit, slow.stay)
+	}
+}
+
 // A debug log says each change, and why a count holds, once: a hold that
 // repeats is not said again until the count changes.
 func TestTuner_SaysWhyItHolds(t *testing.T) {
@@ -293,19 +331,6 @@ func TestTuner_SaysWhyItHolds(t *testing.T) {
 	}
 	if holds != 1 {
 		t.Fatalf("a transfer at its ceiling said so %d times, want once", holds)
-	}
-	if got := threadsChange(8, 8, 80e6, "at the most this transfer allows"); got != "stays at 8 at 76.29 MiB/s: at the most this transfer allows" {
-		t.Fatalf("a hold reads %q", got)
-	}
-}
-
-// A download's threads plan gives its settings, without the bound on parts
-// in flight that only an upload has.
-func TestThreadsPlan_Download(t *testing.T) {
-	lim := newLimiter(t.Context(), 0, 8, 0)
-	want := "adaptive: start 4, up to 8 (limit 64, at most one per range); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%"
-	if got := threadsPlan(lim, 0, MaxDownloadConcurrency, "range"); got != want {
-		t.Fatalf("download threads plan:\n got %q\nwant %q", got, want)
 	}
 }
 

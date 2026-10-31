@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -167,30 +168,6 @@ func (c *Client) MultipartStatus(revisionID string) (*MultipartStatus, error) {
 	return &out, nil
 }
 
-// humanBytesLocal renders a byte count in IEC units for debug log lines.
-// Tiny duplicate of the helper in the parent sdk package: sdk/api can't
-// import sdk (would create a cycle).
-func humanBytesLocal(b int64) string {
-	if b <= 0 {
-		return "0 B"
-	}
-	const (
-		kib = int64(1 << 10)
-		mib = int64(1 << 20)
-		gib = int64(1 << 30)
-	)
-	switch {
-	case b >= gib:
-		return fmt.Sprintf("%.2f GiB", float64(b)/float64(gib))
-	case b >= mib:
-		return fmt.Sprintf("%.2f MiB", float64(b)/float64(mib))
-	case b >= kib:
-		return fmt.Sprintf("%.2f KiB", float64(b)/float64(kib))
-	default:
-		return fmt.Sprintf("%d B", b)
-	}
-}
-
 // ── High-level helper ──────────────────────────────────────────────────────
 
 // MultipartUploadOptions configures the multipart-upload helper.
@@ -202,8 +179,8 @@ type MultipartUploadOptions struct {
 	// go out, one call at a time. The count drops back when a failed part
 	// is retried.
 	OnProgress func(int64, int64)
-	// OnDebug is called with structured debug events.
-	OnDebug func(step, message string)
+	// Logger receives the transfer's logs. Optional: nil logs nothing.
+	Logger *slog.Logger
 	// Status, when set, follows the upload part by part for a progress
 	// display.
 	Status *TransferStatus
@@ -235,11 +212,9 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	if totalSize <= 0 {
 		return fmt.Errorf("multipart upload: empty data")
 	}
-	debugf := func(step, format string, args ...any) {
-		if opts.OnDebug != nil {
-			opts.OnDebug(step, fmt.Sprintf(format, args...))
-		}
-	}
+	root := Logger(opts.Logger)
+	log := Module(root, "upload")
+	started := time.Now()
 	ctx, cancel := context.WithCancelCause(c.reqCtx())
 	defer cancel(nil)
 
@@ -286,10 +261,11 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 			work = append(work, i)
 		}
 	}
-	debugf("plan", "upload: multipart, %s in %d part(s) of %s (the server sizes parts: %s)",
-		humanBytesLocal(totalSize), count, humanBytesLocal(init.PartSize), PieceSizeRule)
+	// The server sizes the parts.
+	log.Debug("plan", "transfer", "multipart", "size", Bytes(totalSize), "parts", count, "part_size", Bytes(init.PartSize),
+		"url_batch", partURLBatch, "url_renew_before", partURLRenewMargin)
 	if kept > 0 {
-		debugf("plan", "resume: %d part(s) (%s) already in storage are kept; %d to upload", count-len(work), humanBytesLocal(kept), len(work))
+		Module(root, "resume").Debug("stored parts kept", "parts", count-len(work), "size", Bytes(kept), "parts_left", len(work))
 	}
 
 	var sent atomic.Int64
@@ -303,13 +279,13 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	}
 	opts.Status.start(totalSize, count, kept, count-len(work), lim)
 	if len(work) > 0 {
-		debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxUploadThreads, "part"))
-		debugf("plan", "part URLs: %d per request, fetched again %s before they expire or when storage refuses one", partURLBatch, roundDuration(partURLRenewMargin))
-		debugf("plan", "retries: %s", retryPlan())
+		threads := Module(log, "threads")
+		threads.Debug("plan", threadsPlan(lim, opts.Threads, MaxUploadThreads, "part")...)
+		log.Debug("retry plan", retryPlan()...)
 		queue := &partQueue{parts: parts, items: work}
 		lim.waiting = queue.left
 		go lim.tune(ctx, func(from, to int, rate float64, reason string) {
-			debugf("threads", "%s", threadsChange(from, to, rate, reason))
+			logThreads(threads, from, to, rate, reason)
 		})
 		var progressMu sync.Mutex
 		progress := func(n int) {
@@ -341,7 +317,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 					t0 := time.Now()
 					sum, err := partMD5(src, p)
 					if err == nil {
-						etags[idx], err = c.uploadPart(ctx, urls, lim, conn, p, src, base64.StdEncoding.EncodeToString(sum), progress)
+						etags[idx], err = c.uploadPart(ctx, log, urls, lim, conn, p, src, base64.StdEncoding.EncodeToString(sum), progress)
 					}
 					lim.release()
 					opts.Status.end(conn, err == nil)
@@ -349,7 +325,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 						cancel(fmt.Errorf("part %d: %w", p.Number, err))
 						return
 					}
-					debugf("multipart.upload", "part %d/%d size=%s in %s", p.Number, count, humanBytesLocal(p.Size), time.Since(t0).Round(time.Millisecond))
+					Trace(log, "part complete", "part", p.Number, "parts", count, "size", Bytes(p.Size), "elapsed", time.Since(t0).Round(time.Millisecond))
 				}
 			}()
 		}
@@ -367,7 +343,10 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	if err := c.retryAPI(ctx, func() error { return c.MultipartComplete(revisionID, final) }); err != nil {
 		return err
 	}
-	debugf("multipart.complete", "finalized %d parts in %s", count, time.Since(tComp).Round(time.Millisecond))
+	Trace(log, "upload finalized", "parts", count, "elapsed", time.Since(tComp).Round(time.Millisecond))
+	elapsed := time.Since(started)
+	log.Info("upload complete", "size", Bytes(totalSize), "parts", count, "sent", Bytes(totalSize-kept),
+		"elapsed", elapsed.Round(time.Millisecond), "rate", RateOf(totalSize-kept, elapsed))
 	return nil
 }
 
@@ -601,11 +580,12 @@ func (c *Client) retryAPI(ctx context.Context, call func() error) error {
 	return err
 }
 
-// uploadPart PUTs one part, retrying transient failures with backoff. A
-// URL storage refuses (403, usually expired) is presigned again and
-// retried at once; refused again, the upload fails, since a fresh URL
-// being refused is not an expiry. Returns the part's unquoted ETag.
-func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limiter, conn *connRun, p uploadPart, src io.ReaderAt, contentMD5 string, onChunk func(int)) (string, error) {
+// uploadPart PUTs one part, retrying transient failures with backoff, and
+// logs each retry. A URL storage refuses (403, usually expired) is
+// presigned again and retried at once; refused again, the upload fails,
+// since a fresh URL being refused is not an expiry. Returns the part's
+// unquoted ETag.
+func (c *Client) uploadPart(ctx context.Context, log *slog.Logger, urls *partURLCache, lim *limiter, conn *connRun, p uploadPart, src io.ReaderAt, contentMD5 string, onChunk func(int)) (string, error) {
 	var lastErr error
 	refused := false
 	for attempt := 0; attempt < multipartAttempts; attempt++ {
@@ -656,6 +636,9 @@ func (c *Client) uploadPart(ctx context.Context, urls *partURLCache, lim *limite
 			return "", err
 		}
 		lastErr = err
+		if attempt+1 < multipartAttempts {
+			log.Warn("retrying request", "part", p.Number, "attempt", attempt+2, "attempts", multipartAttempts, "error", err)
+		}
 	}
 	return "", fmt.Errorf("after %d attempts: %w", multipartAttempts, lastErr)
 }

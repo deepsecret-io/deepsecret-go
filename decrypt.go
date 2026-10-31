@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,7 +130,7 @@ type OpenedSecret struct {
 	spool      *spool
 	journal    *downloadJournal // records a kept download's ranges; nil otherwise
 	ctx        context.Context
-	debugf     func(step, format string, args ...any)
+	log        *slog.Logger
 	onProgress func(stage DecryptStage, done, total int64) // optional
 
 	// recordSender records the sender's key, new to this device, once a
@@ -188,27 +189,21 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		return nil, fmt.Errorf("secret ID is required")
 	}
 
-	debugf := func(step, format string, args ...any) {
-		if opt.OnDebug == nil {
-			return
-		}
-		opt.OnDebug(step, fmt.Sprintf(format, args...))
-	}
+	log := api.Logger(opt.Logger)
+	secretLog := api.Module(log, "secret")
 
-	debugf("fetch", "GET /secrets/%s", secretID)
 	secretInfo, err := c.DescribeSecret(secretID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch secret: %w", err)
 	}
-	debugf("fetch", "latest_revision=%s", secretInfo.LatestRevisionID)
-	debugf("fetch", "sender_id=%s", secretInfo.SenderID)
+	secretLog.Debug("secret fetched", "secret_id", secretInfo.ID, "name", secretInfo.Name, "latest_revision_id", secretInfo.LatestRevisionID, "sender_id", secretInfo.SenderID)
 
 	// Load recipient identity (explicit fingerprint or server-registered primary)
 	kp, localFP, err := c.loadIdentity(opt.Identity, opt.Password)
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
 	}
-	debugf("identity", "recipient fingerprint=%s", crypto.ShortFingerprint(localFP))
+	logKeyPair(log, localFP, opt.Identity)
 
 	// Resolve target revision and pre-validate fingerprint
 	rev, err := c.resolveRevision(secretID, secretInfo.LatestRevisionID, localFP, opt.Revision)
@@ -216,11 +211,13 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		return nil, err
 	}
 	targetRevID := rev.ID
-	debugf("revision", "target=%s", targetRevID)
-	debugf("revision", "recipients=%d", len(rev.Integrity.Recipients))
+	source := "latest"
+	if opt.Revision != "" {
+		source = "requested"
+	}
+	secretLog.Debug("revision chosen", "revision_id", targetRevID, "source", source, "recipients", len(rev.Integrity.Recipients))
 
 	// Fetch the signed manifest and the caller's own wrap.
-	debugf("manifest", "GET /secrets/revisions/%s/manifest", targetRevID)
 	rm, err := secrets.GetManifest(c.api, targetRevID)
 	if err != nil {
 		return nil, err
@@ -239,12 +236,6 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
-	debugf("manifest", "size=%s", humanBytes(int64(len(rm.Manifest))))
-	debugf("manifest", "version=%s", peek.Version)
-	debugf("manifest", "cipher=%s", peek.CipherSuite)
-	debugf("manifest", "payload_type=%s", peek.PayloadType)
-	debugf("manifest", "sender fingerprint=%s", crypto.ShortFingerprint(peek.SenderFingerprint))
-	debugf("manifest", "recipients=%d", len(peek.Recipients))
 	senderEmail, err := identity.ResolveActorEmail(c.api, secretInfo.SenderID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
@@ -253,7 +244,6 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
-	debugf("verify", "sender Ed25519 public key resolved")
 
 	opened, err := crypto.Open(rm.Manifest, wrap, kp, crypto.OpenParams{
 		RevisionID:    targetRevID,
@@ -263,10 +253,8 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		return nil, err
 	}
 	m := opened.Manifest
-	debugf("verify", "sender bundle bound to fingerprint, Ed25519 + ML-DSA-65 signatures verified")
-	debugf("verify", "manifest is for this revision and lists your key")
-	debugf("verify", "wrap matches the signed digest and opened (HPKE X25519 + ML-KEM-768)")
-	senderFirst, err := c.checkSenderKey(senderEmail, m.SenderFingerprint, debugf)
+	logManifestVerified(log, m, len(rm.Manifest))
+	senderFirst, err := c.checkSenderKey(senderEmail, m.SenderFingerprint, log)
 	if err != nil {
 		opened.Close()
 		return nil, fmt.Errorf("check sender %s: %w", senderEmail, err)
@@ -300,7 +288,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		sp = newMemSpool(m.CiphertextSize)
 	case opt.ResumeDir != "":
 		var rec *PendingDownload
-		if sp, rec, err = c.openDownloadSpool(opt.ResumeDir, secretInfo, m, debugf); err != nil {
+		if sp, rec, err = c.openDownloadSpool(opt.ResumeDir, secretInfo, m, log); err != nil {
 			opened.Close()
 			return nil, err
 		}
@@ -311,7 +299,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 			return nil, err
 		}
 	}
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress,
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), log: log, onProgress: opt.OnDecryptProgress,
 		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, senderFirst)}
 
 	// Download the ciphertext into the spool, or the ranges a kept
@@ -319,7 +307,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	dl := api.MultipartDownloadOptions{
 		Threads:              opt.DownloadThreads,
 		OnProgress:           opt.OnDownloadProgress,
-		OnDebug:              opt.OnDebug,
+		Logger:               opt.Logger,
 		Status:               opt.DownloadStatus,
 		PresignExpiryMinutes: opt.PresignExpiryMinutes,
 	}
@@ -329,16 +317,15 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		resumed = journal.rec.Downloaded()
 		go journal.run()
 	}
-	debugf("download", "revision=%s", targetRevID)
-	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(m.CiphertextSize-resumed)))
-	t0 := time.Now()
+	api.Module(log, "decrypt").Debug("ciphertext storage", sp.logArgs(spoolNeed(m.CiphertextSize-resumed))...)
+	// The download logs its plan and its completion.
 	err = c.api.DownloadToFile(targetRevID, sp, m.CiphertextSize, dl)
 	if journal != nil {
 		journal.halt()
 		o.journal = journal
 		if err != nil {
 			if cerr := journal.checkpoint(); cerr != nil {
-				debugf("resume", "recording the download failed: %v", cerr)
+				logRecordFailed(log, cerr)
 			}
 			if journal.rec.Downloaded() > 0 {
 				_ = o.Close() // the folder stays for the next decrypt (sp.keep); it holds ciphertext only, in a private (0700) directory.
@@ -351,13 +338,6 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		_ = o.Close()   // the download error is returned; the spool holds ciphertext only, in a private (0700) directory.
 		return nil, fmt.Errorf("download: %w", err)
 	}
-	dlElapsed := time.Since(t0)
-	debugf("download", "payload=%s", humanBytes(m.CiphertextSize))
-	if resumed > 0 {
-		debugf("download", "kept from an earlier download=%s", humanBytes(resumed))
-	}
-	debugf("download", "elapsed=%s", dlElapsed.Round(time.Millisecond))
-	debugf("download", "rate=%s", formatRate(m.CiphertextSize-resumed, dlElapsed))
 
 	o.Result = DecryptResult{
 		RevisionID:           targetRevID,
@@ -386,7 +366,7 @@ func (o *OpenedSecret) Close() error {
 	o.opened.Close()
 	if o.spool.keep && o.journal != nil {
 		if err := o.journal.checkpoint(); err != nil {
-			o.debugf("resume", "recording the download failed: %v", err)
+			logRecordFailed(o.log, err)
 		}
 	}
 	return o.spool.Close()
@@ -506,10 +486,9 @@ func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
 		return nil, err
 	}
 	o.spool.keep = false // decrypted: a kept download has done its job
-	o.debugf("verify", "payload sha256=%s… matches the signed manifest", hex.EncodeToString(m.PayloadDigest)[:12])
-	o.debugf("verify", "every chunk authenticated, in order, ending on the last-chunk flag")
-	o.debugf("decrypt", "plaintext=%s", humanBytes(int64(len(plaintext))))
-	o.debugf("decrypt", "elapsed=%s", time.Since(tDec).Round(time.Millisecond))
+	logPayloadVerified(o.log, m)
+	decElapsed := time.Since(tDec)
+	api.Module(o.log, "decrypt").Info("payload decrypted", "size", api.Bytes(int64(len(plaintext))), "elapsed", decElapsed.Round(time.Millisecond))
 	if err := o.decrypted(); err != nil {
 		return nil, err
 	}
@@ -696,8 +675,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	}); err != nil {
 		return nil, fmt.Errorf("check payload: %w", err)
 	}
-	o.debugf("verify", "payload sha256=%s… matches the signed manifest", hex.EncodeToString(m.PayloadDigest)[:12])
-	o.debugf("verify", "every chunk authenticated, in order, ending on the last-chunk flag")
+	logPayloadVerified(o.log, m)
 
 	var names []string
 	var total int64
@@ -740,7 +718,8 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 			return nil, err
 		}
 	}
-	o.debugf("verify", "checked %d payload entries in %s", len(names), time.Since(tCheck).Round(time.Millisecond))
+	api.Module(o.log, "decrypt").Debug("payload checked", "archived", info.Archive, "files", len(names), "size", api.Bytes(total),
+		"elapsed", time.Since(tCheck).Round(time.Millisecond))
 
 	// Directories made to hold decrypted files are private. undo records
 	// what the write creates, so a failure removes all of it.
@@ -750,6 +729,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 	}
 
 	// Pass 2: write.
+	tWrite := time.Now()
 	result := &WriteResult{Archived: info.Archive}
 	err := o.pass(DecryptWriting, func(r io.Reader) error {
 		out, err := payload.DecodeFiles(r, decLim, func(idx int, size int64, data io.Reader) error {
@@ -791,6 +771,14 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 		return nil, undo.Remove(err)
 	}
 	o.spool.keep = false // decrypted: a kept download has done its job
+	written := []any{"archived", info.Archive}
+	if info.Archive {
+		written = append(written, "extracted", result.Extracted)
+	} else {
+		written = append(written, "files", len(result.Files))
+	}
+	api.Module(o.log, "decrypt").Info("files written", append(written, "dir", dir, "size", api.Bytes(total),
+		"elapsed", time.Since(tWrite).Round(time.Millisecond))...)
 	return result, nil
 }
 

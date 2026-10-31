@@ -325,7 +325,8 @@ func TestUpload_ResumesFromStorage(t *testing.T) {
 	}
 	u.stored[3] = MultipartPartStatus{PartNumber: 3, Etag: strings.Repeat("0", 32), Size: part}
 	var first int64 = -1
-	err := u.client(t).MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{OnProgress: func(n, _ int64) {
+	var book logBook
+	err := u.client(t).MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{Logger: book.logger(), OnProgress: func(n, _ int64) {
 		if first < 0 {
 			first = n
 		}
@@ -347,6 +348,9 @@ func TestUpload_ResumesFromStorage(t *testing.T) {
 	if first != 4*part {
 		t.Fatalf("progress started at %d, want the kept %d bytes", first, 4*part)
 	}
+	book.has(t, "resume", "stored parts kept", map[string]any{"parts": 4, "size": Bytes(4 * part), "parts_left": 4})
+	// Its rate is of what it sent, not of the kept parts.
+	book.has(t, "upload", "upload complete", map[string]any{"size": Bytes(8 * part), "parts": 8, "sent": Bytes(4 * part)})
 }
 
 // Storage refusing a URL (expired) gets the part presigned again; a
@@ -358,8 +362,20 @@ func TestUpload_RecoversFromRefusalsFailuresAndStalls(t *testing.T) {
 	u.expireFirst = true
 	u.fail[2] = 2
 	u.stall[4] = 1
-	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{}); err != nil {
+	var book logBook
+	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
 		t.Fatal(err)
+	}
+	// Each retry is logged with the attempt it starts: part 2 failed on its
+	// second and third.
+	var part2 []int64
+	for _, r := range book.all("upload", "retrying request") {
+		if r.fields["part"].Int64() == 2 {
+			part2 = append(part2, r.fields["attempt"].Int64())
+		}
+	}
+	if !slices.Equal(part2, []int64{2, 3, 4}) {
+		t.Errorf("part 2 logged retries for attempts %v, want 2, 3 and 4", part2)
 	}
 	u.locked(func() {
 		// Every part was refused once, then part 2 failed twice and part 4
@@ -396,45 +412,42 @@ func TestUpload_RefusesASizeMismatch(t *testing.T) {
 	}
 }
 
-// Before moving data an upload reports its plan: the parts, the threads,
-// how part URLs are fetched, and how it retries.
+// Before moving data an upload logs its plan as fields: the parts, the
+// threads and how it retries; then each part, and its completion.
 func TestUpload_ReportsItsPlan(t *testing.T) {
 	const part = S3MinPartSize
 	u := newUploadServer(t, 3*part, part)
-	plans := map[string]string{}
-	opts := MultipartUploadOptions{OnDebug: func(step, msg string) {
-		if step == "plan" {
-			key, rest, _ := strings.Cut(msg, ": ")
-			plans[key] = rest
-		}
-	}}
-	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, opts); err != nil {
+	var book logBook
+	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
 		t.Fatal(err)
 	}
-	for key, want := range map[string]string{
-		"upload":    "multipart, 15.00 MiB in 3 part(s) of 5.00 MiB",
-		"part URLs": "100 per request",
-		"retries":   "8 attempts per request, waits doubling from 2s up to 1m; a request that moves no bytes for 1m30s restarts",
-	} {
-		if !strings.HasPrefix(plans[key], want) {
-			t.Errorf("plan %q: got %q, want it to start with %q", key, plans[key], want)
-		}
+	book.has(t, "upload", "plan", map[string]any{
+		"transfer": "multipart", "size": Bytes(3 * part), "parts": 3, "part_size": Bytes(part),
+		"url_batch": 100, "url_renew_before": 30 * time.Second,
+	})
+	book.has(t, "upload", "retry plan", map[string]any{
+		"attempts": 8, "first_wait": 2 * time.Second, "max_wait": time.Minute, "stall_timeout": 90 * time.Second,
+	})
+	// The threads plan gives the settings only: each decision is logged in
+	// the threads module with its own reason.
+	book.has(t, "upload.threads", "plan", map[string]any{
+		"mode": "adaptive", "start": 1, "max": 3, "cap": 32, "window": 5 * time.Second, "fast_window": 2 * time.Second,
+		"fast_rate": Rate(4e6), "gain_pct": 10, "part_time": time.Minute,
+	})
+	if n := len(book.all("upload", "part complete")); n != 3 {
+		t.Errorf("%d parts logged complete, want 3", n)
 	}
-	// The threads plan gives the settings only: each decision is a
-	// "threads" event with its own reason.
-	if want := "adaptive: start 1, up to 3 (limit 32, at most one per part); measured every 5s (2s from 3.81 MiB/s); an increase stays only if throughput rises over 10%; parts in flight must each finish within 1m at the measured rate; once every part has started, the count stays"; plans["threads"] != want {
-		t.Errorf("threads plan:\n got %q\nwant %q", plans["threads"], want)
+	book.has(t, "upload", "upload complete", map[string]any{"size": Bytes(3 * part), "parts": 3, "sent": Bytes(3 * part)})
+	if kept := book.all("resume", "stored parts kept"); len(kept) != 0 {
+		t.Errorf("a fresh upload logged kept parts: %v", kept)
 	}
 
-	plans = map[string]string{}
-	opts.Threads = 2
+	var fixed logBook
 	u2 := newUploadServer(t, 3*part, part)
-	if err := u2.client(t).MultipartUploadOpts("rev-1", patternSource{u2.size}, u2.size, opts); err != nil {
+	if err := u2.client(t).MultipartUploadOpts("rev-1", patternSource{u2.size}, u2.size, MultipartUploadOptions{Threads: 2, Logger: fixed.logger()}); err != nil {
 		t.Fatal(err)
 	}
-	if plans["threads"] != "fixed at 2 (requested)" {
-		t.Errorf("fixed threads plan: %q", plans["threads"])
-	}
+	fixed.has(t, "upload.threads", "plan", map[string]any{"mode": "fixed", "threads": 2, "requested": 2})
 }
 
 // On a slow link, parts finish one after another rather than all sharing
@@ -502,8 +515,7 @@ func TestUpload_LeavesOnePartWhenEachConnectionIsLimited(t *testing.T) {
 	const part = S3MinPartSize
 	u := newUploadServer(t, 16*part, part)
 	u.connRate = 16 << 20 // a part alone takes 0.31s, so the bound at one part allows 1.9 of them
-	var mu sync.Mutex
-	var said []string
+	var book logBook
 	var status TransferStatus
 	most := 0
 	done, sampled := make(chan struct{}), make(chan struct{})
@@ -520,27 +532,22 @@ func TestUpload_LeavesOnePartWhenEachConnectionIsLimited(t *testing.T) {
 	}()
 	err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{
 		Status: &status,
-		OnDebug: func(step, msg string) {
-			if step == "threads" {
-				mu.Lock()
-				said = append(said, msg)
-				mu.Unlock()
-			}
-		},
+		Logger: book.logger(),
 	})
 	close(done)
 	<-sampled
 	if err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
 	// Whether the bound held it at one when it tried depends on how fast
 	// the window measured; the tuner's tests pin what each case says.
-	if !slices.ContainsFunc(said, func(s string) bool { return strings.HasPrefix(s, "1 -> 2 ") }) {
-		t.Fatalf("the upload never tried a second part: %q", said)
+	increases := book.all("upload.threads", "increasing")
+	if !slices.ContainsFunc(increases, func(r record) bool {
+		return r.fields["from"].Int64() == 1 && r.fields["to"].Int64() == 2
+	}) {
+		t.Fatalf("the upload never tried a second part: %v", increases)
 	}
 	if most < 3 {
-		t.Fatalf("at most %d parts in flight: %q", most, said)
+		t.Fatalf("at most %d parts in flight: %v", most, increases)
 	}
 }

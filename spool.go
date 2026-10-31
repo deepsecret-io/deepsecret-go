@@ -10,6 +10,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+
+	"github.com/deepsecret-io/sdk/api"
 )
 
 // TempDirEnv names the environment variable that sets where sends and
@@ -196,21 +198,23 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// plan describes where the spool keeps the ciphertext, and the free space
-// the filesystem reports against what it needs, for a debug "plan" event.
-func (s *spool) plan(need int64) string {
+// logArgs says where the spool keeps the ciphertext, as log fields: in
+// memory, or in its private directory, with when that is removed and the
+// free space its filesystem reports against need.
+func (s *spool) logArgs(need int64) []any {
 	if s.file == nil {
-		return "in memory (small payload)"
+		return []any{"where", "memory"}
 	}
-	where := s.dir + " (private, removed when done)"
+	removed := "when done"
 	switch s.resume {
 	case "upload":
-		where = s.dir + " (private, kept until the upload finishes so it can resume)"
+		removed = "when done, unless a multipart upload fails and can resume"
 	case "download":
-		where = s.dir + " (private, kept until the payload is decrypted so the download can resume)"
+		removed = "once the payload is decrypted or fails its check"
 	}
+	args := []any{"where", s.dir, "removed", removed, "need", api.Bytes(need)}
 	if free, ok := freeDiskBytes(s.dir); ok {
-		where += fmt.Sprintf("; needs %s, %s free", humanBytes(need), humanBytes(free))
+		args = append(args, "free", api.Bytes(free))
 	}
-	return where
+	return args
 }

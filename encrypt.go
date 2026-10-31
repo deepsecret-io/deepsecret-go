@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -195,19 +196,15 @@ func (c *Client) EncryptPaths(recipients []string, paths []string, opt EncryptOp
 	return c.encryptExpandedFiles(recipients, expanded, opt)
 }
 
-// emitArchiveDecision logs the archive-mode decision through the OnDebug
-// callback. Always emits, even when archive is off, so the user can see
-// the decision was considered. The reason string is empty when archive is
-// off; we synthesize a "flat path" message in that case.
+// emitArchiveDecision logs whether the files go into one archive, and
+// why, also when they do not, so the decision shows in the log.
 func emitArchiveDecision(opt EncryptOptions, archiveOn bool, reason string, expanded []archive.ExpandedFile) {
-	if opt.OnDebug == nil {
-		return
-	}
+	log := api.Module(api.Logger(opt.Logger), "archive")
 	regular := regularFiles(expanded)
 	if archiveOn {
-		opt.OnDebug("archive", fmt.Sprintf("enabled: %s (entries=%d, regular_files=%d)", reason, len(expanded), regular))
+		log.Debug("archive enabled", "reason", reason, "entries", len(expanded), "regular_files", regular)
 	} else {
-		opt.OnDebug("archive", fmt.Sprintf("disabled: flat per-file payload (regular_files=%d)", regular))
+		log.Debug("archive disabled", "reason", reason, "regular_files", regular)
 	}
 }
 
@@ -221,16 +218,6 @@ func regularFiles(expanded []archive.ExpandedFile) int {
 		}
 	}
 	return n
-}
-
-// archiveSizeNote says, for the debug log, what an archive's plaintext
-// size holds: its files and their tar headers, so it is more than the
-// files alone (EncryptResult.OriginalSize).
-func archiveSizeNote(p *plaintext) string {
-	if !p.archived {
-		return ""
-	}
-	return fmt.Sprintf(" (the archive: %s of files plus tar headers)", humanBytes(p.originalSize))
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -302,18 +289,18 @@ func preflightExpandedSize(expanded []archive.ExpandedFile, limit int64) (int64,
 // A modified client that skips auto-archive and submits an over-tier file
 // count is rejected at the API boundary.
 //
-// Returns (archive, reason, err). reason is "" when archive=false.
+// Returns (archive, reason, err).
 func (c *Client) shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions) (bool, string, error) {
 	if opt.Archive {
-		return true, "manual --archive / --hide-metadata flag", nil
+		return true, "requested", nil
 	}
 	for _, ef := range expanded {
 		if ef.IsSymlink {
-			return true, fmt.Sprintf("symlink detected in tree (%s); flat payload cannot encode link targets", ef.RelPath), nil
+			return true, fmt.Sprintf("%s is a symbolic link, and only an archive carries link targets", ef.RelPath), nil
 		}
 	}
 	if !opt.AutoArchive {
-		return false, "", nil
+		return false, "not requested", nil
 	}
 	info, err := identity.WhoAmI(c.api)
 	if err != nil {
@@ -337,9 +324,9 @@ func (c *Client) shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptio
 		}
 	}
 	if regularCount > maxFiles {
-		return true, fmt.Sprintf("file count %d exceeds tier limit %d (auto-archive)", regularCount, maxFiles), nil
+		return true, fmt.Sprintf("%d files, more than the %d sent without an archive", regularCount, maxFiles), nil
 	}
-	return false, "", nil
+	return false, fmt.Sprintf("%d files, at most the %d sent without an archive", regularCount, maxFiles), nil
 }
 
 func (c *Client) encryptExpandedFiles(recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
@@ -479,18 +466,19 @@ var errSampleFull = errors.New("compression sample is full")
 
 // worthCompressing compresses the first compressionSample bytes of p and
 // reports whether they shrink by at least 5%. Payloads smaller than the
-// sample are decided on all of their bytes.
+// sample are decided on all of their bytes. An algorithm that cannot
+// compress the sample is an error, not a payload that does not shrink.
 func worthCompressing(p *plaintext, algo compress.Algorithm) (bool, error) {
 	sample := &sampleWriter{max: compressionSample}
 	if err := p.write(sample); err != nil && !errors.Is(err, errSampleFull) {
-		return false, err
+		return false, fmt.Errorf("read payload: %w", err)
 	}
 	if len(sample.buf) == 0 {
 		return false, nil
 	}
 	n, err := compress.CompressedSize(sample.buf, algo)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("compress: %w", err)
 	}
 	return n <= int64(len(sample.buf))*95/100, nil
 }
@@ -622,12 +610,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if opt.LocalFile != "" {
 		return c.encryptToFile(recipients, p, opt)
 	}
-	debugf := func(step, format string, args ...any) {
-		if opt.OnDebug == nil {
-			return
-		}
-		opt.OnDebug(step, fmt.Sprintf(format, args...))
-	}
+	log := api.Logger(opt.Logger)
 
 	// Input validation
 	if err := ValidateRecipients(recipients); err != nil {
@@ -636,11 +619,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if p.size == 0 {
 		return nil, fmt.Errorf("payload is empty")
 	}
-	debugf("encrypt", "payload type=%s", p.payloadType)
-	debugf("encrypt", "plaintext size=%s%s", humanBytes(p.size), archiveSizeNote(p))
-	if p.archived {
-		debugf("encrypt", "archived=true")
-	}
+	logPayload(log, p)
 
 	// Enforce payload size limit before expensive operations
 	if maxSize := maxPayloadSize(opt); p.size > maxSize {
@@ -657,8 +636,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if actorInfo.OrgID == "" {
 		return nil, fmt.Errorf("no organization found: activate a plan first")
 	}
-	debugf("actor", "org=%s", actorInfo.OrgID)
-	debugf("actor", "tier=%s", actorInfo.TierName)
+	api.Module(log, "auth").Debug("account resolved", "actor_id", actorInfo.ID, "org_id", actorInfo.OrgID, "tier", actorInfo.TierName)
 
 	// Phase 5 removed per-tier limits from /api/me. The backend
 	// authoritatively enforces max payload size, TTL policy, and IP
@@ -672,8 +650,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if err != nil {
 		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
-	debugf("identity", "sender fingerprint=%s", crypto.ShortFingerprint(senderFP))
-	debugf("verify", "sender identity loaded (X25519+Ed25519, ML-KEM-768+ML-DSA-65)")
+	logKeyPair(log, senderFP, opt.Identity)
 
 	// Resolve every recipient's actor id and primary keys. The sender is a
 	// recipient only when the caller listed them: by one of their accounts
@@ -700,13 +677,10 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		if first {
 			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: keys.Fingerprint})
 		}
-		debugf("recipient", "email=%s fingerprint=%s actor_id=%s",
-			sanitizeForLog(email), crypto.ShortFingerprint(keys.Fingerprint), actorID)
-		debugf("verify", "recipient %s: %s", sanitizeForLog(email), recipientKeyNote(keys.Fingerprint, self, first))
+		logRecipientKeys(log, email, actorID, keys.Fingerprint, self, first)
 	}
-	debugf("verify", "recipient key bundles from the server (%d): fingerprint and both self-signatures checked; not proof the keys are the recipient's (compare fingerprints with them)", len(recipients))
 
-	algo, err := chooseCompression(p, opt.Compress, debugf)
+	algo, err := chooseCompression(p, opt.Compress, log)
 	if err != nil {
 		return nil, err
 	}
@@ -722,8 +696,8 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		}
 	}
 	defer sp.Close()
-	debugf("plan", "encryption: %s", encryptionPlan(len(pubs)))
-	debugf("plan", "ciphertext: %s", sp.plan(spoolNeed(p.size)))
+	logEncryptPlan(log, len(pubs))
+	api.Module(log, "encrypt").Debug("ciphertext storage", sp.logArgs(spoolNeed(p.size))...)
 
 	tEnc := time.Now()
 	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
@@ -735,20 +709,10 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
-	encElapsed := time.Since(tEnc)
+	logSealed(log, algo, sealed, written, time.Since(tEnc))
 	m := sealed.Manifest
 	digestHex := hex.EncodeToString(m.PayloadDigest)
 	compressionLabel, compressionRatio, originalSize := compressionSummary(p, algo, m, written)
-	if algo != compress.None && written > 0 {
-		debugf("compress", "ratio=%.1f%%", float64(m.PlaintextSize)/float64(written)*100)
-	}
-	debugf("encrypt", "input=%s", humanBytes(written))
-	debugf("encrypt", "payload=%s", humanBytes(m.CiphertextSize))
-	debugf("encrypt", "manifest=%s", humanBytes(int64(len(sealed.ManifestData))))
-	debugf("encrypt", "elapsed=%s", encElapsed.Round(time.Millisecond))
-	debugf("encrypt", "rate=%s", formatRate(written, encElapsed))
-	debugf("verify", "manifest binds the payload digest and every recipient's wrap")
-	debugf("verify", "payload sha256=%s…", digestHex[:12])
 
 	inputs := make([]secrets.RecipientInput, len(recipients))
 	sentTo := make([]Recipient, len(recipients))
@@ -815,24 +779,21 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		req.AllowedIPs = opt.IPs
 	}
 
-	debugf("create", "POST /secrets")
-	debugf("create", "name=%q", sanitizeForLog(req.Name))
-	debugf("create", "recipients=%d", len(req.Recipients))
-	debugf("create", "payload size=%s", humanBytes(req.Size))
+	secretLog := api.Module(log, "secret")
+	createArgs := []any{"name", req.Name, "revision_id", req.RevisionID, "recipients", len(req.Recipients), "size", api.Bytes(req.Size)}
 	if p.archived {
-		debugf("create", "files=archived")
+		createArgs = append(createArgs, "archived", true)
 	} else {
-		debugf("create", "files=%d", req.FilesCount)
+		createArgs = append(createArgs, "files", req.FilesCount)
 	}
-	if opt.RevokeMissing {
-		debugf("create", "revoke_missing=true")
+	createArgs = append(createArgs, "revoke_missing", req.RevokeMissing)
+	if req.TTLSeconds > 0 {
+		createArgs = append(createArgs, "ttl", time.Duration(req.TTLSeconds)*time.Second)
 	}
-	if opt.TTL != "" {
-		debugf("policy", "ttl=%s", sanitizeForLog(opt.TTL))
+	if len(req.AllowedIPs) > 0 {
+		createArgs = append(createArgs, "allowed_ips", len(req.AllowedIPs))
 	}
-	if len(opt.IPs) > 0 {
-		debugf("policy", "ip_lock=%d entries", len(opt.IPs))
-	}
+	secretLog.Debug("creating secret", createArgs...)
 	secret, revoked, err := secrets.Create(c.api, req)
 	if err != nil {
 		// A send under an existing name that leaves out people who have
@@ -844,10 +805,9 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		}
 		return nil, err
 	}
-	debugf("create", "secret_id=%s", secret.ID)
-	debugf("create", "revision_id=%s", revisionID)
+	secretLog.Info("secret created", "secret_id", secret.ID, "revision_id", revisionID, "multipart", secret.IsMultipart)
 	for _, r := range revoked {
-		debugf("create", "revoked=%s", sanitizeForLog(r.Email))
+		secretLog.Info("access revoked", "secret_id", secret.ID, "actor_id", r.ID, "email", r.Email)
 	}
 
 	// Upload AFTER the revision record exists so the backend's presign flow
@@ -864,37 +824,32 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		if err != nil {
 			return nil, err
 		}
-		tUp := time.Now()
+		// The multipart upload logs its plan, and its completion once the
+		// server has assembled the parts.
 		if err := c.api.MultipartUploadOpts(revisionID, sp, size, api.MultipartUploadOptions{
 			Threads:    opt.UploadThreads,
 			OnProgress: opt.OnUploadProgress,
-			OnDebug:    opt.OnDebug,
+			Logger:     opt.Logger,
 			Status:     opt.UploadStatus,
 		}); err != nil {
 			return nil, uploadFailed(sp, pending, err)
 		}
-		upElapsed := time.Since(tUp)
-		debugf("upload", "elapsed=%s", upElapsed.Round(time.Millisecond))
-		debugf("upload", "rate=%s", formatRate(size, upElapsed))
-		debugf("verify", "server completed multipart upload (HEAD-verified size)")
 	} else {
-		debugf("plan", "upload: %s", api.SinglePutPlan(size, opt.PresignExpiryMinutes))
+		api.LogSinglePutPlan(log, size, opt.PresignExpiryMinutes)
 		tUp := time.Now()
 		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus); err != nil {
 			return nil, fmt.Errorf("upload: %w", err)
 		}
-		upElapsed := time.Since(tUp)
-		debugf("upload", "elapsed=%s", upElapsed.Round(time.Millisecond))
-		debugf("upload", "rate=%s", formatRate(size, upElapsed))
 
-		// Confirm the upload so the backend HEAD-verifies size/etag and marks
-		// the revision downloadable. Without this, downloads fall back to
-		// on-demand verification at extra latency.
-		debugf("confirm", "POST /secrets/revisions/%s/confirm", revisionID)
+		// Confirm the upload so the server checks the stored object's size
+		// and marks the revision downloadable: until then a download of it
+		// is refused.
 		if err := c.api.ConfirmUpload(revisionID); err != nil {
 			return nil, fmt.Errorf("confirm upload: %w", err)
 		}
-		debugf("verify", "server confirmed upload (HEAD-verified size and etag)")
+		upElapsed := time.Since(tUp)
+		api.Module(log, "upload").Info("upload complete", "size", api.Bytes(size), "parts", 1, "sent", api.Bytes(size),
+			"elapsed", upElapsed.Round(time.Millisecond), "rate", api.RateOf(size, upElapsed))
 	}
 
 	// Sent: the keys new to this device that it went to are accepted now.
@@ -966,46 +921,43 @@ func (c *Client) recipientKeys(known map[string][]knownKeyDisk, email string, se
 	return keys, first, nil
 }
 
-// recipientKeyNote says, for the debug log, why a recipient's key fp was
-// trusted.
-func recipientKeyNote(fp string, self, first bool) string {
+// keyTrust says, for the log, why a key was accepted: it is the user's
+// own, on this device; it is new to this device, accepted on first use
+// once the send or decrypt succeeds; or this device accepted it before.
+func keyTrust(own, first bool) string {
 	switch {
-	case self:
-		return fmt.Sprintf("you: key %s is on this device", crypto.ShortFingerprint(fp))
+	case own:
+		return "own"
 	case first:
-		return fmt.Sprintf("key %s is new to this device: accepted on first use once the send succeeds (compare fingerprints with them)", crypto.ShortFingerprint(fp))
+		return "first_use"
 	}
-	return fmt.Sprintf("key %s is the one this device accepted for them", crypto.ShortFingerprint(fp))
+	return "known"
 }
 
-// chooseCompression picks how p is compressed. An archive is always
-// zstd-compressed: the tar inside it is not. Other payloads are compressed
-// with want when it is set and a sample of them shrinks by at least 5%.
-func chooseCompression(p *plaintext, want compress.Algorithm, debugf func(step, format string, args ...any)) (compress.Algorithm, error) {
+// chooseCompression picks how p is compressed, and logs why. An archive is
+// always zstd-compressed: the tar inside it is not. Other payloads are
+// compressed with want when it is set and a sample of them shrinks by at
+// least 5%.
+func chooseCompression(p *plaintext, want compress.Algorithm, log *slog.Logger) (compress.Algorithm, error) {
+	log = api.Module(log, "compress")
 	switch {
 	case p.archived:
-		debugf("plan", "compression: zstd (an archive is always compressed)")
+		log.Debug("compression enabled", "algorithm", compress.Zstd, "reason", "an archive is always compressed")
 		return compress.Zstd, nil
 	case want == "" || want == compress.None:
-		debugf("plan", "compression: none (not requested)")
+		log.Debug("compression disabled", "reason", "not requested")
 		return compress.None, nil
 	}
 	worth, err := worthCompressing(p, want)
 	if err != nil {
-		return "", fmt.Errorf("read payload: %w", err)
+		return "", err
 	}
 	if !worth {
-		debugf("plan", "compression: none (a sample of the payload did not shrink by 5%%)")
+		log.Debug("compression disabled", "requested", want, "reason", "a sample of the payload did not shrink by 5%")
 		return compress.None, nil
 	}
-	debugf("plan", "compression: %s (a sample of the payload shrank by at least 5%%)", want)
+	log.Debug("compression enabled", "algorithm", want, "reason", "a sample of the payload shrank by at least 5%")
 	return want, nil
-}
-
-// encryptionPlan describes how a payload is sealed for n recipients.
-func encryptionPlan(n int) string {
-	return fmt.Sprintf("AES-256-GCM in %s chunks under a fresh content key, wrapped for %d recipient%s with HPKE (X25519 + ML-KEM-768); manifest signed with Ed25519 + ML-DSA-65",
-		humanBytes(crypto.ChunkSize), n, pluralSuffix(n))
 }
 
 // compressionSummary describes a sealed payload's compression: its label
@@ -1028,14 +980,6 @@ func compressionSummary(p *plaintext, algo compress.Algorithm, m *crypto.Manifes
 		return string(algo), ratio, written
 	}
 	return "", 0, written
-}
-
-// pluralSuffix returns "s" when n != 1.
-func pluralSuffix(n int) string {
-	if n == 1 {
-		return ""
-	}
-	return "s"
 }
 
 // parseTTL parses a TTL string into seconds. Only accepts:

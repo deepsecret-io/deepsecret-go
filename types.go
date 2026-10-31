@@ -4,6 +4,8 @@
 package sdk
 
 import (
+	"log/slog"
+
 	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/identity"
@@ -126,10 +128,9 @@ type EncryptOptions struct {
 	// equals it; done never passes it. Optional.
 	OnEncryptProgress func(done, total int64)
 
-	// OnDebug is called at each step of the encrypt/upload flow with a
-	// short context tag ("encrypt", "upload", "confirm", ...) and a message.
-	// Wire it to your CLI's debug logger. Optional.
-	OnDebug func(step, message string)
+	// Logger receives the flow's logs, each naming its module (see
+	// api.ModuleKey). Optional: nil logs nothing.
+	Logger *slog.Logger
 
 	// AutoArchive bundles files into a tar archive when the file count
 	// exceeds the tier's MaxFilesPerSecret limit. When true, the SDK fetches
@@ -232,8 +233,8 @@ type DecryptOptions struct {
 	// the way. Optional.
 	OnDecryptProgress func(stage DecryptStage, done, total int64)
 
-	// OnDebug is called at each step of the download/decrypt flow. Optional.
-	OnDebug func(step, message string)
+	// Logger receives the flow's logs, as for EncryptOptions. Optional.
+	Logger *slog.Logger
 
 	// Password is the password for decrypting password-protected identity keys.
 	Password string

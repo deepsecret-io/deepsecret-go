@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/crypto"
 	"github.com/deepsecret-io/sdk/identity"
 )
@@ -341,13 +343,16 @@ func (c *Client) recordFirstUse(people []Recipient, sender bool) error {
 }
 
 // checkSenderKey checks fp, the key whose signatures on a secret from email
-// just verified. A key on this device is the user's own and passes;
-// anyone else's must pass checkKey. It changes nothing: a key new to this
-// device is reported as first, for recordFirstUse once the decrypt
-// succeeds.
-func (c *Client) checkSenderKey(email, fp string, debugf func(step, format string, args ...any)) (bool, error) {
+// just verified, and logs why it is trusted. A key on this device is the
+// user's own and passes; anyone else's must pass checkKey. It changes
+// nothing: a key new to this device is reported as first, for
+// recordFirstUse once the decrypt succeeds.
+func (c *Client) checkSenderKey(email, fp string, log *slog.Logger) (bool, error) {
+	verified := func(own, first bool) {
+		api.Module(log, "verify").Debug("sender key verified", "email", email, "fingerprint", fp, "trust", keyTrust(own, first))
+	}
 	if isLocalKey(fp) {
-		debugf("verify", "sender key %s is on this device: yours", crypto.ShortFingerprint(fp))
+		verified(true, false)
 		return false, nil
 	}
 	disk, err := c.knownKeys().read()
@@ -355,12 +360,8 @@ func (c *Client) checkSenderKey(email, fp string, debugf func(step, format strin
 		return false, err
 	}
 	first, err := checkKey(disk.Servers[c.knownServer()], strings.ToLower(email), fp, true)
-	switch {
-	case err != nil:
-	case first:
-		debugf("verify", "sender key %s is new to this device: accepted on first use once the decrypt succeeds (compare fingerprints with them)", crypto.ShortFingerprint(fp))
-	default:
-		debugf("verify", "sender key %s is one this device accepted for them", crypto.ShortFingerprint(fp))
+	if err == nil {
+		verified(false, first)
 	}
 	return first, err
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 
+	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/crypto"
 	"github.com/deepsecret-io/sdk/identity"
@@ -108,12 +109,7 @@ var localDecMode = func() cbor.DecMode {
 // encryptToFile is encryptAndSend for EncryptOptions.LocalFile: it seals p
 // for recipients into the file instead of sending it.
 func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOptions) (*EncryptResult, error) {
-	debugf := func(step, format string, args ...any) {
-		if opt.OnDebug == nil {
-			return
-		}
-		opt.OnDebug(step, fmt.Sprintf(format, args...))
-	}
+	log := api.Logger(opt.Logger)
 	if err := ValidateRecipients(recipients); err != nil {
 		return nil, err
 	}
@@ -133,14 +129,14 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	if err := checkFreeSpace(dir, spoolNeed(p.size), "the encrypted file", ""); err != nil {
 		return nil, err
 	}
-	debugf("encrypt", "payload type=%s", p.payloadType)
-	debugf("encrypt", "plaintext size=%s%s", humanBytes(p.size), archiveSizeNote(p))
-	need := spoolNeed(p.size)
+	logPayload(log, p)
+	// The ciphertext is sealed into a private file beside out and renamed
+	// to it when complete.
+	storage := []any{"where", out, "need", api.Bytes(spoolNeed(p.size))}
 	if free, ok := freeDiskBytes(dir); ok {
-		debugf("plan", "local file: %s, sealed into a private file beside it and renamed when complete; needs %s, %s free", out, humanBytes(need), humanBytes(free))
-	} else {
-		debugf("plan", "local file: %s, sealed into a private file beside it and renamed when complete; needs %s", out, humanBytes(need))
+		storage = append(storage, "free", api.Bytes(free))
 	}
+	api.Module(log, "encrypt").Debug("ciphertext storage", storage...)
 
 	// The sender's email goes in the file, so the recipient's client can
 	// check the signing key against the keys that account registered.
@@ -152,7 +148,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	if err != nil {
 		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
-	debugf("identity", "sender fingerprint=%s", crypto.ShortFingerprint(senderFP))
+	logKeyPair(log, senderFP, opt.Identity)
 	known, err := c.recordOwnAccount(me.Email, senderFP, false)
 	if err != nil {
 		return nil, err
@@ -169,14 +165,13 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		if first {
 			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: keys.Fingerprint})
 		}
-		debugf("recipient", "email=%s fingerprint=%s", sanitizeForLog(email), crypto.ShortFingerprint(keys.Fingerprint))
-		debugf("verify", "recipient %s: %s", sanitizeForLog(email), recipientKeyNote(keys.Fingerprint, self, first))
+		logRecipientKeys(log, email, "", keys.Fingerprint, self, first)
 	}
-	algo, err := chooseCompression(p, opt.Compress, debugf)
+	algo, err := chooseCompression(p, opt.Compress, log)
 	if err != nil {
 		return nil, err
 	}
-	debugf("plan", "encryption: %s", encryptionPlan(len(pubs)))
+	logEncryptPlan(log, len(pubs))
 
 	// Seal into a private file beside the destination, renamed into place
 	// once complete, so a failure never leaves a partial file under it.
@@ -205,9 +200,8 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
+	logSealed(log, algo, sealed, written, time.Since(tEnc))
 	m := sealed.Manifest
-	debugf("encrypt", "payload=%s", humanBytes(m.CiphertextSize))
-	debugf("encrypt", "elapsed=%s", time.Since(tEnc).Round(time.Millisecond))
 
 	var length [8]byte
 	binary.BigEndian.PutUint64(length[:], uint64(m.CiphertextSize)) // #nosec G115 -- the byte count the seal just wrote, never negative.
@@ -250,7 +244,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		_ = os.Remove(out) // the file was just written by this send, and its error is returned.
 		return nil, fmt.Errorf("recording the recipients' keys on this device failed, so %s was removed: %w", out, err)
 	}
-	debugf("local", "wrote %s", humanBytes(localPrefixLen+m.CiphertextSize+int64(len(data))))
+	api.Module(log, "encrypt").Info("local file written", "file", out, "size", api.Bytes(localPrefixLen+m.CiphertextSize+int64(len(data))))
 
 	label, ratio, original := compressionSummary(p, algo, m, written)
 	result := &EncryptResult{
@@ -283,12 +277,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 // OnDownloadProgress reports the copy. Revision and the download options
 // do not apply.
 func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, error) {
-	debugf := func(step, format string, args ...any) {
-		if opt.OnDebug == nil {
-			return
-		}
-		opt.OnDebug(step, fmt.Sprintf(format, args...))
-	}
+	log := api.Logger(opt.Logger)
 	f, err := os.Open(path) // #nosec G304 -- the local file the caller asked to open; its contents are checked as untrusted.
 	if err != nil {
 		return nil, err
@@ -305,15 +294,15 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	debugf("local", "file=%s", path)
-	debugf("local", "sender=%s", sanitizeForLog(hdr.SenderEmail))
-	debugf("local", "recipients=%d", len(hdr.Wraps))
+	// The sender's email and the wraps' emails are labels the signature
+	// does not cover: they are checked below.
+	api.Module(log, "decrypt").Debug("local file read", "file", path, "sender", hdr.SenderEmail, "wraps", len(hdr.Wraps), "payload_size", api.Bytes(payloadSize))
 
 	kp, localFP, err := c.loadIdentity(opt.Identity, opt.Password)
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
 	}
-	debugf("identity", "recipient fingerprint=%s", crypto.ShortFingerprint(localFP))
+	logKeyPair(log, localFP, opt.Identity)
 	var wrap *crypto.Wrap
 	emails := make(map[string]string, len(hdr.Wraps))
 	for _, w := range hdr.Wraps {
@@ -342,7 +331,6 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if err != nil {
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
 	}
-	debugf("verify", "sender key %s is registered to %s", crypto.ShortFingerprint(peek.SenderFingerprint), sanitizeForLog(hdr.SenderEmail))
 	opened, err := crypto.Open(hdr.Manifest, wrap, kp, crypto.OpenParams{
 		RevisionID:    peek.RevisionID,
 		SenderED25519: senderED25519,
@@ -351,9 +339,8 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		return nil, err
 	}
 	m := opened.Manifest
-	debugf("verify", "sender bundle bound to fingerprint, Ed25519 + ML-DSA-65 signatures verified")
-	debugf("verify", "wrap matches the signed digest and opened (HPKE X25519 + ML-KEM-768)")
-	senderFirst, err := c.checkSenderKey(hdr.SenderEmail, m.SenderFingerprint, debugf)
+	logManifestVerified(log, m, len(hdr.Manifest))
+	senderFirst, err := c.checkSenderKey(hdr.SenderEmail, m.SenderFingerprint, log)
 	if err != nil {
 		opened.Close()
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
@@ -379,8 +366,10 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		opened.Close()
 		return nil, err
 	}
-	debugf("plan", "local file: the %s payload is copied before it is checked, so the file cannot change under the checks, to %s", humanBytes(payloadSize), sp.plan(m.CiphertextSize))
-	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), debugf: debugf, onProgress: opt.OnDecryptProgress,
+	// The payload is copied before it is checked, so the file cannot change
+	// under the checks.
+	api.Module(log, "decrypt").Debug("ciphertext storage", sp.logArgs(m.CiphertextSize)...)
+	o := &OpenedSecret{opened: opened, spool: sp, ctx: c.api.Context(), log: log, onProgress: opt.OnDecryptProgress,
 		recordSender: c.senderRecorder(hdr.SenderEmail, m.SenderFingerprint, senderFirst)}
 	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
 	if opt.OnDownloadProgress != nil {
@@ -406,7 +395,9 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 			if checked > maxCheckedLabels {
 				email = ""
 			} else if _, err := identity.ResolveED25519ByEmail(c.api, email, r.Fingerprint); err != nil {
-				debugf("verify", "recipient label %s does not own key %s; not shown", sanitizeForLog(email), crypto.ShortFingerprint(r.Fingerprint))
+				// Not shown whatever the reason: the account does not own
+				// the key, or the lookup failed.
+				api.Module(log, "verify").Warn("recipient label not verified", "email", email, "fingerprint", r.Fingerprint, "error", err)
 				email = ""
 			}
 		}

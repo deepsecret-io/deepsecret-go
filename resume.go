@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -71,8 +72,8 @@ type ResumeOptions struct {
 	OnUploadProgress func(transferred, total int64)
 	// UploadStatus follows the upload, as for EncryptOptions.
 	UploadStatus *TransferStatus
-	// OnDebug receives debug events, as for EncryptOptions.
-	OnDebug func(step, message string)
+	// Logger receives the flow's logs, as for EncryptOptions.
+	Logger *slog.Logger
 }
 
 // newSendSpool creates the spool a send seals into: a folder named after
@@ -294,7 +295,7 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 	err = c.api.MultipartUploadOpts(revisionID, f, p.Size, api.MultipartUploadOptions{
 		Threads:    opt.UploadThreads,
 		OnProgress: opt.OnUploadProgress,
-		OnDebug:    opt.OnDebug,
+		Logger:     opt.Logger,
 		Status:     opt.UploadStatus,
 	})
 	if err != nil {

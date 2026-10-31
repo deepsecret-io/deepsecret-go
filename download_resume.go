@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -115,7 +116,7 @@ func (e *DownloadInterruptedError) Unwrap() error { return e.Err }
 // starts one there, locked for this decrypt. The record's Have is what the
 // spool already holds. A kept download that does not agree with m, or that
 // came from another server, starts over.
-func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *crypto.Manifest, debugf func(step, format string, args ...any)) (*spool, *PendingDownload, error) {
+func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *crypto.Manifest, log *slog.Logger) (*spool, *PendingDownload, error) {
 	if id, err := uuid.Parse(m.RevisionID); err != nil || id.String() != m.RevisionID {
 		return nil, nil, fmt.Errorf("revision ID %q is not a UUID", m.RevisionID)
 	}
@@ -132,7 +133,7 @@ func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *crypto.Man
 		RevisionID: m.RevisionID, SecretID: secret.ID, Name: secret.Name, Size: m.CiphertextSize,
 		PayloadDigest: hex.EncodeToString(m.PayloadDigest), APIURL: c.api.BaseURL(), Dir: pdir,
 	}
-	f, rec, err := openKeptDownload(pdir, want, debugf)
+	f, rec, err := openKeptDownload(pdir, want, api.Module(log, "resume"))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -149,8 +150,8 @@ func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *crypto.Man
 // openKeptDownload opens pdir's payload, creating the folder and the
 // payload when missing, and locks it. It returns the kept record when it
 // describes want's payload, and otherwise empties the payload and records
-// want, holding nothing.
-func openKeptDownload(pdir string, want *PendingDownload, debugf func(step, format string, args ...any)) (*os.File, *PendingDownload, error) {
+// want, holding nothing. log is the "resume" module.
+func openKeptDownload(pdir string, want *PendingDownload, log *slog.Logger) (*os.File, *PendingDownload, error) {
 	if err := os.Mkdir(pdir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, nil, fmt.Errorf("create download folder: %w", err)
 	}
@@ -168,16 +169,16 @@ func openKeptDownload(pdir string, want *PendingDownload, debugf func(step, form
 		// Some network filesystems have no locks. The lock only keeps two
 		// decrypts from sharing the folder; the digest check does not
 		// depend on it.
-		debugf("resume", "the download file cannot be locked here (%v): a second decrypt of this revision would share it", err)
+		log.Warn("download file not locked", "dir", pdir, "error", err, "reason", "a second decrypt of this revision could share it")
 	}
 
 	kept, why := keptRecord(pdir, f, want)
 	if kept != nil {
-		debugf("resume", "kept download: %s of %s, recorded %s", humanBytes(kept.Downloaded()), humanBytes(kept.Size), kept.UpdatedAt.Format(time.RFC3339))
+		log.Debug("resuming download", "revision_id", kept.RevisionID, "held", api.Bytes(kept.Downloaded()), "size", api.Bytes(kept.Size), "recorded_at", kept.UpdatedAt)
 		return f, kept, nil
 	}
 	if why != "" {
-		debugf("resume", "kept download starts over: %s", why)
+		log.Warn("kept download discarded", "revision_id", want.RevisionID, "reason", why)
 	}
 	now := time.Now().UTC()
 	rec := *want
@@ -399,6 +400,12 @@ func (j *downloadJournal) checkpoint() error {
 		j.mu.Unlock()
 	}
 	return err
+}
+
+// logRecordFailed logs a kept download whose ranges could not be
+// recorded: the next decrypt fetches again what the record does not list.
+func logRecordFailed(log *slog.Logger, err error) {
+	api.Module(log, "resume").Warn("download record not written", "error", err)
 }
 
 // removeKeptDownload removes a kept download's folder unless a decrypt is

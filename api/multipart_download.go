@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -72,8 +73,8 @@ type MultipartDownloadOptions struct {
 	// complete, one call at a time.
 	OnProgress func(transferred, total int64)
 
-	// OnDebug is called with structured debug events. Optional.
-	OnDebug func(step, message string)
+	// Logger receives the transfer's logs. Optional: nil logs nothing.
+	Logger *slog.Logger
 
 	// Status, when set, follows the download range by range for a
 	// progress display.
@@ -166,11 +167,12 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	for _, r := range have {
 		held += r[1] - r[0]
 	}
-	debugf := func(step, format string, args ...any) {
-		if opts.OnDebug == nil {
-			return
-		}
-		opts.OnDebug(step, fmt.Sprintf(format, args...))
+	log := Module(Logger(opts.Logger), "download")
+	started := time.Now()
+	complete := func(fetched int64) {
+		elapsed := time.Since(started)
+		log.Info("download complete", "size", Bytes(size), "fetched", Bytes(fetched),
+			"elapsed", elapsed.Round(time.Millisecond), "rate", RateOf(fetched, elapsed))
 	}
 
 	urls := &presignedDownload{c: c, revisionID: revisionID, expiry: resolveExpiryMinutes(opts.PresignExpiryMinutes)}
@@ -195,34 +197,42 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 		}
 	}
 
-	rule := PieceSizeRule
-	if opts.PartSize > 0 {
-		rule = "requested"
-	}
-	if held > 0 {
-		debugf("plan", "resume: %s of %s already downloaded, %s left", humanBytesLocal(held), humanBytesLocal(size), humanBytesLocal(size-held))
-	}
 	if len(spans) == 0 {
 		opts.Status.start(size, 0, size, 0, nil)
 		if opts.OnProgress != nil {
 			opts.OnProgress(size, size)
 		}
-		debugf("done", "nothing left to fetch")
+		complete(0)
 		return nil
 	}
 
+	// What sized the ranges: the caller, the server's suggestion when it
+	// is larger than the rule's, or the rule.
+	sizing := PieceSizeRule
+	switch {
+	case opts.PartSize > 0:
+		sizing = "requested"
+	case plan.PartSize > downloadPartSize(size):
+		sizing = "server"
+	}
 	ctx, cancel := context.WithCancelCause(c.reqCtx())
 	defer cancel(nil)
 	lim := newLimiter(ctx, opts.Threads, min(MaxDownloadConcurrency, len(spans)), 0)
-	debugf("plan", "download: %s in %d range(s) of %s (%s)", humanBytesLocal(size-held), len(spans), humanBytesLocal(partSize), rule)
-	debugf("plan", "threads: %s", threadsPlan(lim, opts.Threads, MaxDownloadConcurrency, "range"))
-	debugf("plan", "URL: one presigned URL for every range, valid %dm, presigned again %s before it expires or when storage refuses it",
-		urls.expiry, roundDuration(urls.renewMargin()))
-	debugf("plan", "retries: %s", retryPlan())
 	sched := newRangeScheduler(spans, opts.Status, minSplit)
-	debugf("plan", "tail: once every range has started, an idle connection takes the second half of what the range in flight with the most left has not fetched, while each half is at least %s", humanBytesLocal(sched.minSplit))
+	// One presigned URL serves every range; once every range has started,
+	// an idle connection splits the range in flight with the most left
+	// (split_min is the smallest half).
+	planArgs := []any{"size", Bytes(size)}
+	if held > 0 {
+		planArgs = append(planArgs, "held", Bytes(held))
+	}
+	log.Debug("plan", append(planArgs, "ranges", len(spans), "range_size", Bytes(partSize), "sizing", sizing,
+		"url_expiry", time.Duration(urls.expiry)*time.Minute, "url_renew_before", urls.renewMargin(), "split_min", Bytes(sched.minSplit))...)
+	threads := Module(log, "threads")
+	threads.Debug("plan", threadsPlan(lim, opts.Threads, MaxDownloadConcurrency, "range")...)
+	log.Debug("retry plan", retryPlan()...)
 	go lim.tune(ctx, func(from, to int, rate float64, reason string) {
-		debugf("threads", "%s", threadsChange(from, to, rate, reason))
+		logThreads(threads, from, to, rate, reason)
 	})
 	opts.Status.start(size, len(spans), held, 0, lim)
 
@@ -241,12 +251,12 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 				if lim.acquire(ctx) != nil {
 					return
 				}
-				p := sched.take(debugf)
+				p := sched.take(log)
 				if p == nil {
 					lim.release()
 					return
 				}
-				err := c.downloadPiece(ctx, urls, lim, p, dst, debugf)
+				err := c.downloadPiece(ctx, log, urls, lim, p, dst)
 				lim.release()
 				sched.done(p)
 				opts.Status.end(p.conn, err == nil)
@@ -271,7 +281,7 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
-	debugf("done", "got=%d bytes", size-held)
+	complete(size - held)
 	return nil
 }
 
@@ -343,7 +353,7 @@ var minSplit int64 = 4 << 20
 // ranges, or a half split off one. Its end moves down when another
 // connection takes the rest.
 type piece struct {
-	n     int   // its number in the status and debug, from 1
+	n     int   // its number in the status and logs, from 1
 	start int64 // its first byte
 	conn  *connRun
 
@@ -430,18 +440,18 @@ func newRangeScheduler(spans [][2]int64, status *TransferStatus, minSplit int64)
 }
 
 // take returns the next range, or once every range has started, the second
-// half of the range in flight with the most left to fetch. It returns nil
-// when nothing is worth taking: what is in flight only shrinks, so nothing
-// will be later either.
-func (s *rangeScheduler) take(debugf func(step, format string, args ...any)) *piece {
+// half of the range in flight with the most left to fetch, and logs the
+// split. It returns nil when nothing is worth taking: what is in flight
+// only shrinks, so nothing will be later either.
+func (s *rangeScheduler) take(log *slog.Logger) *piece {
 	p, victim, size := s.pick()
 	if victim != nil {
-		debugf("split", "part %d gave the last %s of what it had left to part %d", victim.n, humanBytesLocal(size), p.n)
+		log.Debug("range split", "part", victim.n, "new_part", p.n, "size", Bytes(size))
 	}
 	return p
 }
 
-// pick is take without its debug line, which waits until the lock is
+// pick is take without its log record, which waits until the lock is
 // released. For a split it also returns the piece the half came from, and
 // the half's size.
 func (s *rangeScheduler) pick() (*piece, *piece, int64) {
@@ -484,11 +494,16 @@ func (s *rangeScheduler) done(p *piece) {
 
 // downloadPiece fetches p into dst, retrying transient failures from the
 // first byte not yet written and presigning again when the URL is
-// refused. It stops at p's end as it stands, which a split can move down.
-func (c *Client) downloadPiece(ctx context.Context, urls *presignedDownload, lim *limiter, p *piece, dst io.WriterAt, debugf func(step, format string, args ...any)) error {
+// refused, and logs each retry. It stops at p's end as it stands, which a
+// split can move down.
+func (c *Client) downloadPiece(ctx context.Context, log *slog.Logger, urls *presignedDownload, lim *limiter, p *piece, dst io.WriterAt) error {
 	var lastErr error
 	renewed := false
 	t0 := time.Now()
+	complete := func() {
+		start, end := p.extent()
+		Trace(log, "range complete", "part", p.n, "offset", start, "size", Bytes(end-start), "elapsed", time.Since(t0).Round(time.Millisecond))
+	}
 	for attempt := 0; attempt < multipartAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -502,8 +517,6 @@ func (c *Client) downloadPiece(ctx context.Context, urls *presignedDownload, lim
 					return err
 				}
 			}
-			from, to := p.rest()
-			debugf("retry", "part=%d attempt=%d range=%d-%d err=%v", p.n, attempt, from, to-1, lastErr)
 		}
 		renewed = false
 		from, to := p.rest()
@@ -522,7 +535,6 @@ func (c *Client) downloadPiece(ctx context.Context, urls *presignedDownload, lim
 				return ctx.Err()
 			}
 			if errors.Is(err, errPresignRefused) {
-				debugf("presign", "range %d-%d refused, presigning again", from, to-1)
 				if _, rerr := urls.renew(url); rerr != nil {
 					return rerr
 				}
@@ -533,13 +545,18 @@ func (c *Client) downloadPiece(ctx context.Context, urls *presignedDownload, lim
 				return err
 			}
 			lastErr = err
+			if attempt+1 < multipartAttempts {
+				next, end := p.rest()
+				log.Warn("retrying request", "part", p.n, "attempt", attempt+2, "attempts", multipartAttempts,
+					"offset", next, "size", Bytes(end-next), "error", err)
+			}
 			continue
 		}
-		start, end := p.extent()
-		debugf("range", "part %d range=%d-%d size=%s in %s", p.n, start, end-1, humanBytesLocal(end-start), time.Since(t0).Round(time.Millisecond))
+		complete()
 		return nil
 	}
 	if from, to := p.rest(); from >= to {
+		complete()
 		return nil
 	}
 	start, end := p.extent()

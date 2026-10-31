@@ -116,9 +116,10 @@ network, so memory does not grow with part size or threads.
   per-connection shaping), one part measures slow and that bound would
   hold the upload at one, so from one part an upload tries a second: it
   keeps it when throughput rises by more than 10%, and otherwise goes back
-  to one and tries again five minutes later. `OnDebug` events with step
-  `threads` say each change and why a count holds. `UploadThreads` and
-  `DownloadThreads` fix the number instead.
+  to one and tries again five minutes later. The `upload.threads` and
+  `download.threads` logs say each change and why a count holds (see
+  [Logging](#logging)). `UploadThreads` and `DownloadThreads` fix the
+  number instead.
 - **Connections.** Each part runs on its own HTTP/1.1 connection, so
   parallel parts are parallel TCP streams, and a finished part's connection
   carries the next part instead of a new TLS handshake.
@@ -171,6 +172,33 @@ var stopped *sdk.DownloadInterruptedError
 if errors.As(err, &stopped) {
     // The same call later fetches only what stopped.Download lacks.
 }
+```
+
+## Logging
+
+`EncryptOptions`, `DecryptOptions` and `ResumeOptions` take a `Logger
+*slog.Logger`; nil logs nothing. Every record names its subsystem in the
+`module` field (`api.ModuleKey`): `encrypt`, `recipient`, `secret`,
+`upload`, `download`, `verify` and others. A nested module carries the
+field once per level, which a handler joins with a dot, as hclog's named
+loggers do (`upload.threads`). The message names the event in a few words
+and holds no values; the values are fields, with sizes as `api.Bytes` and
+rates as `api.Rate` (binary units in text, exact numbers in JSON) and
+durations as `time.Duration`.
+
+- `api.LevelTrace`, below debug: each part, range and request.
+- Debug: plans and decisions, such as `upload: plan`,
+  `upload.threads: increasing` with its reason, and what each check
+  verified.
+- Info: milestones, such as `secret created`, `upload complete` and
+  `payload decrypted`.
+- Warn: what a flow recovers from, such as `retrying request`.
+
+Logs never hold plaintext, keys, passwords, tokens or presigned URLs.
+
+```go
+logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: api.LevelTrace}))
+_, err := client.EncryptFile(to, "backup.tar", sdk.EncryptOptions{Logger: logger})
 ```
 
 ## Recipient Keys
