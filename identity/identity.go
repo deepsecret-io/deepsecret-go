@@ -22,7 +22,16 @@ import (
 type Membership struct {
 	OrgID string `json:"org_id"`
 	Role  string `json:"role"`
+	// OrgKind is "personal" for a one-person workspace, which has no
+	// members, groups or audit log, or "organization".
+	OrgKind string `json:"org_kind"`
 }
+
+// Org kinds, as OrgKind holds them.
+const (
+	OrgKindPersonal     = "personal"
+	OrgKindOrganization = "organization"
+)
 
 // Subscription mirrors /api/me's subscription block: the OWNER's
 // authz row. Tier-display fields (name, price, limits) live on the
@@ -87,13 +96,51 @@ type RemoteKey struct {
 }
 
 // WhoAmI returns the authenticated user's info. Hits /api/v1/actors/me
-// for the canonical authz state; if the actor has a membership, makes
-// a second call to /api/v1/orgs to populate the flat TierName field
-// (the spec moved tier display info off the actor row to the org
-// response, and old SDK consumers expect it on ActorInfo). The /orgs
-// call is best-effort: a failure leaves TierName empty rather than
-// failing the whole call.
+// for the canonical authz state and, at the same time, /api/v1/orgs to
+// populate the flat TierName field (the spec moved tier display info off
+// the actor row to the org response, and old SDK consumers expect it on
+// ActorInfo). The two requests run together, so WhoAmI takes one round
+// trip. The /orgs call is best-effort: a failure leaves TierName empty
+// rather than failing the whole call.
 func WhoAmI(c *api.Client) (*ActorInfo, error) {
+	var (
+		orgResp *api.Response
+		orgErr  error
+		orgDone = make(chan struct{})
+	)
+	go func() {
+		defer close(orgDone)
+		orgResp, orgErr = c.Get("/api/v1/orgs")
+	}()
+	info, err := actorMe(c)
+	<-orgDone
+	if err != nil {
+		return nil, err
+	}
+
+	// Best-effort tier-name lookup. /api/v1/orgs returns the actor's
+	// org with tier_name on it; if the call fails (no membership,
+	// permissions issue, network), we just leave TierName empty.
+	if info.OrgID != "" && orgErr == nil {
+		var orgs []struct {
+			ID       string `json:"id"`
+			TierName string `json:"tier_name"`
+		}
+		if jerr := json.Unmarshal(orgResp.Data, &orgs); jerr == nil {
+			for _, o := range orgs {
+				if o.ID == info.OrgID {
+					info.TierName = o.TierName
+					break
+				}
+			}
+		}
+	}
+	return info, nil
+}
+
+// actorMe fetches /api/v1/actors/me alone and fills the flat fields that
+// come from it (all but TierName).
+func actorMe(c *api.Client) (*ActorInfo, error) {
 	resp, err := c.Get("/api/v1/actors/me")
 	if err != nil {
 		return nil, err
@@ -102,7 +149,6 @@ func WhoAmI(c *api.Client) (*ActorInfo, error) {
 	if err := json.Unmarshal(resp.Data, &info); err != nil {
 		return nil, fmt.Errorf("parse actor: %w", err)
 	}
-
 	info.ID = info.Actor.ID
 	info.Email = info.Actor.Email
 	info.Name = info.Actor.Name
@@ -110,28 +156,6 @@ func WhoAmI(c *api.Client) (*ActorInfo, error) {
 	if info.Membership != nil {
 		info.OrgID = info.Membership.OrgID
 	}
-
-	// Best-effort tier-name lookup. /api/v1/orgs returns the actor's
-	// org with tier_name on it; if the call fails (no membership,
-	// permissions issue, network), we just leave TierName empty.
-	if info.OrgID != "" {
-		orgResp, oerr := c.Get("/api/v1/orgs")
-		if oerr == nil {
-			var orgs []struct {
-				ID       string `json:"id"`
-				TierName string `json:"tier_name"`
-			}
-			if jerr := json.Unmarshal(orgResp.Data, &orgs); jerr == nil {
-				for _, o := range orgs {
-					if o.ID == info.OrgID {
-						info.TierName = o.TierName
-						break
-					}
-				}
-			}
-		}
-	}
-
 	return &info, nil
 }
 
@@ -292,11 +316,16 @@ func CheckOwnKeys(keys *crypto.PublicKeys, senderFP string) error {
 	return nil
 }
 
-// ResolveActorID returns the current authenticated user's actor ID.
+// ResolveActorID returns the current authenticated user's actor ID, from
+// /api/v1/actors/me alone: one request, with no tier lookup. An answer
+// without an ID is an error, so a caller never builds a path from "".
 func ResolveActorID(c *api.Client) (string, error) {
-	info, err := WhoAmI(c)
+	info, err := actorMe(c)
 	if err != nil {
 		return "", err
+	}
+	if info.ID == "" {
+		return "", errors.New("the server's answer names no account")
 	}
 	return info.ID, nil
 }

@@ -6,6 +6,7 @@ package crypto
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -156,6 +157,35 @@ func TestOpenRefusesWrongRecipientWrapOrRevision(t *testing.T) {
 	_, sealed2 := seal(t, []byte("payload"), sender, other, alice)
 	if _, err := Open(sealed.ManifestData, wrapData(t, sealed2, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); err == nil || !strings.Contains(err.Error(), "wrap does not match") {
 		t.Errorf("wrap moved from another revision: %v", err)
+	}
+}
+
+// A manifest with no secret name was sealed before the name was signed: it
+// is refused as outdated, while a name that breaks the rule stays malformed.
+func TestUnmarshalManifestRefusesUnnamedAsOutdated(t *testing.T) {
+	sender, alice := newParty(t), newParty(t)
+	_, sealed := seal(t, []byte("payload"), sender, msgParams, alice)
+	m, err := UnmarshalManifest(sealed.ManifestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SecretName = ""
+	data, err := m.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnmarshalManifest(data); !errors.Is(err, ErrOutdatedManifest) {
+		t.Errorf("unnamed manifest: got %v, want ErrOutdatedManifest", err)
+	}
+	if _, err := Open(data, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); !errors.Is(err, ErrOutdatedManifest) {
+		t.Errorf("open an unnamed manifest: got %v, want ErrOutdatedManifest", err)
+	}
+	m.SecretName = strings.Repeat("a", maxSecretNameLen+1)
+	if data, err = m.Marshal(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnmarshalManifest(data); errors.Is(err, ErrOutdatedManifest) || err == nil || !strings.Contains(err.Error(), "secret name must be") {
+		t.Errorf("overlong name: %v", err)
 	}
 }
 

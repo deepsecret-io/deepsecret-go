@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/deepsecret-io/sdk/api"
@@ -165,5 +166,92 @@ func TestCheckOwnKeys(t *testing.T) {
 	forged.Fingerprint = senderFP
 	if err := CheckOwnKeys(forged, senderFP); err == nil {
 		t.Error("substituted key labelled with the sender's fingerprint accepted")
+	}
+}
+
+// meServer answers /actors/me with me and /orgs with orgs (or a 500 when
+// orgs is nil), and counts the requests each path gets.
+func meServer(t *testing.T, me map[string]any, orgs []map[string]any) (*api.Client, func(path string) int) {
+	t.Helper()
+	var mu sync.Mutex
+	hits := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		var data any
+		switch {
+		case r.URL.Path == "/api/v1/actors/me":
+			data = me
+		case r.URL.Path == "/api/v1/orgs" && orgs != nil:
+			data = orgs
+		default:
+			http.Error(w, `{"success":false,"message":"no"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "data": data})
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, func(path string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits[path]
+	}
+}
+
+func actorAnswer(id, kind string) map[string]any {
+	return map[string]any{
+		"actor":           map[string]any{"id": id, "email": "ana@example.com", "name": "Ana"},
+		"membership":      map[string]any{"org_id": "org-1", "role": "owner", "org_kind": kind},
+		"effective_state": "ACTIVE_OWNER",
+		"subscription":    map[string]any{"status": "active"},
+	}
+}
+
+// WhoAmI reads the membership's kind, which tells a personal workspace
+// from an organization, and the tier name from /orgs.
+func TestWhoAmIReadsTheOrgKind(t *testing.T) {
+	for _, kind := range []string{OrgKindPersonal, OrgKindOrganization} {
+		c, _ := meServer(t, actorAnswer("actor-1", kind), []map[string]any{{"id": "org-1", "tier_name": "Personal"}})
+		info, err := WhoAmI(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Membership == nil || info.Membership.OrgKind != kind || info.Membership.Role != "owner" {
+			t.Errorf("membership %+v, want kind %s", info.Membership, kind)
+		}
+		if info.ID != "actor-1" || info.Email != "ana@example.com" || info.OrgID != "org-1" || info.TierName != "Personal" {
+			t.Errorf("flat fields %+v", info)
+		}
+	}
+
+	// /orgs failing only leaves the tier name out.
+	c, _ := meServer(t, actorAnswer("actor-1", OrgKindPersonal), nil)
+	info, err := WhoAmI(c)
+	if err != nil || info.TierName != "" || info.Membership.OrgKind != OrgKindPersonal {
+		t.Fatalf("without /orgs: %+v, %v", info, err)
+	}
+}
+
+// ResolveActorID, which every secrets list calls first, makes one request:
+// /actors/me, never the tier lookup. An answer without an ID fails.
+func TestResolveActorIDIsOneRequest(t *testing.T) {
+	c, hits := meServer(t, actorAnswer("actor-1", OrgKindOrganization), []map[string]any{{"id": "org-1", "tier_name": "Team"}})
+	id, err := ResolveActorID(c)
+	if err != nil || id != "actor-1" {
+		t.Fatalf("ResolveActorID = %q, %v", id, err)
+	}
+	if hits("/api/v1/actors/me") != 1 || hits("/api/v1/orgs") != 0 {
+		t.Errorf("requests: actors/me %d, orgs %d; want 1 and 0", hits("/api/v1/actors/me"), hits("/api/v1/orgs"))
+	}
+
+	c, _ = meServer(t, actorAnswer("", OrgKindOrganization), nil)
+	if id, err := ResolveActorID(c); err == nil {
+		t.Fatalf("an answer without an ID gave %q", id)
 	}
 }

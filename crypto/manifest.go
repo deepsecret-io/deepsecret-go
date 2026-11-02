@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -125,6 +126,12 @@ func (m *Manifest) Marshal() ([]byte, error) {
 	return cborMarshal(m)
 }
 
+// ErrOutdatedManifest is a manifest with no secret name: one sealed before
+// the name was signed (2026-11-01, still protocol version 4), since Seal
+// refuses an empty name. It cannot be opened; its sender has to send the
+// secret again.
+var ErrOutdatedManifest = errors.New("this secret was made by an earlier version of DeepSecret and cannot be opened: ask the sender to send it again")
+
 // UnmarshalManifest parses a serialized manifest and checks its structure.
 // It does not verify the signatures; Open does.
 func UnmarshalManifest(data []byte) (*Manifest, error) {
@@ -161,6 +168,9 @@ func (m *Manifest) validate() error {
 	}
 	if m.RevisionID == "" || len(m.RevisionID) > maxRevisionIDLen {
 		return fmt.Errorf("malformed manifest: revision id must be 1 to %d bytes", maxRevisionIDLen)
+	}
+	if m.SecretName == "" {
+		return ErrOutdatedManifest
 	}
 	if err := validateSecretName(m.SecretName); err != nil {
 		return fmt.Errorf("malformed manifest: %w", err)

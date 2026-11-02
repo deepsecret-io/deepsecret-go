@@ -49,6 +49,7 @@
 // # Package Layout
 //
 //   - identity.go  : key generation, fingerprints, bundle signing, verification
+//   - safety_number.go : safety numbers, a fingerprint as digits to compare aloud
 //   - keystore.go  : password-protected key storage (Argon2id + AES-256-GCM)
 //   - protocol.go  : protocol constants, canonical encoding, serialization
 //   - stream.go    : the chunked payload stream

@@ -75,6 +75,7 @@ The manifest is a canonical-CBOR map, signed by the sender:
 
 - **`SignableBytes`** is SHA-256 over every field above except the two signatures, in table order, each written with `writeField`. Strings are UTF-8 and booleans one byte. The integers `chunk_size`, `plaintext_size`, `ciphertext_size` and `timestamp` are 8 bytes big-endian. `recipients` is a 4-byte big-endian count, then each pair's `recipient_fp` and `wrap_digest` as two fields.
 - **Limits.** 1 to 1000 recipients, sorted by fingerprint with no duplicates. A serialized manifest is at most 1 MiB; readers refuse anything larger before parsing. A wrap's `enc` is exactly 1120 bytes and its `ct` 48. `ciphertext_size` must equal `plaintext_size` plus 16 bytes per chunk, counting an empty payload as one chunk. `secret_name` is 1 to 1024 bytes of UTF-8 with no leading or trailing white space (Unicode `White_Space`) and no control character (`Cc`), line or paragraph separator (`Zl`, `Zp`) or bidi formatting character (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069).
+- **Manifests from before the signed name.** Version 4 manifests sealed before `secret_name` was added (2026-11-01) have no name. A sealer refuses an empty name, so a reader takes a manifest without one as outdated and refuses it with that reason (`crypto.ErrOutdatedManifest`), not as malformed: it cannot be opened, and its sender has to send the secret again.
 - **What the signature proves.** Every recipient holds `K` and could encrypt different content under it, so the AEAD alone cannot show who wrote the payload. The signature binds the payload digest to the sender's identity key. Covering the recipient list stops anyone adding, removing or swapping a recipient unnoticed. Covering `secret_name` stops a revision passing as part of another secret.
 - **Who sees the recipient list.** Every recipient sees the full list of recipient fingerprints. This was approved as an accepted trade-off on 2026-10-25.
 
@@ -129,3 +130,23 @@ This section is informative; the API contract is `api/docs/design/2026-10-25-pro
 ## 10. Test vectors
 
 `sdk/crypto/v4_vector_test.go` pins the deterministic values of v4: the payload key, the chunk associated data, two nonces, one sealed chunk, the payload digest, the wrap info, a wrap digest and a manifest's `SignableBytes`, all from fixed inputs. They were reproduced independently in Python (`hashlib`, and `cryptography` for HKDF and AES-GCM) from this text. Another SDK must reproduce every one of them. HPKE and the signatures are randomized, so the round-trip and tamper tests in `seal_test.go` cover them.
+
+## 11. Safety numbers
+
+A safety number shows a key fingerprint as decimal digits, for two people to read to each other and compare, as Signal and WhatsApp do (numbers only). It is a display of the fingerprint: nothing in the protocol signs or sends it. `sdk/crypto/safety_number.go` is the one implementation (`SafetyNumber`, `PairSafetyNumber`, `GroupDigits`); the web app, which cannot use the Go SDK, repeats it in `app/lib/safety-number.ts` and must give the same digits for the vectors below.
+
+- **Input:** a full identity key fingerprint (`crypto.Fingerprint`): exactly 64 lower-case hex characters, the SHA-256 of the key bundle. Anything else is refused, upper-case hex included, since fingerprints are lower case everywhere. `fp32` is its 32 bytes.
+- **One key:** `h = SHA-512("DeepSecret safety number v1" || 0x00 || fp32)`, then 5199 more times `h = SHA-512(h || fp32)`: 5200 hashes in all, so finding a key with a matching number costs that much per try. `h[0:30]` is read as six 5-byte big-endian unsigned integers, each taken mod 100000 and written as 5 digits with leading zeros. The 30 digits are the key's number.
+- **Two keys** (you and a contact): both keys' numbers, the lexicographically smaller first, concatenated: 60 digits. Both people see the same number, whichever key is theirs. The same key twice is allowed.
+- **Display:** groups of 5 digits. A pair's 12 groups are shown in 3 rows of 4; a key's own 6 groups (on key pages) in one or two rows. Clients keep the hex fingerprint available as a secondary value, so older clients and scripts can still compare.
+- **Which keys:** with another person, a client pairs your primary key with the key it has for them. It takes your half from a key pair on the device whose fingerprint it computes from the key file, never from the server's listing alone: a server that lists a key of its own for you and for them would otherwise get matching numbers. The web app holds no key pair, so its number pairs the keys the server lists and cannot catch a dishonest server; compare on the CLI or the desktop app for that.
+
+**Test vectors** (`sdk/crypto/safety_number_test.go`, reproduced independently in Python with `hashlib`):
+
+| Fingerprint | Safety number |
+|---|---|
+| `0000000000000000000000000000000000000000000000000000000000000000` | `22498 68061 77197 31533 19831 84070` |
+| `ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff` | `16409 37532 34229 26549 62996 69170` |
+| `f282d3c8021155ac8b7f96fa35d1b84959855c84aa64690049664a206c8837fa` | `13132 50275 56127 30861 31849 97296` |
+
+The pair of the first two is `16409 37532 34229 26549 62996 69170 22498 68061 77197 31533 19831 84070`.
