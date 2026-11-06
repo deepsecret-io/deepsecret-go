@@ -20,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/apierror"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // ── Server-side hard limits ─────────────────────────────────────────────────
@@ -38,7 +40,7 @@ const (
 	// multipartAttempts is how many times a part PUT, or an API call of
 	// the upload, is tried before the upload fails. With backoff capped at
 	// a minute, a part rides out a few minutes of outage.
-	multipartAttempts = api.TransferAttempts
+	multipartAttempts = transfer.Attempts
 
 	// partURLBatch is how many part URLs one API call presigns: the part a
 	// worker needs and the ones queued after it.
@@ -100,8 +102,8 @@ type completePart struct {
 
 // MultipartInit starts a multipart upload for the revision. Idempotent: a
 // second call on an already-initialized revision returns the same UploadID.
-func (c *Client) MultipartInit(revisionID string) (*MultipartInitResponse, error) {
-	resp, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/init", map[string]any{})
+func (c *Client) MultipartInit(ctx context.Context, revisionID string) (*MultipartInitResponse, error) {
+	resp, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/init", map[string]any{})
 	if err != nil {
 		return nil, fmt.Errorf("multipart init: %w", err)
 	}
@@ -113,8 +115,8 @@ func (c *Client) MultipartInit(revisionID string) (*MultipartInitResponse, error
 }
 
 // MultipartPartURLs presigns upload URLs for up to 100 distinct parts.
-func (c *Client) MultipartPartURLs(revisionID string, partNumbers []int) (*MultipartPartURLsResponse, error) {
-	resp, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/part-urls", map[string]any{
+func (c *Client) MultipartPartURLs(ctx context.Context, revisionID string, partNumbers []int) (*MultipartPartURLsResponse, error) {
+	resp, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/part-urls", map[string]any{
 		"part_numbers": partNumbers,
 	})
 	if err != nil {
@@ -129,12 +131,12 @@ func (c *Client) MultipartPartURLs(revisionID string, partNumbers []int) (*Multi
 
 // MultipartComplete finalizes the upload. Parts must be ordered ascending and
 // contiguous from 1.
-func (c *Client) MultipartComplete(revisionID string, parts []MultipartPartStatus) error {
+func (c *Client) MultipartComplete(ctx context.Context, revisionID string, parts []MultipartPartStatus) error {
 	body := make([]completePart, len(parts))
 	for i, p := range parts {
 		body[i] = completePart{PartNumber: p.PartNumber, Etag: p.Etag}
 	}
-	_, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/complete", map[string]any{
+	_, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/complete", map[string]any{
 		"parts": body,
 	})
 	if err != nil {
@@ -145,8 +147,8 @@ func (c *Client) MultipartComplete(revisionID string, parts []MultipartPartStatu
 
 // MultipartAbort cancels an in-flight multipart upload. Idempotent on
 // already-aborted revisions.
-func (c *Client) MultipartAbort(revisionID string) error {
-	_, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/abort", map[string]any{})
+func (c *Client) MultipartAbort(ctx context.Context, revisionID string) error {
+	_, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/abort", map[string]any{})
 	if err != nil {
 		return fmt.Errorf("multipart abort: %w", err)
 	}
@@ -154,8 +156,8 @@ func (c *Client) MultipartAbort(revisionID string) error {
 }
 
 // MultipartStatus loads the upload's state and the parts storage holds.
-func (c *Client) MultipartStatus(revisionID string) (*MultipartStatus, error) {
-	resp, err := c.Get("/api/v1/secrets/revisions/" + PathSegment(revisionID) + "/multipart/status")
+func (c *Client) MultipartStatus(ctx context.Context, revisionID string) (*MultipartStatus, error) {
+	resp, err := c.Get(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/multipart/status")
 	if err != nil {
 		return nil, fmt.Errorf("multipart status: %w", err)
 	}
@@ -171,7 +173,7 @@ func (c *Client) MultipartStatus(revisionID string) (*MultipartStatus, error) {
 // MultipartUploadOptions configures the multipart-upload helper.
 type MultipartUploadOptions struct {
 	// Threads fixes the number of concurrent part PUTs, at most
-	// api.MaxUploadThreads. 0 adapts it to the link (adaptive.go).
+	// transfer.MaxUploadThreads. 0 adapts it to the link (adaptive.go).
 	Threads int
 	// OnProgress is called with (transferredBytes, totalBytes) as bytes
 	// go out, one call at a time. The count drops back when a failed part
@@ -206,19 +208,19 @@ type uploadPart struct {
 // Parts stream from src to the network, read once for their Content-MD5
 // and again as they are sent, so src can be a file of any size and memory
 // does not grow with the part size or the number of threads.
-func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSize int64, opts MultipartUploadOptions) error {
+func (c *Client) MultipartUploadOpts(ctx context.Context, revisionID string, src io.ReaderAt, totalSize int64, opts MultipartUploadOptions) error {
 	if totalSize <= 0 {
 		return fmt.Errorf("multipart upload: empty data")
 	}
-	root := api.Logger(opts.Logger)
-	log := api.Module(root, "upload")
+	root := logattr.Logger(opts.Logger)
+	log := logattr.Module(root, "upload")
 	started := time.Now()
-	ctx, cancel := context.WithCancelCause(c.ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
 	var init *MultipartInitResponse
 	if err := c.retryAPI(ctx, func() (err error) {
-		init, err = c.MultipartInit(revisionID)
+		init, err = c.MultipartInit(ctx, revisionID)
 		return err
 	}); err != nil {
 		return err
@@ -244,7 +246,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	// Parts from an earlier attempt.
 	var status *MultipartStatus
 	if err := c.retryAPI(ctx, func() (err error) {
-		status, err = c.MultipartStatus(revisionID)
+		status, err = c.MultipartStatus(ctx, revisionID)
 		return err
 	}); err != nil {
 		return err
@@ -260,10 +262,10 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 		}
 	}
 	// The server sizes the parts.
-	log.Debug("plan", "transfer", "multipart", "size", api.Bytes(totalSize), "parts", count, "part_size", api.Bytes(init.PartSize),
+	log.Debug("plan", "transfer", "multipart", "size", logattr.Bytes(totalSize), "parts", count, "part_size", logattr.Bytes(init.PartSize),
 		"url_batch", partURLBatch, "url_renew_before", partURLRenewMargin)
 	if kept > 0 {
-		api.Module(root, "resume").Debug("stored parts kept", "parts", count-len(work), "size", api.Bytes(kept), "parts_left", len(work))
+		logattr.Module(root, "resume").Debug("stored parts kept", "parts", count-len(work), "size", logattr.Bytes(kept), "parts_left", len(work))
 	}
 
 	var sent atomic.Int64
@@ -273,12 +275,12 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 	}
 	var lim *limiter
 	if len(work) > 0 {
-		lim = newLimiter(ctx, opts.Threads, min(api.MaxUploadThreads, len(work)), init.PartSize)
+		lim = newLimiter(ctx, opts.Threads, min(transfer.MaxUploadThreads, len(work)), init.PartSize)
 	}
 	opts.Status.start(totalSize, count, kept, count-len(work), lim)
 	if len(work) > 0 {
-		threads := api.Module(log, "threads")
-		threads.Debug("plan", threadsPlan(lim, opts.Threads, api.MaxUploadThreads, "part")...)
+		threads := logattr.Module(log, "threads")
+		threads.Debug("plan", threadsPlan(lim, opts.Threads, transfer.MaxUploadThreads, "part")...)
 		log.Debug("retry plan", retryPlan()...)
 		queue := &partQueue{parts: parts, items: work}
 		lim.waiting = queue.left
@@ -323,7 +325,7 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 						cancel(fmt.Errorf("part %d: %w", p.Number, err))
 						return
 					}
-					api.Trace(log, "part complete", "part", p.Number, "parts", count, "size", api.Bytes(p.Size), "elapsed", time.Since(t0).Round(time.Millisecond))
+					logattr.Trace(log, "part complete", "part", p.Number, "parts", count, "size", logattr.Bytes(p.Size), "elapsed", time.Since(t0).Round(time.Millisecond))
 				}
 			}()
 		}
@@ -338,13 +340,13 @@ func (c *Client) MultipartUploadOpts(revisionID string, src io.ReaderAt, totalSi
 		final[i] = MultipartPartStatus{PartNumber: p.Number, Etag: etags[i], Size: p.Size}
 	}
 	tComp := time.Now()
-	if err := c.retryAPI(ctx, func() error { return c.MultipartComplete(revisionID, final) }); err != nil {
+	if err := c.retryAPI(ctx, func() error { return c.MultipartComplete(ctx, revisionID, final) }); err != nil {
 		return err
 	}
-	api.Trace(log, "upload finalized", "parts", count, "elapsed", time.Since(tComp).Round(time.Millisecond))
+	logattr.Trace(log, "upload finalized", "parts", count, "elapsed", time.Since(tComp).Round(time.Millisecond))
 	elapsed := time.Since(started)
-	log.Info("upload complete", "size", api.Bytes(totalSize), "parts", count, "sent", api.Bytes(totalSize-kept),
-		"elapsed", elapsed.Round(time.Millisecond), "rate", api.RateOf(totalSize-kept, elapsed))
+	log.Info("upload complete", "size", logattr.Bytes(totalSize), "parts", count, "sent", logattr.Bytes(totalSize-kept),
+		"elapsed", elapsed.Round(time.Millisecond), "rate", logattr.RateOf(totalSize-kept, elapsed))
 	return nil
 }
 
@@ -516,7 +518,7 @@ func (u *partURLCache) get(ctx context.Context, n int) (string, error) {
 		return url, nil
 	}
 	numbers := []int{n}
-	for _, m := range u.queue.near(api.MaxUploadThreads, 2*partURLBatch) {
+	for _, m := range u.queue.near(transfer.MaxUploadThreads, 2*partURLBatch) {
 		if len(numbers) == partURLBatch {
 			break
 		}
@@ -526,7 +528,7 @@ func (u *partURLCache) get(ctx context.Context, n int) (string, error) {
 	}
 	var resp *MultipartPartURLsResponse
 	if err := u.c.retryAPI(ctx, func() (err error) {
-		resp, err = u.c.MultipartPartURLs(u.revisionID, numbers)
+		resp, err = u.c.MultipartPartURLs(ctx, u.revisionID, numbers)
 		return err
 	}); err != nil {
 		return "", err
@@ -680,7 +682,7 @@ func isMultipartRetryableErr(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var apiErr *api.Error
+	var apiErr *apierror.Error
 	if !errors.As(err, &apiErr) {
 		return true
 	}
@@ -691,7 +693,7 @@ func isMultipartRetryableErr(err error) bool {
 // honored, up to a minute; otherwise the exponential backoff applies.
 // Returns ctx.Err() if the context ends during the sleep.
 func multipartBackoff(ctx context.Context, attempt int, lastErr error) error {
-	var apiErr *api.Error
+	var apiErr *apierror.Error
 	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > 0 {
 		d := min(apiErr.RetryAfter, maxBackoff)
 		// ±10% jitter so clients hitting the same 429 spread out.

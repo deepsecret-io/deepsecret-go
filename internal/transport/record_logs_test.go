@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
 )
 
 // recordLogs is a logger that passes each record's module (nested ones
@@ -29,7 +29,7 @@ func (r *recorder) Handle(_ context.Context, rec slog.Record) error {
 	fields := map[string]slog.Value{}
 	var modules []string
 	add := func(a slog.Attr) bool {
-		if a.Key == api.ModuleKey {
+		if a.Key == logattr.ModuleKey {
 			modules = append(modules, a.Value.String())
 		} else {
 			fields[a.Key] = a.Value.Resolve()

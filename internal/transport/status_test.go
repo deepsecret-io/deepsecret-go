@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // A nil status records nothing, so a transfer without one calls it freely.
@@ -122,8 +123,8 @@ func TestTransferStatus_BoundsWhatItShows(t *testing.T) {
 }
 
 // watch polls a status until done closes and returns every snapshot seen.
-func watch(s *TransferStatus, done <-chan struct{}) []api.TransferSnapshot {
-	var seen []api.TransferSnapshot
+func watch(s *TransferStatus, done <-chan struct{}) []transfer.Snapshot {
+	var seen []transfer.Snapshot
 	for {
 		select {
 		case <-done:
@@ -151,7 +152,7 @@ func TestUpload_StatusFollowsTheParts(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err = c.MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Threads: 3, Status: &status})
+		err = c.MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Threads: 3, Status: &status})
 	}()
 	seen := watch(&status, done)
 	if err != nil {
@@ -193,7 +194,7 @@ func TestUpload_StatusCountsKeptParts(t *testing.T) {
 		u.stored[n] = MultipartPartStatus{PartNumber: n, Etag: storedETag(src, off, part), Size: part}
 	}
 	var status TransferStatus
-	if err := u.client(t).MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{Status: &status}); err != nil {
+	if err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", src, u.size, MultipartUploadOptions{Status: &status}); err != nil {
 		t.Fatal(err)
 	}
 	if snap := status.Snapshot(); !snap.Started || snap.Done != u.size || snap.PartsDone != 2 || len(snap.Connections) != 0 {
@@ -259,7 +260,7 @@ func TestDownload_StatusFollowsTheRanges(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		err = c.DownloadToFile("rev-1", dst, int64(len(data)), MultipartDownloadOptions{Threads: 2, PartSize: 1 << 20, Status: &status})
+		err = c.DownloadToFile(context.Background(), "rev-1", dst, int64(len(data)), MultipartDownloadOptions{Threads: 2, PartSize: 1 << 20, Status: &status})
 	}()
 	seen := watch(&status, done)
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 // Extraction applies the umask to the archive's modes, as open(2) and

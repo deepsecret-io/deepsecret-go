@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 // overflowingTar holds a 5-byte file and then the header of one declaring

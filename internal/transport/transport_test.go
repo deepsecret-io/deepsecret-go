@@ -56,7 +56,7 @@ func TestStorageTransportKeepsParallelWarmConnections(t *testing.T) {
 	c.presignClient.Transport.(*http.Transport).TLSClientConfig = storage
 
 	const threads = 8
-	if err := c.MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Threads: threads}); err != nil {
+	if err := c.MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Threads: threads}); err != nil {
 		t.Fatal(err)
 	}
 	if protos["HTTP/1.1"] != 48 || len(protos) != 1 {

@@ -12,26 +12,26 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keys"
 )
 
 type party struct {
-	kp  *crypto.KeyPair
+	kp  *keys.Pair
 	fp  string
-	pub *crypto.PublicKeys
+	pub *keys.PublicKeys
 }
 
 func newParty(t *testing.T) party {
 	t.Helper()
-	kp, err := crypto.GenerateKeyPair()
+	kp, err := keys.Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp, err := crypto.Fingerprint(kp)
+	fp, err := keys.Fingerprint(kp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return party{kp: kp, fp: fp, pub: &crypto.PublicKeys{
+	return party{kp: kp, fp: fp, pub: &keys.PublicKeys{
 		ED25519: kp.ED25519Public, X25519: kp.X25519Public,
 		MLKEM768: kp.MLKEM768PK, MLDSA65: kp.MLDSA65PK, Fingerprint: fp,
 	}}
@@ -50,7 +50,7 @@ var msgParams = SealParams{RevisionID: "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70", S
 
 func seal(t *testing.T, plaintext []byte, sender party, p SealParams, recipients ...party) ([]byte, *Sealed) {
 	t.Helper()
-	pubs := make([]*crypto.PublicKeys, len(recipients))
+	pubs := make([]*keys.PublicKeys, len(recipients))
 	for i, r := range recipients {
 		pubs[i] = r.pub
 	}
@@ -65,7 +65,7 @@ func wrapData(t *testing.T, s *Sealed, fp string) *Wrap {
 	t.Helper()
 	w, ok := s.Wrap(fp)
 	if !ok {
-		t.Fatalf("no wrap for %s", crypto.ShortFingerprint(fp))
+		t.Fatalf("no wrap for %s", keys.ShortFingerprint(fp))
 	}
 	return w
 }
@@ -110,21 +110,21 @@ func TestSealOpenRoundTrip(t *testing.T) {
 func TestSealRejectsBadInput(t *testing.T) {
 	sender, alice := newParty(t), newParty(t)
 	cases := map[string]struct {
-		recipients []*crypto.PublicKeys
+		recipients []*keys.PublicKeys
 		params     SealParams
 		want       string
 	}{
 		"no recipients":     {nil, msgParams, "recipients"},
-		"duplicate":         {[]*crypto.PublicKeys{alice.pub, alice.pub}, msgParams, "listed twice"},
-		"no revision":       {[]*crypto.PublicKeys{alice.pub}, SealParams{SecretName: "n", PayloadType: "message"}, "revision id"},
-		"no secret name":    {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", PayloadType: "message"}, "secret name"},
-		"padded name":       {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token ", PayloadType: "message"}, "white space"},
-		"line break":        {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\nRun: rm", PayloadType: "message"}, "control"},
-		"bidi override":     {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "invoice\u202etxt.exe", PayloadType: "message"}, "bidi"},
-		"name not utf-8":    {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\xff", PayloadType: "message"}, "UTF-8"},
-		"name too long":     {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: strings.Repeat("a", maxSecretNameLen+1), PayloadType: "message"}, "secret name"},
-		"bad payload type":  {[]*crypto.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "n", PayloadType: "exe"}, "payload type"},
-		"wrong fingerprint": {[]*crypto.PublicKeys{{ED25519: alice.pub.ED25519, X25519: alice.pub.X25519, MLKEM768: alice.pub.MLKEM768, MLDSA65: alice.pub.MLDSA65, Fingerprint: strings.Repeat("a", 64)}}, msgParams, "fingerprint mismatch"},
+		"duplicate":         {[]*keys.PublicKeys{alice.pub, alice.pub}, msgParams, "listed twice"},
+		"no revision":       {[]*keys.PublicKeys{alice.pub}, SealParams{SecretName: "n", PayloadType: "message"}, "revision id"},
+		"no secret name":    {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", PayloadType: "message"}, "secret name"},
+		"padded name":       {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token ", PayloadType: "message"}, "white space"},
+		"line break":        {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\nRun: rm", PayloadType: "message"}, "control"},
+		"bidi override":     {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "invoice\u202etxt.exe", PayloadType: "message"}, "bidi"},
+		"name not utf-8":    {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "token\xff", PayloadType: "message"}, "UTF-8"},
+		"name too long":     {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: strings.Repeat("a", maxSecretNameLen+1), PayloadType: "message"}, "secret name"},
+		"bad payload type":  {[]*keys.PublicKeys{alice.pub}, SealParams{RevisionID: "r", SecretName: "n", PayloadType: "exe"}, "payload type"},
+		"wrong fingerprint": {[]*keys.PublicKeys{{ED25519: alice.pub.ED25519, X25519: alice.pub.X25519, MLKEM768: alice.pub.MLKEM768, MLDSA65: alice.pub.MLDSA65, Fingerprint: strings.Repeat("a", 64)}}, msgParams, "fingerprint mismatch"},
 	}
 	for name, c := range cases {
 		if _, _, err := SealBytes([]byte("x"), sender.kp, c.recipients, c.params); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -178,17 +178,17 @@ func TestUnmarshalManifestRefusesUnnamedAsOutdated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := UnmarshalManifest(data); !errors.Is(err, crypto.ErrOutdatedManifest) {
-		t.Errorf("unnamed manifest: got %v, want crypto.ErrOutdatedManifest", err)
+	if _, err := UnmarshalManifest(data); !errors.Is(err, ErrOutdatedManifest) {
+		t.Errorf("unnamed manifest: got %v, want ErrOutdatedManifest", err)
 	}
-	if _, err := Open(data, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); !errors.Is(err, crypto.ErrOutdatedManifest) {
-		t.Errorf("open an unnamed manifest: got %v, want crypto.ErrOutdatedManifest", err)
+	if _, err := Open(data, wrapData(t, sealed, alice.fp), alice.kp, OpenParams{RevisionID: msgParams.RevisionID, SecretName: msgParams.SecretName}); !errors.Is(err, ErrOutdatedManifest) {
+		t.Errorf("open an unnamed manifest: got %v, want ErrOutdatedManifest", err)
 	}
 	m.SecretName = strings.Repeat("a", maxSecretNameLen+1)
 	if data, err = m.Marshal(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := UnmarshalManifest(data); errors.Is(err, crypto.ErrOutdatedManifest) || err == nil || !strings.Contains(err.Error(), "secret name must be") {
+	if _, err := UnmarshalManifest(data); errors.Is(err, ErrOutdatedManifest) || err == nil || !strings.Contains(err.Error(), "secret name must be") {
 		t.Errorf("overlong name: %v", err)
 	}
 }

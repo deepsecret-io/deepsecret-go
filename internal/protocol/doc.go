@@ -3,7 +3,7 @@
 
 // Package protocol implements DeepSecret protocol v4 (PROTOCOL_V4.md): one
 // payload per revision, encrypted once, with a wrap of its content key for
-// every recipient. It is internal so a caller cannot skip what the sdk package
+// every recipient. It is internal so a caller cannot skip what package secrets
 // adds around it: checking keys against the ones this device knows, and
 // refusing a rollback.
 //

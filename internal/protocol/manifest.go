@@ -12,8 +12,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/deepsecret-io/sdk/crypto"
-	"github.com/deepsecret-io/sdk/internal/canon"
+	"github.com/deepsecret-io/deepsecret-go/internal/canon"
+	"github.com/deepsecret-io/deepsecret-go/internal/sign"
+	"github.com/deepsecret-io/deepsecret-go/keys"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -164,7 +165,7 @@ func (m *Manifest) validate() error {
 		return fmt.Errorf("malformed manifest: revision id must be 1 to %d bytes", maxRevisionIDLen)
 	}
 	if m.SecretName == "" {
-		return crypto.ErrOutdatedManifest
+		return ErrOutdatedManifest
 	}
 	if err := validateSecretName(m.SecretName); err != nil {
 		return fmt.Errorf("malformed manifest: %w", err)
@@ -184,8 +185,8 @@ func (m *Manifest) validate() error {
 	if len(m.Signature) != ED25519SignatureSize {
 		return fmt.Errorf("malformed manifest: sig must be %d bytes, got %d", ED25519SignatureSize, len(m.Signature))
 	}
-	if len(m.SignatureMLDSA65) != crypto.MLDSA65SignatureSize {
-		return fmt.Errorf("malformed manifest: sig_mldsa65 must be %d bytes, got %d", crypto.MLDSA65SignatureSize, len(m.SignatureMLDSA65))
+	if len(m.SignatureMLDSA65) != sign.MLDSA65SignatureSize {
+		return fmt.Errorf("malformed manifest: sig_mldsa65 must be %d bytes, got %d", sign.MLDSA65SignatureSize, len(m.SignatureMLDSA65))
 	}
 	if err := verifySenderBundle(m.SenderFingerprint, m.SenderED25519, m.SenderX25519, m.SenderMLKEM768, m.SenderMLDSA65); err != nil {
 		return err
@@ -213,7 +214,7 @@ func (m *Manifest) verifySignatures() error {
 	if !ed25519.Verify(ed25519.PublicKey(m.SenderED25519), signable, m.Signature) {
 		return fmt.Errorf("Ed25519 signature verification failed: manifest may be tampered with")
 	}
-	if !crypto.VerifyMLDSA65(m.SenderMLDSA65, signable, m.SignatureMLDSA65) {
+	if !sign.VerifyMLDSA65(m.SenderMLDSA65, signable, m.SignatureMLDSA65) {
 		return fmt.Errorf("ML-DSA-65 signature verification failed: manifest may be tampered with")
 	}
 	return nil
@@ -223,7 +224,7 @@ func (m *Manifest) verifySignatures() error {
 // the claimed fingerprint, which binds the signing keys to the sender.
 func verifySenderBundle(fp string, ed, x, mlkem, mldsa []byte) error {
 	if len(ed) != ED25519PubKeySize || len(x) != X25519PubKeySize ||
-		len(mlkem) != MLKEM768PubKeySize || len(mldsa) != crypto.MLDSA65PubKeySize {
+		len(mlkem) != MLKEM768PubKeySize || len(mldsa) != sign.MLDSA65PubKeySize {
 		return fmt.Errorf("sender identity check: embedded public keys have the wrong sizes")
 	}
 	h := sha256.New()
@@ -233,7 +234,7 @@ func verifySenderBundle(fp string, ed, x, mlkem, mldsa []byte) error {
 	h.Write(mldsa)
 	if computed := hex.EncodeToString(h.Sum(nil)); computed != fp {
 		return fmt.Errorf("sender identity mismatch: embedded keys compute fingerprint %s but manifest claims %s",
-			crypto.ShortFingerprint(computed), crypto.ShortFingerprint(fp))
+			keys.ShortFingerprint(computed), keys.ShortFingerprint(fp))
 	}
 	return nil
 }

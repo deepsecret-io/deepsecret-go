@@ -5,6 +5,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"math"
@@ -16,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
 )
 
 func TestMergeRanges(t *testing.T) {
@@ -117,7 +118,7 @@ func TestDownload_FetchesOnlyWhatItLacks(t *testing.T) {
 	var progress []int64
 	var status TransferStatus
 	var book logBook
-	err := s.client(t).DownloadToFile("rev-1", dst, size, MultipartDownloadOptions{
+	err := s.client(t).DownloadToFile(context.Background(), "rev-1", dst, size, MultipartDownloadOptions{
 		Threads: 2, PartSize: mib, Status: &status, Logger: book.logger(),
 		Have:       [][2]int64{{3 * mib, 4 * mib}, {0, mib}},
 		OnRange:    func(from, to int64) { got = append(got, [2]int64{from, to}) },
@@ -143,7 +144,7 @@ func TestDownload_FetchesOnlyWhatItLacks(t *testing.T) {
 		t.Fatalf("status %+v", snap)
 	}
 	book.has(t, "download", "plan", map[string]any{
-		"size": api.Bytes(size), "held": api.Bytes(2 * mib), "ranges": 4, "range_size": api.Bytes(mib), "sizing": "requested",
+		"size": logattr.Bytes(size), "held": logattr.Bytes(2 * mib), "ranges": 4, "range_size": logattr.Bytes(mib), "sizing": "requested",
 		"url_expiry": 30 * time.Minute, "url_renew_before": 2 * time.Minute,
 	})
 	book.has(t, "download.threads", "plan", map[string]any{"mode": "fixed", "threads": 2, "requested": 2})
@@ -151,7 +152,7 @@ func TestDownload_FetchesOnlyWhatItLacks(t *testing.T) {
 	if n := len(book.all("download", "range complete")); n != 4 {
 		t.Errorf("%d ranges logged complete, want 4", n)
 	}
-	book.has(t, "download", "download complete", map[string]any{"size": api.Bytes(size), "fetched": api.Bytes(size - 2*mib)})
+	book.has(t, "download", "download complete", map[string]any{"size": logattr.Bytes(size), "fetched": logattr.Bytes(size - 2*mib)})
 }
 
 // A download sized by the rule says so, and one the server suggests
@@ -161,11 +162,11 @@ func TestDownload_PlanSaysWhatSizedTheRanges(t *testing.T) {
 	s := newResumeServer(t, data)
 	size := int64(len(data))
 	var book logBook
-	if err := s.client(t).DownloadToFile("rev-1", &sliceWriter{b: make([]byte, size)}, size, MultipartDownloadOptions{Logger: book.logger()}); err != nil {
+	if err := s.client(t).DownloadToFile(context.Background(), "rev-1", &sliceWriter{b: make([]byte, size)}, size, MultipartDownloadOptions{Logger: book.logger()}); err != nil {
 		t.Fatal(err)
 	}
 	// 3 MiB is under the rule's 8 MiB ranges: one range of all of it.
-	r := book.has(t, "download", "plan", map[string]any{"ranges": 1, "range_size": api.Bytes(size), "sizing": PieceSizeRule})
+	r := book.has(t, "download", "plan", map[string]any{"ranges": 1, "range_size": logattr.Bytes(size), "sizing": PieceSizeRule})
 	if _, ok := r.fields["held"]; ok {
 		t.Fatalf("a fresh download's plan says it held something: %v", r)
 	}
@@ -181,7 +182,7 @@ func TestDownload_PresignsWhenNothingIsLeft(t *testing.T) {
 	var status TransferStatus
 	var progress []int64
 	var book logBook
-	err := s.client(t).DownloadToFile("rev-1", &sliceWriter{b: make([]byte, size)}, size, MultipartDownloadOptions{
+	err := s.client(t).DownloadToFile(context.Background(), "rev-1", &sliceWriter{b: make([]byte, size)}, size, MultipartDownloadOptions{
 		Have: [][2]int64{{0, size}}, Status: &status, Logger: book.logger(),
 		OnProgress: func(done, _ int64) { progress = append(progress, done) },
 	})
@@ -197,7 +198,7 @@ func TestDownload_PresignsWhenNothingIsLeft(t *testing.T) {
 	if !slices.Equal(progress, []int64{size}) {
 		t.Fatalf("progress %v", progress)
 	}
-	book.has(t, "download", "download complete", map[string]any{"size": api.Bytes(size), "fetched": api.Bytes(0)})
+	book.has(t, "download", "download complete", map[string]any{"size": logattr.Bytes(size), "fetched": logattr.Bytes(0)})
 	if plans := book.all("download", "plan"); len(plans) != 0 {
 		t.Fatalf("a download with nothing to fetch logged a plan: %v", plans)
 	}
@@ -207,7 +208,7 @@ func TestDownload_PresignsWhenNothingIsLeft(t *testing.T) {
 // the server.
 func TestDownload_RefusesHeldRangesOutsideTheObject(t *testing.T) {
 	s := newResumeServer(t, make([]byte, 2<<20))
-	err := s.client(t).DownloadToFile("rev-1", &sliceWriter{b: make([]byte, 2<<20)}, 2<<20, MultipartDownloadOptions{
+	err := s.client(t).DownloadToFile(context.Background(), "rev-1", &sliceWriter{b: make([]byte, 2<<20)}, 2<<20, MultipartDownloadOptions{
 		Have: [][2]int64{{1 << 20, 2<<20 + 1}},
 	})
 	if err == nil || s.presigns != 0 {
@@ -277,7 +278,7 @@ func TestDownload_SplitsASlowTail(t *testing.T) {
 	var written [][2]int64
 	var status TransferStatus
 	t0 := time.Now()
-	err := s.client(t).DownloadToFile("rev-1", dst, size, MultipartDownloadOptions{
+	err := s.client(t).DownloadToFile(context.Background(), "rev-1", dst, size, MultipartDownloadOptions{
 		Threads: 4, PartSize: mib, Status: &status,
 		OnRange: func(from, to int64) {
 			mu.Lock()
@@ -321,7 +322,7 @@ func TestDownload_SplitsManyRangesAtOnce(t *testing.T) {
 	var mu sync.Mutex
 	var written [][2]int64
 	var book logBook
-	err := s.client(t).DownloadToFile("rev-1", dst, size, MultipartDownloadOptions{
+	err := s.client(t).DownloadToFile(context.Background(), "rev-1", dst, size, MultipartDownloadOptions{
 		Threads: 8, PartSize: mib,
 		OnRange: func(from, to int64) {
 			mu.Lock()
@@ -366,14 +367,14 @@ func TestDownload_RetryFetchesOnlyWhatIsMissing(t *testing.T) {
 	size := int64(len(data))
 	dst := &sliceWriter{b: make([]byte, size)}
 	var book logBook
-	if err := s.client(t).DownloadToFile("rev-1", dst, size, MultipartDownloadOptions{Threads: 1, PartSize: size, Logger: book.logger()}); err != nil {
+	if err := s.client(t).DownloadToFile(context.Background(), "rev-1", dst, size, MultipartDownloadOptions{Threads: 1, PartSize: size, Logger: book.logger()}); err != nil {
 		t.Fatal(err)
 	}
 	if asked := s.requests(); len(asked) != 2 || asked[0] != [2]int64{0, size} || asked[1] != [2]int64{mib, size} {
 		t.Fatalf("requests %v: want the range, then only its second half", asked)
 	}
 	// The retry is the second attempt, for what did not arrive.
-	book.has(t, "download", "retrying request", map[string]any{"part": 1, "attempt": 2, "attempts": 8, "offset": mib, "size": api.Bytes(mib)})
+	book.has(t, "download", "retrying request", map[string]any{"part": 1, "attempt": 2, "attempts": 8, "offset": mib, "size": logattr.Bytes(mib)})
 	if !bytes.Equal(dst.b, data) {
 		t.Fatal("the download differs")
 	}

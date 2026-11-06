@@ -16,8 +16,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/deepsecret-io/sdk/api"
 )
 
 // tokenLifetime is how long the API's session tokens last.
@@ -88,7 +86,7 @@ func TestSession_RefreshesShortlyBeforeExpiry(t *testing.T) {
 	old := fakeToken("actor-1", time.Now().Add(2*time.Minute), 1)
 	srv, c := newSessionServer(t, old)
 	var saved []string
-	c.SetSessionStore(api.SessionStore{Save: func(token string, exp time.Time) error {
+	c.SetSessionStore(SessionStore{Save: func(token string, exp time.Time) error {
 		if time.Until(exp) < 50*time.Minute {
 			t.Errorf("saved token expires in %s", time.Until(exp))
 		}
@@ -96,7 +94,7 @@ func TestSession_RefreshesShortlyBeforeExpiry(t *testing.T) {
 		return nil
 	}})
 	for range 3 {
-		if _, err := c.Get("/api/v1/me"); err != nil {
+		if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -120,7 +118,7 @@ func TestSession_RenewsOnUseAfterAnEighthOfItsLifetime(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(tokenLifetime-tc.age), 1))
 			for range 3 {
-				if _, err := c.Get("/api/v1/me"); err != nil {
+				if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -152,7 +150,7 @@ func TestSession_FailingRefreshIsNotRetriedPerRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 5 {
-		if _, err := c.Get("/api/v1/me"); err != nil {
+		if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -171,7 +169,7 @@ func TestSession_ConcurrentRequestsRefreshOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := c.Get("/api/v1/me"); err != nil {
+			if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 				failed.Add(1)
 			}
 		}()
@@ -192,8 +190,8 @@ func TestSession_AdoptsTheStoredTokenOnUnauthorized(t *testing.T) {
 	delete(srv.valid, mine)
 	srv.valid[theirs] = true
 	srv.mu.Unlock()
-	c.SetSessionStore(api.SessionStore{Load: func() (string, error) { return theirs, nil }})
-	if _, err := c.Get("/api/v1/me"); err != nil {
+	c.SetSessionStore(SessionStore{Load: func() (string, error) { return theirs, nil }})
+	if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 		t.Fatalf("request: %v", err)
 	}
 	if c.credential() != "bearer:"+theirs || srv.refreshes.Load() != 0 {
@@ -211,8 +209,8 @@ func TestSession_IgnoresAnotherAccountsToken(t *testing.T) {
 	delete(srv.valid, mine)
 	srv.valid[other] = true
 	srv.mu.Unlock()
-	c.SetSessionStore(api.SessionStore{Load: func() (string, error) { return other, nil }})
-	if _, err := c.Get("/api/v1/me"); err == nil {
+	c.SetSessionStore(SessionStore{Load: func() (string, error) { return other, nil }})
+	if _, err := c.Get(context.Background(), "/api/v1/me"); err == nil {
 		t.Fatal("the request went through with another account's token")
 	}
 	if c.credential() != "bearer:"+mine {
@@ -234,7 +232,7 @@ func TestSession_APIKeysAreNotRefreshed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Get("/api/v1/me"); err == nil {
+	if _, err := c.Get(context.Background(), "/api/v1/me"); err == nil {
 		t.Fatal("expected 401")
 	}
 	if refreshes.Load() != 0 {
@@ -249,7 +247,7 @@ func TestSession_RefreshOutlivesACancelledCall(t *testing.T) {
 	old := fakeToken("actor-1", time.Now().Add(2*time.Minute), 1)
 	srv, c := newSessionServer(t, old)
 	var saved []string
-	c.SetSessionStore(api.SessionStore{Save: func(token string, _ time.Time) error {
+	c.SetSessionStore(SessionStore{Save: func(token string, _ time.Time) error {
 		saved = append(saved, token)
 		return nil
 	}})
@@ -259,14 +257,14 @@ func TestSession_RefreshOutlivesACancelledCall(t *testing.T) {
 	srv.onRefresh = cancel
 	srv.mu.Unlock()
 
-	_, _ = c.WithContext(ctx).Get("/api/v1/me")
+	_, _ = c.Get(ctx, "/api/v1/me")
 	if ctx.Err() == nil {
 		t.Fatal("the call never reached a refresh")
 	}
 	if len(saved) != 1 || c.credential() != "bearer:"+saved[0] {
 		t.Fatalf("saved %d tokens; the client holds the new one: %t", len(saved), len(saved) == 1 && c.credential() == "bearer:"+saved[0])
 	}
-	if _, err := c.WithContext(context.Background()).Get("/api/v1/me"); err != nil {
+	if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 		t.Fatalf("the session ended with the cancelled call: %v", err)
 	}
 	if n := srv.refreshes.Load(); n != 1 {
@@ -274,19 +272,16 @@ func TestSession_RefreshOutlivesACancelledCall(t *testing.T) {
 	}
 }
 
-// A view's context ends that view's calls only.
-func TestWithContextEndsOnlyThatView(t *testing.T) {
+// A call's context ends that call only.
+func TestCancelledCallEndsOnlyThatCall(t *testing.T) {
 	srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(time.Hour), 1))
 	_ = srv
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := c.WithContext(ctx).Get("/api/v1/me"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled view: %v", err)
+	if _, err := c.Get(ctx, "/api/v1/me"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled call: %v", err)
 	}
-	if _, err := c.WithContext(context.Background()).Get("/api/v1/me"); err != nil {
-		t.Fatalf("another view: %v", err)
-	}
-	if _, err := c.Get("/api/v1/me"); err != nil {
-		t.Fatalf("the client itself: %v", err)
+	if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
+		t.Fatalf("a later call: %v", err)
 	}
 }

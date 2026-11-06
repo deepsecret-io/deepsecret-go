@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 DeepSecret
 
-# SDK tasks. `task --list` shows them; run from sdk/.
+# SDK tasks. `task --list` shows them; run from the repo root.
 version: '3'
 
 vars:

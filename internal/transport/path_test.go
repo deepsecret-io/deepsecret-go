@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,7 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/apierror"
 )
 
 func TestPathSegment(t *testing.T) {
@@ -47,10 +48,10 @@ func TestRefusesPathsThatReachAnotherEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	methods := map[string]func(string) (*Response, error){
-		"GET":    c.Get,
-		"POST":   func(p string) (*Response, error) { return c.Post(p, nil) },
-		"PUT":    func(p string) (*Response, error) { return c.Put(p, nil) },
-		"DELETE": func(p string) (*Response, error) { return c.Delete(p, nil) },
+		"GET":    func(p string) (*Response, error) { return c.Get(context.Background(), p) },
+		"POST":   func(p string) (*Response, error) { return c.Post(context.Background(), p, nil) },
+		"PUT":    func(p string) (*Response, error) { return c.Put(context.Background(), p, nil) },
+		"DELETE": func(p string) (*Response, error) { return c.Delete(context.Background(), p, nil) },
 	}
 	for name, send := range methods {
 		for _, path := range []string{
@@ -64,7 +65,7 @@ func TestRefusesPathsThatReachAnotherEndpoint(t *testing.T) {
 			"/api/v1/secrets/s/recipients/?limit=1",
 			"/api/v1/secrets/s/recipients/..?limit=1",
 		} {
-			if _, err := send(path); !errors.Is(err, api.ErrInvalidID) {
+			if _, err := send(path); !errors.Is(err, apierror.ErrInvalidID) {
 				t.Errorf("%s %s: err = %v, want ErrInvalidID", name, path, err)
 			}
 		}
@@ -81,7 +82,7 @@ func TestRefusesPathsThatReachAnotherEndpoint(t *testing.T) {
 		"/api/v1/secrets/a..b",
 		"/api/v1/secrets/...",
 	} {
-		if _, err := c.Get(path); err != nil {
+		if _, err := c.Get(context.Background(), path); err != nil {
 			t.Errorf("GET %s: %v", path, err)
 		}
 	}
@@ -110,14 +111,14 @@ func TestTransferPathsKeepIDsInOneSegment(t *testing.T) {
 		path string
 		call func()
 	}{
-		{"/api/v1/secrets/revisions/" + seg + "/multipart/init", func() { _, _ = c.MultipartInit(id) }},
-		{"/api/v1/secrets/revisions/" + seg + "/multipart/part-urls", func() { _, _ = c.MultipartPartURLs(id, []int{1}) }},
-		{"/api/v1/secrets/revisions/" + seg + "/multipart/complete", func() { _ = c.MultipartComplete(id, nil) }},
-		{"/api/v1/secrets/revisions/" + seg + "/multipart/abort", func() { _ = c.MultipartAbort(id) }},
-		{"/api/v1/secrets/revisions/" + seg + "/multipart/status", func() { _, _ = c.MultipartStatus(id) }},
-		{"/api/v1/secrets/revisions/" + seg + "/confirm", func() { _ = c.ConfirmUpload(id) }},
-		{"/api/v1/secrets/revisions/" + seg + "/presign", func() { _, _ = c.presignDownloadURL(id, 1) }},
-		{"/api/v1/orgs/" + seg + "/storage/presign", func() { _, _ = c.presignUploadURL(id, "key", 1) }},
+		{"/api/v1/secrets/revisions/" + seg + "/multipart/init", func() { _, _ = c.MultipartInit(context.Background(), id) }},
+		{"/api/v1/secrets/revisions/" + seg + "/multipart/part-urls", func() { _, _ = c.MultipartPartURLs(context.Background(), id, []int{1}) }},
+		{"/api/v1/secrets/revisions/" + seg + "/multipart/complete", func() { _ = c.MultipartComplete(context.Background(), id, nil) }},
+		{"/api/v1/secrets/revisions/" + seg + "/multipart/abort", func() { _ = c.MultipartAbort(context.Background(), id) }},
+		{"/api/v1/secrets/revisions/" + seg + "/multipart/status", func() { _, _ = c.MultipartStatus(context.Background(), id) }},
+		{"/api/v1/secrets/revisions/" + seg + "/confirm", func() { _ = c.ConfirmUpload(context.Background(), id) }},
+		{"/api/v1/secrets/revisions/" + seg + "/presign", func() { _, _ = c.presignDownloadURL(context.Background(), id, 1) }},
+		{"/api/v1/orgs/" + seg + "/storage/presign", func() { _, _ = c.presignUploadURL(context.Background(), id, "key", 1) }},
 	} {
 		mu.Lock()
 		paths = nil

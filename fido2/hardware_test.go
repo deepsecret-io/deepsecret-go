@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
 type envPrompt struct {
@@ -52,17 +52,17 @@ func TestHardwareEnrollAndDerive(t *testing.T) {
 	userID := make([]byte, 16)
 	_, _ = rand.Read(input)
 	_, _ = rand.Read(userID)
-	enrolled, err := a.Enroll(ctx, crypto.EnrollRequest{
-		RPID: crypto.SecurityKeyRPID, UserID: userID, UserName: "deepsecret-test", DisplayName: "DeepSecret test", PRFInput: input,
+	enrolled, err := a.Enroll(ctx, keystore.EnrollRequest{
+		RPID: keystore.SecurityKeyRPID, UserID: userID, UserName: "deepsecret-test", DisplayName: "DeepSecret test", PRFInput: input,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("enrolled on %s, credential %d bytes, aaguid %x", enrolled.Device, len(enrolled.CredentialID), enrolled.AAGUID)
-	req := crypto.DeriveRequest{
-		RPID:        crypto.SecurityKeyRPID,
+	req := keystore.DeriveRequest{
+		RPID:        keystore.SecurityKeyRPID,
 		Fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		Credentials: []crypto.DeriveCredential{{ID: enrolled.CredentialID, PRFInput: input, Label: "test"}},
+		Credentials: []keystore.DeriveCredential{{ID: enrolled.CredentialID, PRFInput: input, Label: "test"}},
 	}
 	for i := 0; i < 2; i++ {
 		got, err := a.Derive(ctx, req)

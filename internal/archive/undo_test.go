@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 // tree lists every path under dir, relative and slash-separated, with a

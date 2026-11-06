@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 // TarEntry represents an in-memory file for archive creation or extraction.

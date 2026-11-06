@@ -6,7 +6,8 @@ package protocol
 import (
 	"testing"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/internal/directory"
+	"github.com/deepsecret-io/deepsecret-go/keys"
 )
 
 const testRevisionID = "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70"
@@ -14,22 +15,22 @@ const testRevisionID = "4f9c1e5a-8b2d-4c3e-9f1a-2b3c4d5e6f70"
 const testSecretName = "db-password"
 
 type testParty struct {
-	kp  *crypto.KeyPair
+	kp  *keys.Pair
 	fp  string
-	pub *crypto.PublicKeys
+	pub *keys.PublicKeys
 }
 
 func newTestParty(t *testing.T) testParty {
 	t.Helper()
-	kp, err := crypto.GenerateKeyPair()
+	kp, err := keys.Generate()
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
-	fp, err := crypto.Fingerprint(kp)
+	fp, err := keys.Fingerprint(kp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return testParty{kp: kp, fp: fp, pub: &crypto.PublicKeys{
+	return testParty{kp: kp, fp: fp, pub: &keys.PublicKeys{
 		ED25519:     kp.ED25519Public,
 		X25519:      kp.X25519Public,
 		MLKEM768:    kp.MLKEM768PK,
@@ -41,7 +42,7 @@ func newTestParty(t *testing.T) testParty {
 // sealFor seals plaintext once for every recipient.
 func sealFor(t *testing.T, plaintext []byte, sender testParty, p SealParams, recipients ...testParty) ([]byte, *Sealed) {
 	t.Helper()
-	pubs := make([]*crypto.PublicKeys, len(recipients))
+	pubs := make([]*keys.PublicKeys, len(recipients))
 	for i, r := range recipients {
 		pubs[i] = r.pub
 	}
@@ -140,13 +141,13 @@ func TestSignatureVerificationFails(t *testing.T) {
 }
 
 func TestKeyFingerprint(t *testing.T) {
-	kp, _ := crypto.GenerateKeyPair()
+	kp, _ := keys.Generate()
 
-	fp1, err := crypto.Fingerprint(kp)
+	fp1, err := keys.Fingerprint(kp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp2, err := crypto.Fingerprint(kp)
+	fp2, err := keys.Fingerprint(kp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +155,7 @@ func TestKeyFingerprint(t *testing.T) {
 		t.Error("same key should produce same fingerprint")
 	}
 
-	fp3, err := crypto.FingerprintFromPubs(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK)
+	fp3, err := keys.FingerprintFromPubs(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,27 +163,27 @@ func TestKeyFingerprint(t *testing.T) {
 		t.Error("Fingerprint and FingerprintFromPubs should match")
 	}
 
-	kp2, _ := crypto.GenerateKeyPair()
-	fp4, _ := crypto.Fingerprint(kp2)
+	kp2, _ := keys.Generate()
+	fp4, _ := keys.Fingerprint(kp2)
 	if fp1 == fp4 {
 		t.Error("different keys should have different fingerprints")
 	}
 }
 
 func TestKeyBundleSignVerify(t *testing.T) {
-	kp, _ := crypto.GenerateKeyPair()
+	kp, _ := keys.Generate()
 
-	edSig, mldsaSig, err := crypto.SignKeyBundle(kp)
+	edSig, mldsaSig, err := directory.SignKeyBundle(kp)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := crypto.VerifyKeyBundleSignature(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK, edSig, mldsaSig); err != nil {
+	if err := directory.VerifyKeyBundleSignature(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK, edSig, mldsaSig); err != nil {
 		t.Errorf("valid signature should verify: %v", err)
 	}
 
-	kp2, _ := crypto.GenerateKeyPair()
-	if err := crypto.VerifyKeyBundleSignature(kp2.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK, edSig, mldsaSig); err == nil {
+	kp2, _ := keys.Generate()
+	if err := directory.VerifyKeyBundleSignature(kp2.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK, edSig, mldsaSig); err == nil {
 		t.Error("mismatched key should fail verification")
 	}
 }

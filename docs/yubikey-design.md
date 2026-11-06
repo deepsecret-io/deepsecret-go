@@ -1,6 +1,6 @@
 # Security key (YubiKey) protection for key files
 
-Status: implemented 2026-11-02 in the SDK (`sdk/crypto`, `sdk/fido2`) and
+Status: implemented 2026-11-02 in the SDK (`keystore`, `fido2`) and
 the CLI. Graphical clients use the same SDK API. The hardware
 test passes on a real YubiKey on macOS: see section 12.
 
@@ -136,7 +136,7 @@ The security key output `S`:
 
 - `S = HMAC-SHA-256(CredRandomWithUV, SHA-256("WebAuthn PRF" || 0x00 || prf_input))`.
 - `prf_input` is 32 random bytes kept in the slot.
-- The SDK hashes `prf_input` into the salt itself (`crypto.PRFSalt`). This is
+- The SDK hashes `prf_input` into the salt itself (`keystore.PRFSalt`). This is
   the salt that WebAuthn PRF, and Windows' webauthn.dll by default, give the
   device, so one credential gives one output on every platform.
 - Both derivations are pinned by test vectors, checked against an
@@ -353,7 +353,7 @@ the owner's own key lists. Other users never get it: the lookup senders use
 owner's responses (`GET /api/v1/identities`, `GET /:id`, the response to
 registering) carry it.
 
-- Registering sends it (`SyncIdentity(kp, securityKey)`), from the key
+- Registering sends it (`Identity.Sync(kp, securityKey)`), from the key
   file on the registering device.
 - `PUT /api/v1/identities/:id/security-key {"security_key": bool}` changes
   it, for the owner's keys only (another actor's key is not found), audited
@@ -374,17 +374,17 @@ desktop Keys page, and the web app's Identities page.
 
 | Layer | Contents | cgo |
 |---|---|---|
-| `sdk/crypto` | Version 5 format, checks, slot rules, derivation, `ReadKeyFileInfo`, `UnlockKeyPair`, `EditKeyFile` / `NewSecurityKeyFile` (the slot editor), the `Authenticator` interface, typed errors | No |
-| `sdk` client | `EncryptOptions` and `DecryptOptions` gain `SecurityKey` and `RecoveryCode` beside `Password`. `LoadPrimaryIdentityWith(Unlock)` and `PrimaryFingerprint()` are new. The identity is unlocked once per operation | No |
-| `sdk/fido2` | libfido2 through purego: device list, silent check, PIN, make credential, assertion with `hmac-secret`, cancel. Implements `crypto.Authenticator` behind a `Prompter` (PIN, Touch, TouchDone, Insert) that each client provides | No |
+| `keystore` | Version 5 format, checks, slot rules, derivation, `ReadInfo`, `Open`, `Edit` / `NewSecurityKeyFile` (the slot editor), the `Authenticator` interface, typed errors | No |
+| `secrets`, `identity` | `EncryptOptions` and `DecryptOptions` gain `SecurityKey` and `RecoveryCode` beside `Password`. `Identity.LoadPrimary(Unlock)` and `Identity.PrimaryFingerprint()` are new. The identity is unlocked once per operation | No |
+| `fido2` | libfido2 through purego: device list, silent check, PIN, make credential, assertion with `hmac-secret`, cancel. Implements `keystore.Authenticator` behind a `Prompter` (PIN, Touch, TouchDone, Insert) that each client provides | No |
 | CLI | Terminal prompter and the commands in section 5 | No |
 | Graphical clients | A window prompter (PIN dialog, touch state, cancel) and the same flows | Unchanged |
 
 Notes on the API:
 
-- **Additive, not breaking.** Callers of `LoadKeyPair`,
-  `LoadPrimaryIdentity(password)` and `Password` work as before. Given a
-  version 5 file, they get `crypto.ErrSecurityKeyRequired`.
+- **Additive, not breaking.** Callers of `keystore.Load`,
+  `Identity.LoadPrimary` with a password and `Password` work as before. Given a
+  version 5 file, they get `keystore.ErrSecurityKeyRequired`.
 - **The recovery code is pure Go.** It works in every build, including the
   ones without device support.
 
@@ -420,7 +420,7 @@ time instead:
 **Builds without it.**
 
 - The `nofido2` build tag, and Windows and other systems, compile a stub that
-  returns `crypto.ErrNoSecurityKeySupport`.
+  returns `keystore.ErrNoSecurityKeySupport`.
 - On Linux, purego makes the binary depend on glibc's loader. So the CLI ships
   two Linux archives:
   - `secret-linux-<arch>.tar.gz` stays fully static (`nofido2`) and runs

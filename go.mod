@@ -1,4 +1,4 @@
-module github.com/deepsecret-io/sdk
+module github.com/deepsecret-io/deepsecret-go
 
 go 1.26.2
 

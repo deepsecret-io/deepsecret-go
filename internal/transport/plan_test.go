@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // record is one log record: its module, message and fields.
@@ -86,10 +87,10 @@ func (b *logBook) has(t *testing.T, module, msg string, want map[string]any) rec
 func TestThreadsPlan_Download(t *testing.T) {
 	var book logBook
 	lim := newLimiter(t.Context(), 0, 8, 0)
-	book.logger().Debug("plan", threadsPlan(lim, 0, api.MaxDownloadConcurrency, "range")...)
+	book.logger().Debug("plan", threadsPlan(lim, 0, transfer.MaxDownloadConcurrency, "range")...)
 	r := book.has(t, "", "plan", map[string]any{
 		"mode": "adaptive", "start": 4, "max": 8, "cap": 64, "window": 5 * time.Second,
-		"fast_window": 2 * time.Second, "fast_rate": api.Rate(4e6), "gain_pct": 10,
+		"fast_window": 2 * time.Second, "fast_rate": logattr.Rate(4e6), "gain_pct": 10,
 	})
 	if _, ok := r.fields["part_time"]; ok {
 		t.Fatalf("a download's plan has an upload's bound: %v", r)
@@ -100,11 +101,11 @@ func TestThreadsPlan_Download(t *testing.T) {
 func TestThreadsPlan_Fixed(t *testing.T) {
 	var book logBook
 	few := newLimiter(t.Context(), 0, 3, 0)
-	book.logger().Debug("too few", threadsPlan(few, 0, api.MaxDownloadConcurrency, "range")...)
+	book.logger().Debug("too few", threadsPlan(few, 0, transfer.MaxDownloadConcurrency, "range")...)
 	book.has(t, "", "too few", map[string]any{"mode": "fixed", "threads": 3, "cap": 64, "reason": "too few ranges to adapt: one per range"})
 
 	capped := newLimiter(t.Context(), 8, 2, 8<<20)
-	book.logger().Debug("capped", threadsPlan(capped, 8, api.MaxUploadThreads, "part")...)
+	book.logger().Debug("capped", threadsPlan(capped, 8, transfer.MaxUploadThreads, "part")...)
 	book.has(t, "", "capped", map[string]any{"mode": "fixed", "threads": 2, "requested": 8, "reason": "at most one per part"})
 }
 
@@ -116,9 +117,9 @@ func TestLogThreads(t *testing.T) {
 	logThreads(log, 1, 2, 1e6, "probing for more throughput")
 	logThreads(log, 8, 4, 2e6, "1 request(s) failed or were throttled")
 	logThreads(log, 8, 8, 80e6, "at the most this transfer allows")
-	book.has(t, "", "increasing", map[string]any{"from": 1, "to": 2, "rate": api.Rate(1e6), "reason": "probing for more throughput"})
-	book.has(t, "", "decreasing", map[string]any{"from": 8, "to": 4, "rate": api.Rate(2e6)})
-	r := book.has(t, "", "holding", map[string]any{"threads": 8, "rate": api.Rate(80e6), "reason": "at the most this transfer allows"})
+	book.has(t, "", "increasing", map[string]any{"from": 1, "to": 2, "rate": logattr.Rate(1e6), "reason": "probing for more throughput"})
+	book.has(t, "", "decreasing", map[string]any{"from": 8, "to": 4, "rate": logattr.Rate(2e6)})
+	r := book.has(t, "", "holding", map[string]any{"threads": 8, "rate": logattr.Rate(80e6), "reason": "at the most this transfer allows"})
 	if got := r.fields["rate"].String(); got != "76.29MiB/s" {
 		t.Fatalf("a hold's rate reads %q", got)
 	}

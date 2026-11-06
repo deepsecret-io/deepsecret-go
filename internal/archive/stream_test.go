@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 func sampleTree(t *testing.T) []ExpandedFile {

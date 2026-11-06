@@ -11,45 +11,53 @@ End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 ## Architecture
 
 ```
-sdk/                 ← the client: encrypt, decrypt, revoke, accounts and keys
-├── api/             ← API errors, transfer status, log conventions
-├── crypto/          ← key pairs, key files, fingerprints, safety numbers
+deepsecret-go/       ← package deepsecret: the client and its setup
+├── identity/        ← account, org, groups, keys registered on the server (client.Identity)
+├── secrets/         ← send, receive, local files, list, revoke, policy, resume, storage (client.Secrets)
+├── trust/           ← the keys this device knows: list, accept, verify, forget (client.Trust)
+├── keys/            ← key pairs, fingerprints, safety numbers; no file access
+├── keystore/        ← key files, protection, security key slots, recovery codes
 ├── fido2/           ← security keys, through libfido2
-├── internal/        ← protocol, transport, payload, archive and compression
+├── apierror/        ← API errors
+├── transfer/        ← a transfer's state, phases and limits
+├── internal/        ← protocol, transport, known keys, payload, archive and compression
 └── examples/
 ```
 
-Build on the `sdk` package. It checks every key against the ones this device knows and refuses a rollback, which the protocol underneath cannot do on its own, so the protocol is internal. To port the SDK to another language, follow [PROTOCOL_V4.md](PROTOCOL_V4.md).
+Build on the `deepsecret` client. A send and a decrypt through it check every key against the ones this device knows and refuse a rollback, which the protocol underneath cannot do on its own, so the protocol is internal. To port the SDK to another language, follow [PROTOCOL_V4.md](PROTOCOL_V4.md).
 
 Every call that can block takes a `context.Context` first and ends when it does.
 
 ## Quick Start
 
 ```go
-import "github.com/deepsecret-io/sdk"
+import (
+    deepsecret "github.com/deepsecret-io/deepsecret-go"
+    "github.com/deepsecret-io/deepsecret-go/secrets"
+)
 
-client, err := sdk.NewClient("https://api.deepsecret.io", "ds_your_api_key")
+client, err := deepsecret.NewClient("https://api.deepsecret.io", "ds_your_api_key")
 if err != nil {
     log.Fatal(err)
 }
 
 // Encrypt a message once for two recipients (you are a recipient only if listed)
-res, _ := client.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
+res, _ := client.Secrets.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", secrets.EncryptOptions{})
 
 // Decrypt, as one of the recipients
-result, _ := client.DecryptSecret(ctx, res.Secret.ID, sdk.DecryptOptions{})
-fmt.Println(result.Message)
+result, _ := client.Secrets.Decrypt(ctx, res.Secret.ID, secrets.DecryptOptions{})
+fmt.Println(result.Decrypted.Message)
 
 // Revoke one recipient
-client.RevokeRecipient(ctx, res.Secret.ID, "bob@example.com")
+client.Secrets.RevokeRecipient(ctx, res.Secret.ID, "bob@example.com")
 ```
 
 ## Encrypt Options
 
 ```go
-sdk.EncryptOptions{
+secrets.EncryptOptions{
     Name:       "report-q4",
-    Compress:   sdk.CompressZstd,  // zstd or none
+    Compress:   secrets.CompressZstd,  // zstd or none
     Archive:    true,              // bundle as one tar archive, zstd-compressed (hides file metadata)
     SkipHidden: true,
     TTL:        "7d",              // "30m", "24h", "7d"
@@ -67,7 +75,7 @@ Files stream, so memory stays flat at any size, up to 100 GiB a secret.
 - **Send.** `EncryptPaths` reads
   each file once, encode, compress and seal it chunk by chunk into a private
   temporary file holding only ciphertext, then upload from that file.
-- **Receive.** `OpenSecret` downloads the ciphertext into a temporary file.
+- **Receive.** `Secrets.Open` downloads the ciphertext into a temporary file.
   `WriteFiles` (or `DecryptToDir`) checks it against the signed manifest,
   decrypts it once to check every file name, size and SHA-256 and an archive's
   entries, then decrypts it again to write. A payload that fails a check
@@ -76,19 +84,19 @@ Files stream, so memory stays flat at any size, up to 100 GiB a secret.
   `TempDir` in the options or `DEEPSECRET_TMPDIR`, else the system temp
   directory is used. A send checks before it reads anything.
 - **In memory.** `EncryptText`, `EncryptData` and `EncryptBytes`, and
-  `DecryptSecret` for payloads up to `DefaultMaxInMemorySize` (256 MiB).
+  `Decrypt` for payloads up to 256 MiB.
 
 ```go
 // Write a files secret of any size to disk
-result, written, err := client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+result, written, err := client.Secrets.DecryptToDir(ctx, secretID, "./out", secrets.DecryptOptions{}, secrets.WriteOptions{})
 
 // Or open first, then choose where it goes
-opened, err := client.OpenSecret(ctx, secretID, sdk.DecryptOptions{})
+opened, err := client.Secrets.Open(ctx, secretID, secrets.DecryptOptions{})
 defer opened.Close()
 if opened.Result.PayloadType == "files" {
-    written, err = opened.WriteFiles("./out", sdk.WriteOptions{Overwrite: false})
+    written, err = opened.WriteFiles(ctx, "./out", secrets.WriteOptions{Overwrite: false})
 } else {
-    decrypted, err := opened.Payload() // a message or key-value data
+    decrypted, err := opened.Payload(ctx) // a message or key-value data
 }
 ```
 
@@ -154,17 +162,17 @@ network, so memory does not grow with part size or threads.
   new one.
 
 ```go
-client, err := sdk.NewClient(url, "bearer:"+token,
-    sdk.WithSessionStore(sdk.SessionStore{Load: loadToken, Save: saveToken}))
+client, err := deepsecret.NewClient(url, "bearer:"+token,
+    deepsecret.WithSessionStore(deepsecret.SessionStore{Load: loadToken, Save: saveToken}))
 
-_, err = client.EncryptPaths(ctx, to, []string{"backup.tar"}, sdk.EncryptOptions{ResumeDir: dir})
-var interrupted *sdk.UploadInterruptedError
+_, err = client.Secrets.EncryptPaths(ctx, to, []string{"backup.tar"}, secrets.EncryptOptions{ResumeDir: dir})
+var interrupted *secrets.UploadInterruptedError
 if errors.As(err, &interrupted) {
-    _, err = client.ResumeUpload(ctx, dir, interrupted.Upload.RevisionID, sdk.ResumeOptions{})
+    _, err = client.Secrets.ResumeUpload(ctx, dir, interrupted.Upload.RevisionID, secrets.ResumeOptions{})
 }
 
-_, _, err = client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{ResumeDir: downloads}, sdk.WriteOptions{})
-var stopped *sdk.DownloadInterruptedError
+_, _, err = client.Secrets.DecryptToDir(ctx, secretID, "./out", secrets.DecryptOptions{ResumeDir: downloads}, secrets.WriteOptions{})
+var stopped *secrets.DownloadInterruptedError
 if errors.As(err, &stopped) {
     // The same call later fetches only what stopped.Download lacks.
 }
@@ -174,15 +182,14 @@ if errors.As(err, &stopped) {
 
 `EncryptOptions`, `DecryptOptions` and `ResumeOptions` take a `Logger
 *slog.Logger`; nil logs nothing. Every record names its subsystem in the
-`module` field (`api.ModuleKey`): `encrypt`, `recipient`, `secret`,
+`module` field (`deepsecret.LogModuleKey`): `encrypt`, `recipient`, `secret`,
 `upload`, `download`, `verify` and others. A nested module carries the
 field once per level, which a handler joins with a dot, as hclog's named
 loggers do (`upload.threads`). The message names the event in a few words
-and holds no values; the values are fields, with sizes as `api.Bytes` and
-rates as `api.Rate` (binary units in text, exact numbers in JSON) and
-durations as `time.Duration`.
+and holds no values; the values are fields, with sizes and rates in binary
+units in text and exact numbers in JSON, and durations as `time.Duration`.
 
-- `api.LevelTrace`, below debug: each part, range and request.
+- `deepsecret.LevelTrace`, below debug: each part, range and request.
 - Debug: plans and decisions, such as `upload: plan`,
   `upload.threads: increasing` with its reason, and what each check
   verified.
@@ -193,8 +200,8 @@ durations as `time.Duration`.
 Logs never hold plaintext, keys, passwords, tokens or presigned URLs.
 
 ```go
-logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: api.LevelTrace}))
-_, err := client.EncryptPaths(ctx, to, []string{"backup.tar"}, sdk.EncryptOptions{Logger: logger})
+logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: deepsecret.LevelTrace}))
+_, err := client.Secrets.EncryptPaths(ctx, to, []string{"backup.tar"}, secrets.EncryptOptions{Logger: logger})
 ```
 
 ## Recipient Keys
@@ -206,7 +213,7 @@ proves the bundle is whole, not whose it is, so the SDK also checks who it
 belongs to:
 
 - **Your own keys.** Any account this device registers a key for
-  (`SyncIdentity`), and the one it first sends from on a server, is
+  (`Identity.Sync`), and the one it first sends from on a server, is
   recorded as yours, so what the server later says about who you are cannot
   change it. For one of your accounts only key pairs on this device pass: a
   send to it must use one, and a secret from it must be signed by one. If
@@ -229,12 +236,12 @@ belongs to:
   any other key is refused with a `*KeyChangedError`, before anything is
   sealed or downloaded.
 - **A changed key.** Once the new key is confirmed with its owner,
-  `AcceptKey(email, fingerprint)` accepts it, and `VerifyKey` records a key
+  `Trust.Accept(ctx, email, fingerprint)` accepts it, and `Trust.Verify` records a key
   you compared. Both take the full fingerprint of a key the server lists
   for them, and both replace their other keys: sends go to the accepted key
   alone, while a replaced key still checks the secrets it signed until
-  `ForgetKey` drops it. A send to a replaced key is refused
-  (`KeyChangedError.Replaced`) until it is accepted again. `KnownKeys`
+  `Trust.Forget` drops it. A send to a replaced key is refused
+  (`KeyChangedError.Replaced`) until it is accepted again. `Trust.List`
   lists what this device knows, your own accounts included.
 
 - **Which secret, which version.** Every revision's manifest signs the
@@ -254,35 +261,63 @@ accepting any key again.
 
 ## Packages
 
-### `sdk/api`: Errors, Status and Logging
+### `identity`: `client.Identity`
 
 | Name | Description |
 |---|---|
-| `Error`, `ErrNotFound`, `ErrForbidden`, ... | What the server answered; branch with `errors.Is` |
-| `IsMaintenanceError`, `MaintenanceMessage` | The API is under maintenance |
-| `TransferSnapshot`, `ConnectionStatus` | A transfer's state, from `sdk.TransferStatus.Snapshot` |
-| `Module`, `LevelTrace`, `Bytes`, `Rate` | The SDK's log conventions |
+| `WhoAmI`, `ResolveActorID` | The caller's account |
+| `ListKeys`, `Sync`, `SetPrimaryKey`, `DeleteKey`, `SetKeySecurityKey` | Keys registered on the server |
+| `LoadPrimary(ctx, unlock)`, `PrimaryFingerprint` | The primary key pair on this device |
+| `ListGroups` | An org's groups and their members |
 
-### `sdk/crypto`: Keys
+### `secrets`: `client.Secrets`
+
+| Name | Description |
+|---|---|
+| `EncryptText`, `EncryptData`, `EncryptBytes`, `EncryptPaths` | Send |
+| `Decrypt`, `DecryptToDir`, `Open`, `OpenLocalFile` | Receive |
+| `ListSent`, `ListReceived`, `Describe`, `DescribeFull`, `ListRevisions` | Read what exists |
+| `Delete`, `RevokeRecipient`, `UpdatePolicy` | Change it |
+| `ResumeUpload`, `DiscardPendingUpload`, `ListPendingUploads`, `ListPendingDownloads`, `DiscardPendingDownload` | Interrupted transfers |
+| `ListStorages` | An org's storages |
+
+### `trust`: `client.Trust`
+
+| Name | Description |
+|---|---|
+| `List`, `Accept`, `Verify`, `Forget` | The keys this device knows |
+| `ServerListedKeys` | What the server lists for someone: only its claim, to compare and never to decide whom to trust |
+| `KeyChangedError`, `StaleRevisionError` | What a send or a decrypt refuses with |
+
+### `keys` and `keystore`: Keys
 
 | Function | Description |
 |---|---|
-| `GenerateKeyPair()` | Generate Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768 key pair |
-| `Fingerprint(kp)` | Full SHA-256 hex fingerprint (64 chars) |
-| `SafetyNumber`, `PairSafetyNumber` | A fingerprint as digits to compare aloud |
-| `SaveKeyPairTo` / `LoadKeyPairFrom` | Password-protected key storage |
-| `ReadKeyFileInfo` | How a key file is protected, and its slots, without unlocking it |
-| `UnlockKeyPair` | Unlock any key file: password, security key or recovery code |
-| `EditKeyFile` / `NewSecurityKeyFile` | Protect a key pair with security keys, add or remove them, set a recovery code |
+| `keys.Generate()` | Generate Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768 key pair |
+| `keys.Fingerprint(kp)` | Full SHA-256 hex fingerprint (64 chars) |
+| `keys.SafetyNumber`, `keys.PairSafetyNumber` | A fingerprint as digits to compare aloud |
+| `keystore.Save` / `keystore.Load` | Password-protected key storage |
+| `keystore.ReadInfo` | How a key file is protected, and its slots, without unlocking it |
+| `keystore.Open` | Unlock any key file: password, security key or recovery code |
+| `keystore.Edit` / `keystore.NewSecurityKeyFile` | Protect a key pair with security keys, add or remove them, set a recovery code |
 
-### `sdk/fido2`: Security Keys
+### `fido2`: Security Keys
 
 | Function | Description |
 |---|---|
-| `New(prompter)` | A `crypto.Authenticator` for YubiKeys and other FIDO2 keys, through libfido2 loaded at run time |
+| `New(prompter)` | A `keystore.Authenticator` for YubiKeys and other FIDO2 keys, through libfido2 loaded at run time |
 | `Check()` | Whether libfido2 is installed, and which security keys are connected |
 
 Builds with `-tags nofido2`, and builds for Windows, have no security key support.
+
+### `apierror` and `transfer`
+
+| Name | Description |
+|---|---|
+| `apierror.Error`, `apierror.ErrNotFound`, `apierror.ErrForbidden`, ... | What the server answered; branch with `errors.Is` |
+| `apierror.IsMaintenanceError`, `apierror.MaintenanceMessage` | The API is under maintenance |
+| `transfer.Snapshot`, `transfer.ConnectionStatus` | A transfer's state, from `secrets.TransferStatus.Snapshot` |
+| `transfer.Phase` | The phases `OnPhase` reports |
 
 ## Encryption Protocol (v4)
 
@@ -318,13 +353,13 @@ annotated `vMAJOR.MINOR.PATCH` git tag, which is how Go finds module
 versions:
 
 ```bash
-go get github.com/deepsecret-io/sdk@v0.3.0
+go get github.com/deepsecret-io/deepsecret-go@v0.4.0
 ```
 
 While the major version is 0 the API can still change: a breaking change
 bumps the minor version, anything else the patch version. From v1.0.0 a
 breaking change bumps the major version, and from v2 the module path ends
-in it (`github.com/deepsecret-io/sdk/v2`).
+in it (`github.com/deepsecret-io/deepsecret-go/v2`).
 
 To release, from a clean, pushed `main`:
 

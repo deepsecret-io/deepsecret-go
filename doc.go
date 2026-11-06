@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 DeepSecret
 
-// Package sdk provides a high-level Go SDK for the DeepSecret API.
+// Package deepsecret provides a high-level Go SDK for the DeepSecret API.
 //
 // DeepSecret uses protocol v4 (PROTOCOL_V4.md): each revision's payload is
 // encrypted once with AES-256-GCM in 1 MiB chunks under a fresh content
@@ -13,10 +13,15 @@
 //
 // # Package Structure
 //
-//	sdk/        : the client: encrypt, decrypt, revoke, accounts and keys
-//	sdk/api/    : API errors, transfer status and log conventions
-//	sdk/crypto/ : key pairs, key files, fingerprints and safety numbers
-//	sdk/fido2/  : security keys, through libfido2
+//	deepsecret : the client and its setup: NewClient, its options, Logout
+//	identity   : account, org, groups and the keys registered on the server (Client.Identity)
+//	secrets    : send, receive, local files, list, revoke, policy, resume, storage (Client.Secrets)
+//	trust      : the keys this device knows: list, accept, verify, forget (Client.Trust)
+//	keys       : key pairs, fingerprints and safety numbers; no file access
+//	keystore   : key files, password and security key protection, recovery codes
+//	fido2      : security keys, through libfido2; pass one as a keystore.Authenticator
+//	apierror   : what the server answered: Error, ErrNotFound and the others
+//	transfer   : a transfer's state, its phases and limits
 //
 // The protocol, transport and file handling behind them are internal.
 // PROTOCOL_V4.md specifies the protocol for ports to other languages.
@@ -32,7 +37,7 @@
 // One send seals the payload once for any number of recipients and uploads
 // it once. The sender is a recipient only when listed. Sending again under
 // an existing name adds a revision, and must list everyone who has access
-// now unless EncryptOptions.RevokeMissing is set. RevokeRecipient removes
+// now unless secrets.EncryptOptions.RevokeMissing is set. Secrets.RevokeRecipient removes
 // one recipient.
 //
 // # Memory Model
@@ -53,28 +58,28 @@
 // else $DEEPSECRET_TMPDIR, else the system temp directory.
 //
 // Messages and key-value data are small and are handled in memory, as is
-// DecryptSecret for payloads up to DefaultMaxInMemorySize.
+// Secrets.Decrypt for payloads up to 256 MiB.
 //
 // # Quick Start
 //
-//	client, err := sdk.NewClient("https://transport.deepsecret.io", "your-api-key")
+//	client, err := deepsecret.NewClient("https://api.deepsecret.io", "your-api-key")
 //	if err != nil { log.Fatal(err) }
 //
 //	// Encrypt a message for two recipients in one send
-//	res, _ := client.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
+//	res, _ := client.Secrets.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", secrets.EncryptOptions{})
 //
 //	// Decrypt a secret (as one of its recipients)
-//	result, _ := client.DecryptSecret(ctx, res.Secret.ID, sdk.DecryptOptions{})
+//	result, _ := client.Secrets.Decrypt(ctx, res.Secret.ID, secrets.DecryptOptions{})
 //	fmt.Println(result.Decrypted.Message)
 //
 //	// Write a files secret of any size to disk
-//	_, written, _ := client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+//	_, written, _ := client.Secrets.DecryptToDir(ctx, secretID, "./out", secrets.DecryptOptions{}, secrets.WriteOptions{})
 //	fmt.Println(len(written.Files), "files")
 //
 // # Secret Management
 //
-//	secrets, total, _ := client.ListReceivedSecrets(ctx, sdk.ListOptions{Limit: 50})
-//	info, _ := client.DescribeSecret(ctx, secretID)
-//	client.RevokeRecipient(ctx, secretID, "bob@example.com")
-//	client.DeleteSecret(ctx, secretID)
-package sdk
+//	list, total, _ := client.Secrets.ListReceived(ctx, secrets.ListOptions{Limit: 50})
+//	info, _ := client.Secrets.Describe(ctx, secretID)
+//	client.Secrets.RevokeRecipient(ctx, secretID, "bob@example.com")
+//	client.Secrets.Delete(ctx, secretID)
+package deepsecret

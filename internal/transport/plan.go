@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
 )
 
 // ── Transfer plans ──────────────────────────────────────────────────────────
@@ -27,8 +27,8 @@ const PieceSizeRule = "8 MiB under 1 GiB, 32 MiB to 16 GiB, 64 MiB from 16 GiB"
 // payload of size bytes sent whole in one presigned PUT, as the server
 // takes small payloads (PresignUploadFrom with expiryMinutes).
 func LogSinglePutPlan(log *slog.Logger, size int64, expiryMinutes int) {
-	up := api.Module(api.Logger(log), "upload")
-	up.Debug("plan", "transfer", "single", "size", api.Bytes(size),
+	up := logattr.Module(logattr.Logger(log), "upload")
+	up.Debug("plan", "transfer", "single", "size", logattr.Bytes(size),
 		"url_expiry", time.Duration(resolveExpiryMinutes(expiryMinutes))*time.Minute)
 	up.Debug("retry plan", "attempts", maxRetries+1, "first_wait", 2*backoffUnit,
 		"attempt_timeout", presignTimeout(size))
@@ -50,7 +50,7 @@ func threadsPlan(lim *limiter, requested, ceiling int, piece string) []any {
 		return []any{"mode", "fixed", "threads", lim.max, "cap", ceiling, "reason", "too few " + piece + "s to adapt: one per " + piece}
 	}
 	args := []any{"mode", "adaptive", "start", lim.current(), "max", lim.max, "cap", ceiling,
-		"window", lim.win.slow, "fast_window", lim.win.fast, "fast_rate", api.Rate(adaptiveFastRate), "gain_pct", adaptiveGainPct}
+		"window", lim.win.slow, "fast_window", lim.win.fast, "fast_rate", logattr.Rate(adaptiveFastRate), "gain_pct", adaptiveGainPct}
 	if lim.partSize > 0 {
 		args = append(args, "part_time", lim.partTime)
 	}
@@ -69,11 +69,11 @@ func retryPlan() []any {
 func logThreads(log *slog.Logger, from, to int, rate float64, reason string) {
 	switch {
 	case to > from:
-		log.Debug("increasing", "from", from, "to", to, "rate", api.Rate(rate), "reason", reason)
+		log.Debug("increasing", "from", from, "to", to, "rate", logattr.Rate(rate), "reason", reason)
 	case to < from:
-		log.Debug("decreasing", "from", from, "to", to, "rate", api.Rate(rate), "reason", reason)
+		log.Debug("decreasing", "from", from, "to", to, "rate", logattr.Rate(rate), "reason", reason)
 	default:
-		log.Debug("holding", "threads", to, "rate", api.Rate(rate), "reason", reason)
+		log.Debug("holding", "threads", to, "rate", logattr.Rate(rate), "reason", reason)
 	}
 }
 

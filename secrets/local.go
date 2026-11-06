@@ -1,0 +1,541 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 DeepSecret
+
+package secrets
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/google/uuid"
+
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/directory"
+	"github.com/deepsecret-io/deepsecret-go/internal/disk"
+	"github.com/deepsecret-io/deepsecret-go/internal/knownkeys"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
+	"github.com/deepsecret-io/deepsecret-go/internal/protocol"
+	"github.com/deepsecret-io/deepsecret-go/keys"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
+)
+
+// ── Local files ──────────────────────────────────────────────────────────────
+//
+// A local file is a sealed secret written to disk instead of being sent.
+// It holds what a send stores on the server, the signed manifest, a wrap
+// per recipient and the encrypted payload, sealed and opened by the same
+// protocol v4 code. Only public keys come from the API: the sender's client
+// looks up each recipient's registered key, and the recipient's client
+// checks that the key which signed the manifest is one the named sender
+// registered. Nothing is uploaded and no secret is created.
+//
+// The file is a CBOR sequence (RFC 8742) of three items:
+//
+//	"deepsecret-local-v1"                  text string
+//	payload                                byte string, its length in 8 bytes
+//	{sender_email, manifest, wraps}        map
+//
+// The map comes last because the manifest signs the payload's digest, so it
+// exists only once the payload is sealed: a send seals straight into the
+// file in one pass and fills in the payload's length afterwards.
+
+// LocalFileExt is the extension the CLI gives local files.
+const LocalFileExt = ".cbor"
+
+const (
+	localMagic = "deepsecret-local-v1"
+
+	// maxLocalHeader bounds the map after the payload: a manifest of at
+	// most 1 MiB and protocol.MaxRecipients wraps of about 1.2 KB each.
+	maxLocalHeader = 4 << 20
+
+	// maxCheckedLabels bounds the API lookups that check recipient labels
+	// on open; recipients past it are shown by fingerprint only.
+	maxCheckedLabels = 100
+)
+
+// localMagicItem is localMagic encoded as a CBOR text string (major type
+// 3; the length fits in the initial byte).
+var localMagicItem = append([]byte{0x60 | byte(len(localMagic))}, localMagic...)
+
+// localPrefixLen is the magic item and the payload byte string's head: the
+// major type 2 initial byte for an 8-byte length (0x5b) and the length.
+var localPrefixLen = int64(len(localMagicItem) + 9)
+
+// localHeader is the map after the payload. Emails are labels the
+// signature does not cover: on open, the sender's is checked against the
+// key that signed the manifest, and each recipient's against the key it
+// labels, and a label that fails is not shown.
+type localHeader struct {
+	SenderEmail string      `cbor:"sender_email"`
+	Manifest    []byte      `cbor:"manifest"`
+	Wraps       []localWrap `cbor:"wraps"`
+}
+
+type localWrap struct {
+	Fingerprint string `cbor:"recipient_fp"`
+	Email       string `cbor:"email"`
+	Enc         []byte `cbor:"enc"`
+	Ct          []byte `cbor:"ct"`
+}
+
+// localDecMode decodes a header strictly: definite lengths only, no
+// duplicate or unknown keys, and bounded sizes.
+var localDecMode = func() cbor.DecMode {
+	dm, err := cbor.DecOptions{
+		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
+		IndefLength:       cbor.IndefLengthForbidden,
+		MaxNestedLevels:   4,
+		MaxArrayElements:  protocol.MaxRecipients,
+		MaxMapPairs:       16,
+		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
+	}.DecMode()
+	if err != nil {
+		panic(err)
+	}
+	return dm
+}()
+
+// encryptToFile is encryptAndSend for EncryptOptions.LocalFile: it seals p
+// for recipients into the file instead of sending it.
+func (c *Client) encryptToFile(ctx context.Context, recipients []string, p *plaintext, opt EncryptOptions) (*EncryptResult, error) {
+	log := logattr.Logger(opt.Logger)
+	if err := ValidateRecipients(recipients); err != nil {
+		return nil, err
+	}
+	if p.size == 0 {
+		return nil, fmt.Errorf("payload is empty")
+	}
+	if maxSize := maxPayloadSize(opt); p.size > maxSize {
+		return nil, fmt.Errorf("payload size %d exceeds limit %d bytes: reduce input size or increase MaxPayloadSize", p.size, maxSize)
+	}
+	out := opt.LocalFile
+	if _, err := os.Lstat(out); err == nil && !opt.LocalOverwrite {
+		return nil, fmt.Errorf("%s already exists (allow overwriting to replace it)", out)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("check %s: %w", out, err)
+	}
+	dir := filepath.Dir(out)
+	if err := checkFreeSpace(dir, spoolNeed(p.size), "the encrypted file", ""); err != nil {
+		return nil, err
+	}
+	logPayload(log, p)
+	// The ciphertext is sealed into a private file beside out and renamed
+	// to it when complete.
+	storage := []any{"where", out, "need", logattr.Bytes(spoolNeed(p.size))}
+	if free, ok := disk.FreeBytes(dir); ok {
+		storage = append(storage, "free", logattr.Bytes(free))
+	}
+	logattr.Module(log, "encrypt").Debug("ciphertext storage", storage...)
+
+	// The sender's email goes in the file, so the recipient's client can
+	// check the signing key against the keys that account registered.
+	me, err := c.senderAccount(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
+	kp, senderFP, err := c.loadIdentity(ctx, opt.Identity, opt.unlock())
+	if err != nil {
+		return nil, fmt.Errorf("load sender identity: %w", err)
+	}
+	logKeyPair(log, senderFP, opt.Identity)
+	known, err := c.store.RecordOwnAccount(me.Email, senderFP, false)
+	if err != nil {
+		return nil, err
+	}
+	pubs := make([]*keys.PublicKeys, len(recipients))
+	var firstUse []Recipient
+	for i, email := range recipients {
+		self := knownkeys.OwnAccount(known[strings.ToLower(email)])
+		pubKeys, first, err := c.recipientKeys(ctx, known, email, self, senderFP)
+		if err != nil {
+			return nil, err
+		}
+		pubs[i] = pubKeys
+		if first {
+			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: pubKeys.Fingerprint})
+		}
+		logRecipientKeys(log, email, "", pubKeys.Fingerprint, self, first)
+	}
+	algo, err := chooseCompression(p, compress.Algorithm(opt.Compress), log)
+	if err != nil {
+		return nil, err
+	}
+	logEncryptPlan(log, len(pubs))
+
+	// Seal into a private file beside the destination, renamed into place
+	// once complete, so a failure never leaves a partial file under it.
+	f, err := os.CreateTemp(dir, ".deepsecret-*.partial")
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", out, err)
+	}
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = f.Close()           // the send already failed, and its error is returned.
+			_ = os.Remove(f.Name()) // a 0600 temporary file of ciphertext; the send's error is returned.
+		}
+	}()
+	head := append(append([]byte{}, localMagicItem...), 0x5b, 0, 0, 0, 0, 0, 0, 0, 0)
+	if _, err := f.Write(head); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	opt.phase(transfer.PhaseEncrypting)
+	tEnc := time.Now()
+	sealed, written, err := sealPlaintext(ctx, f, p, algo, kp, pubs, protocol.SealParams{
+		RevisionID:  uuid.New().String(),
+		SecretName:  secretName(opt),
+		PayloadType: p.payloadType,
+		Compressed:  algo != compress.None,
+		Compression: string(algo),
+	}, opt.OnEncryptProgress)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt: %w", err)
+	}
+	logSealed(log, algo, sealed, written, time.Since(tEnc))
+	m := sealed.Manifest
+
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(m.CiphertextSize)) // #nosec G115 -- the byte count the seal just wrote, never negative.
+	if _, err := f.WriteAt(length[:], int64(len(localMagicItem))+1); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	if pos, err := f.Seek(0, io.SeekCurrent); err != nil || pos != localPrefixLen+m.CiphertextSize {
+		return nil, fmt.Errorf("write %s: the payload is not the size the manifest signs", out)
+	}
+	hdr := localHeader{SenderEmail: me.Email, Manifest: sealed.ManifestData, Wraps: make([]localWrap, len(pubs))}
+	sentTo := make([]Recipient, len(pubs))
+	for i, pub := range pubs {
+		w, ok := sealed.Wrap(pub.Fingerprint)
+		if !ok {
+			return nil, fmt.Errorf("encrypt: no wrap was made for %s", recipients[i])
+		}
+		hdr.Wraps[i] = localWrap{Fingerprint: pub.Fingerprint, Email: recipients[i], Enc: w.Enc, Ct: w.Ciphertext}
+		sentTo[i] = Recipient{Email: recipients[i], Fingerprint: pub.Fingerprint}
+	}
+	data, err := cbor.Marshal(hdr)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", out, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	if err := os.Rename(f.Name(), out); err != nil {
+		return nil, fmt.Errorf("write %s: %w", out, err)
+	}
+	renamed = true
+	// Written: the keys new to this device that it went to are accepted
+	// now. If that fails, the file goes too.
+	if err := c.store.RecordFirstUse(firstUsePeople(firstUse), false); err != nil {
+		_ = os.Remove(out) // the file was just written by this send, and its error is returned.
+		return nil, fmt.Errorf("recording the recipients' keys on this device failed, so %s was removed: %w", out, err)
+	}
+	logattr.Module(log, "encrypt").Info("local file written", "file", out, "size", logattr.Bytes(localPrefixLen+m.CiphertextSize+int64(len(data))))
+
+	label, ratio, original := compressionSummary(p, algo, m, written)
+	result := &EncryptResult{
+		LocalFile:         out,
+		EncryptedSize:     m.CiphertextSize,
+		SenderFingerprint: senderFP,
+		Recipients:        sentTo,
+		FirstUse:          firstUse,
+		Compressed:        label != "",
+		Compression:       label,
+		CompressionRatio:  ratio,
+		OriginalSize:      original,
+		PayloadType:       p.payloadType,
+		FilesCount:        len(p.files),
+		Archived:          p.archived,
+	}
+	if p.archived {
+		result.ArchiveEntryCount, result.ArchiveFileCount = p.archiveEntries, p.archiveFiles
+	}
+	return result, nil
+}
+
+// OpenLocalFile opens a file written with EncryptOptions.LocalFile, as
+// Open opens a secret: it verifies the manifest and that the key
+// which signed it is one the sender named in the file registered, opens
+// the caller's wrap, and copies the payload into a private temporary file
+// (or memory, at most 4 MiB), so the file can change afterwards without
+// affecting what is checked and decrypted. Decrypt it with Payload or
+// WriteFiles, which check the payload's digest before any plaintext.
+// OnDownloadProgress reports the copy. Revision and the download options
+// do not apply.
+func (c *Client) OpenLocalFile(ctx context.Context, path string, opt DecryptOptions) (*OpenedSecret, error) {
+	log := logattr.Logger(opt.Logger)
+	f, err := os.Open(path) // #nosec G304 -- the local file the caller asked to open; its contents are checked as untrusted.
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	hdr, payloadSize, err := readLocalHeader(f, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// The sender's email and the wraps' emails are labels the signature
+	// does not cover: they are checked below.
+	logattr.Module(log, "decrypt").Debug("local file read", "file", path, "sender", hdr.SenderEmail, "wraps", len(hdr.Wraps), "payload_size", logattr.Bytes(payloadSize))
+
+	kp, localFP, err := c.loadIdentity(ctx, opt.Identity, opt.unlock())
+	if err != nil {
+		return nil, fmt.Errorf("load identity: %w", err)
+	}
+	logKeyPair(log, localFP, opt.Identity)
+	var wrap *protocol.Wrap
+	emails := make(map[string]string, len(hdr.Wraps))
+	for _, w := range hdr.Wraps {
+		emails[w.Fingerprint] = w.Email
+		if w.Fingerprint == localFP {
+			wrap = &protocol.Wrap{RecipientFingerprint: localFP, Enc: w.Enc, Ciphertext: w.Ct}
+		}
+	}
+	if wrap == nil {
+		return nil, fmt.Errorf("%s was not encrypted for your key (%s)", path, keys.ShortFingerprint(localFP))
+	}
+
+	// The manifest is parsed here for the sender's fingerprint only; Open
+	// verifies it in full, with the Ed25519 key of the sender's registered
+	// key of that fingerprint.
+	peek, err := protocol.UnmarshalManifest(hdr.Manifest)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// Callers name output after the revision, as for a secret, so it must
+	// be what a send makes: a canonical UUID, never a path.
+	if id, err := uuid.Parse(peek.RevisionID); err != nil || id.String() != peek.RevisionID {
+		return nil, fmt.Errorf("%s: malformed local file: the revision ID is not a UUID", path)
+	}
+	senderED25519, err := directory.ResolveED25519ByEmail(ctx, c.api, hdr.SenderEmail, peek.SenderFingerprint)
+	if err != nil {
+		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
+	}
+	// A local file is opened by path, not by a name or id the server
+	// gives, so its manifest's own revision and name are the ones asked
+	// for. Result shows the signed name.
+	opened, err := protocol.Open(hdr.Manifest, wrap, kp, protocol.OpenParams{
+		RevisionID:    peek.RevisionID,
+		SecretName:    peek.SecretName,
+		SenderED25519: senderED25519,
+	})
+	if err != nil {
+		return nil, err
+	}
+	m := opened.Manifest
+	logManifestVerified(log, m, len(hdr.Manifest))
+	senderFirst, err := c.store.CheckSenderKey(hdr.SenderEmail, m.SenderFingerprint, log)
+	if err != nil {
+		opened.Close()
+		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
+	}
+	if m.CiphertextSize != payloadSize {
+		opened.Close()
+		return nil, fmt.Errorf("%s: the payload is %d bytes, the signed manifest says %d", path, payloadSize, m.CiphertextSize)
+	}
+	maxSize := opt.MaxDownloadSize
+	if maxSize <= 0 {
+		maxSize = defaultMaxDownloadSize
+	}
+	if m.CiphertextSize > maxSize {
+		opened.Close()
+		return nil, fmt.Errorf("the payload is %s, over the %s limit (set MaxDownloadSize to allow it)",
+			humanBytes(m.CiphertextSize), humanBytes(maxSize))
+	}
+
+	var sp *spool
+	if m.CiphertextSize <= smallPayloadSize {
+		sp = newMemSpool(0)
+	} else if sp, err = newSpool(opt.TempDir, m.CiphertextSize); err != nil {
+		opened.Close()
+		return nil, err
+	}
+	// The payload is copied before it is checked, so the file cannot change
+	// under the checks.
+	logattr.Module(log, "decrypt").Debug("ciphertext storage", sp.logArgs(m.CiphertextSize)...)
+	o := &OpenedSecret{opened: opened, spool: sp, log: log, onProgress: opt.OnDecryptProgress,
+		recordSender: c.senderRecorder(hdr.SenderEmail, m.SenderFingerprint, senderFirst)}
+	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
+	if opt.OnDownloadProgress != nil {
+		src = &copyProgress{r: src, total: payloadSize, onProgress: opt.OnDownloadProgress}
+	}
+	opt.phase(transfer.PhaseReading)
+	if n, err := io.Copy(sp, ctxReader{ctx, src}); err != nil || n != payloadSize {
+		_ = o.Close() // the read error is returned; the spool holds ciphertext only, in a private (0700) directory.
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// The signed list holds fingerprints only, so an email is shown for
+	// one only when that account registered the key: anyone handling the
+	// file could have changed the labels.
+	recipients := make([]Recipient, len(m.Recipients))
+	checked := 0
+	for i, r := range m.Recipients {
+		email := emails[r.Fingerprint]
+		if email != "" {
+			checked++
+			if checked > maxCheckedLabels {
+				email = ""
+			} else if _, err := directory.ResolveED25519ByEmail(ctx, c.api, email, r.Fingerprint); err != nil {
+				// Not shown whatever the reason: the account does not own
+				// the key, or the lookup failed.
+				logattr.Module(log, "verify").Warn("recipient label not verified", "email", email, "fingerprint", r.Fingerprint, "error", err)
+				email = ""
+			}
+		}
+		recipients[i] = Recipient{Email: email, Fingerprint: r.Fingerprint}
+	}
+	o.Result = DecryptResult{
+		RevisionID:           m.RevisionID,
+		SecretName:           m.SecretName,
+		SignedAt:             time.Unix(m.Timestamp, 0),
+		SenderFingerprint:    m.SenderFingerprint,
+		SenderEmail:          hdr.SenderEmail,
+		SenderFirstUse:       senderFirst,
+		RecipientFingerprint: localFP,
+		Recipients:           recipients,
+		Compressed:           m.Compressed,
+		Compression:          m.Compression,
+		PayloadType:          m.PayloadType,
+		ProtocolVersion:      m.Version,
+		CipherSuite:          m.CipherSuite,
+		PayloadDigest:        hex.EncodeToString(m.PayloadDigest),
+		EncryptedSize:        m.CiphertextSize,
+		PlaintextSize:        m.PlaintextSize,
+	}
+	return o, nil
+}
+
+// LocalFileRecipients lists the keys a local file was sealed for, with the
+// emails the sender gave them. Nothing is verified: it lets a caller pick
+// which of its keys to open the file with, and OpenLocalFile checks the
+// file.
+func LocalFileRecipients(path string) ([]Recipient, error) {
+	f, err := os.Open(path) // #nosec G304 -- the local file the caller names; its header is parsed as untrusted.
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	hdr, _, err := readLocalHeader(f, info.Size())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	out := make([]Recipient, len(hdr.Wraps))
+	for i, w := range hdr.Wraps {
+		out[i] = Recipient{Email: w.Email, Fingerprint: w.Fingerprint}
+	}
+	return out, nil
+}
+
+// readLocalHeader checks a local file's layout and returns its header and
+// the payload's size; the payload starts at localPrefixLen.
+func readLocalHeader(r io.ReaderAt, size int64) (*localHeader, int64, error) {
+	notLocal := errors.New("not a DeepSecret local file")
+	if size < localPrefixLen {
+		return nil, 0, notLocal
+	}
+	prefix := make([]byte, localPrefixLen)
+	if _, err := r.ReadAt(prefix, 0); err != nil {
+		return nil, 0, err
+	}
+	if !bytes.Equal(prefix[:len(localMagicItem)], localMagicItem) || prefix[len(localMagicItem)] != 0x5b {
+		return nil, 0, notLocal
+	}
+	n := binary.BigEndian.Uint64(prefix[len(localMagicItem)+1:])
+	if n > uint64(size-localPrefixLen) { // #nosec G115 -- size >= localPrefixLen was checked above.
+		return nil, 0, errors.New("the file is truncated")
+	}
+	payloadSize := int64(n) // #nosec G115 -- n is at most size-localPrefixLen, an int64.
+	headerSize := size - localPrefixLen - payloadSize
+	if headerSize <= 0 || headerSize > maxLocalHeader {
+		return nil, 0, errors.New("malformed local file: missing or oversized header")
+	}
+	data := make([]byte, headerSize)
+	if _, err := r.ReadAt(data, localPrefixLen+payloadSize); err != nil {
+		return nil, 0, err
+	}
+	var h localHeader
+	if err := localDecMode.Unmarshal(data, &h); err != nil {
+		return nil, 0, fmt.Errorf("malformed local file: %w", err)
+	}
+	if err := h.validate(); err != nil {
+		return nil, 0, fmt.Errorf("malformed local file: %w", err)
+	}
+	return &h, payloadSize, nil
+}
+
+// validate checks what Open does not: the emails, and that the wraps name
+// distinct, well-formed fingerprints.
+func (h *localHeader) validate() error {
+	if !knownkeys.PlausibleEmail(h.SenderEmail) {
+		return errors.New("invalid sender email")
+	}
+	if len(h.Manifest) == 0 {
+		return errors.New("missing manifest")
+	}
+	if len(h.Wraps) == 0 {
+		return errors.New("no recipients")
+	}
+	seen := make(map[string]bool, len(h.Wraps))
+	for i, w := range h.Wraps {
+		if len(w.Fingerprint) != 64 || strings.ToLower(w.Fingerprint) != w.Fingerprint {
+			return fmt.Errorf("recipient %d has an invalid fingerprint", i)
+		}
+		if _, err := hex.DecodeString(w.Fingerprint); err != nil {
+			return fmt.Errorf("recipient %d has an invalid fingerprint", i)
+		}
+		if seen[w.Fingerprint] {
+			return fmt.Errorf("recipient %s is listed twice", keys.ShortFingerprint(w.Fingerprint))
+		}
+		seen[w.Fingerprint] = true
+		if w.Email != "" && !knownkeys.PlausibleEmail(w.Email) {
+			return fmt.Errorf("recipient %d has an invalid email", i)
+		}
+	}
+	return nil
+}
+
+// copyProgress reports how much of total has been read.
+type copyProgress struct {
+	r          io.Reader
+	n, total   int64
+	onProgress func(transferred, total int64)
+}
+
+func (p *copyProgress) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.n += int64(n)
+		p.onProgress(p.n, p.total)
+	}
+	return n, err
+}

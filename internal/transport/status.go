@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // ── Live transfer status ────────────────────────────────────────────────────
@@ -35,10 +35,10 @@ type TransferStatus struct {
 }
 
 // Snapshot returns the transfer's state now.
-func (s *TransferStatus) Snapshot() api.TransferSnapshot {
+func (s *TransferStatus) Snapshot() transfer.Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := api.TransferSnapshot{
+	out := transfer.Snapshot{
 		Started: s.started, Total: s.total, Done: s.doneBytes,
 		Parts: s.parts, PartsDone: s.partsDone, Threads: 1, MaxThreads: 1,
 	}
@@ -49,13 +49,13 @@ func (s *TransferStatus) Snapshot() api.TransferSnapshot {
 	for last > 0 && s.conns[last-1] == nil {
 		last--
 	}
-	out.Connections = make([]api.ConnectionStatus, last)
+	out.Connections = make([]transfer.ConnectionStatus, last)
 	for i, c := range s.conns[:last] {
 		if c == nil {
 			continue
 		}
 		moved := min(max(c.moved.Load(), 0), c.size)
-		out.Connections[i] = api.ConnectionStatus{Part: c.part, Size: c.size, Moved: moved,
+		out.Connections[i] = transfer.ConnectionStatus{Part: c.part, Size: c.size, Moved: moved,
 			Attempt: c.attempt, Since: c.since, Waiting: c.waiting}
 		out.Done += moved
 	}

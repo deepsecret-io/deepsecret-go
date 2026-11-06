@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/internal/sign"
 )
 
 // Protocol v4 test vectors. Other SDKs MUST reproduce every value here.
@@ -45,7 +45,7 @@ func vecManifest(digest []byte, ctSize int64) *Manifest {
 		SenderED25519:     bytes.Repeat([]byte{0x01}, ED25519PubKeySize),
 		SenderX25519:      bytes.Repeat([]byte{0x02}, X25519PubKeySize),
 		SenderMLKEM768:    bytes.Repeat([]byte{0x03}, MLKEM768PubKeySize),
-		SenderMLDSA65:     bytes.Repeat([]byte{0x04}, crypto.MLDSA65PubKeySize),
+		SenderMLDSA65:     bytes.Repeat([]byte{0x04}, sign.MLDSA65PubKeySize),
 		PayloadType:       vecPayloadType,
 		Compressed:        false,
 		Compression:       "",

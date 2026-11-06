@@ -22,7 +22,8 @@ import (
 
 	"github.com/ebitengine/purego"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keys"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
 // Constants from libfido2's fido.h, fido/param.h and fido/err.h (1.17.0).
@@ -79,7 +80,7 @@ var errNotPlugged = errors.New("no security key was plugged in")
 
 // waitForKey calls try until it reports done or fails. In between it asks
 // once, through p, to plug in want, and looks again every insertPoll until
-// ctx ends (crypto.ErrCancelled) or insertWait passes (errNotPlugged).
+// ctx ends (keystore.ErrCancelled) or insertWait passes (errNotPlugged).
 func waitForKey(ctx context.Context, p Prompter, want string, try func() (done bool, err error)) error {
 	deadline := time.Now().Add(insertWait)
 	asked := false
@@ -98,7 +99,7 @@ func waitForKey(ctx context.Context, p Prompter, want string, try func() (done b
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return fmt.Errorf("%w: %v", crypto.ErrCancelled, ctx.Err())
+			return fmt.Errorf("%w: %v", keystore.ErrCancelled, ctx.Err())
 		case <-t.C:
 		}
 	}
@@ -234,7 +235,7 @@ func errNoLibrary() error {
 	if runtime.GOOS == "darwin" {
 		hint = "install libfido2 with Homebrew (brew install libfido2)"
 	}
-	return fmt.Errorf("%w: libfido2 was not found; %s", crypto.ErrNoSecurityKeySupport, hint)
+	return fmt.Errorf("%w: libfido2 was not found; %s", keystore.ErrNoSecurityKeySupport, hint)
 }
 
 // openLibrary loads the first libfido2 found that passes trustedLibrary
@@ -279,7 +280,7 @@ func openLibrary() (*lib, error) {
 		return l, nil
 	}
 	if len(refused) > 0 {
-		return nil, fmt.Errorf("%w: no usable libfido2 (%v)", crypto.ErrNoSecurityKeySupport, refused)
+		return nil, fmt.Errorf("%w: no usable libfido2 (%v)", keystore.ErrNoSecurityKeySupport, refused)
 	}
 	return nil, errNoLibrary()
 }
@@ -483,7 +484,7 @@ func (s *session) verifyUser(ctx context.Context) error {
 func (s *session) askPIN(ctx context.Context, wrong bool) error {
 	s.builtIn = false
 	if !s.l.devHasPIN(s.dev) {
-		return crypto.ErrPINNotSet
+		return keystore.ErrPINNotSet
 	}
 	pin, err := s.prompter.PIN(ctx, s.name, s.retries(), wrong)
 	if err != nil {
@@ -492,7 +493,7 @@ func (s *session) askPIN(ctx context.Context, wrong bool) error {
 	}
 	if len(pin) == 0 || bytes.IndexByte(pin, 0) >= 0 {
 		clear(pin)
-		return crypto.ErrCancelled
+		return keystore.ErrCancelled
 	}
 	clear(s.pin)
 	s.pin = make([]byte, len(pin)+1) // NUL-terminated, in a buffer of its own
@@ -511,7 +512,7 @@ func (s *session) withUser(ctx context.Context, op func() int32) error {
 		case rc == fidoOK:
 			return nil
 		case ctx.Err() != nil:
-			return fmt.Errorf("%w: %v", crypto.ErrCancelled, ctx.Err())
+			return fmt.Errorf("%w: %v", keystore.ErrCancelled, ctx.Err())
 		case s.builtIn && (rc == fidoErrUVBlocked || rc == fidoErrUVInvalid):
 			if err := s.askPIN(ctx, false); err != nil {
 				return err
@@ -531,27 +532,27 @@ func (s *session) withUser(ctx context.Context, op func() int32) error {
 func (s *session) err(rc int32) error {
 	switch rc {
 	case fidoErrPINInvalid, fidoErrPINAuthInvalid:
-		return &crypto.PINError{Retries: s.retries()}
+		return &keystore.PINError{Retries: s.retries()}
 	case fidoErrPINAuthBlocked:
-		return fmt.Errorf("%w: too many wrong PINs in a row; unplug the security key, plug it back in and try again", crypto.ErrPINInvalid)
+		return fmt.Errorf("%w: too many wrong PINs in a row; unplug the security key, plug it back in and try again", keystore.ErrPINInvalid)
 	case fidoErrPINBlocked:
-		return crypto.ErrPINBlocked
+		return keystore.ErrPINBlocked
 	case fidoErrPINNotSet:
-		return crypto.ErrPINNotSet
+		return keystore.ErrPINNotSet
 	case fidoErrNoCredentials:
-		return crypto.ErrNoSecurityKey
+		return keystore.ErrNoSecurityKey
 	case fidoErrCredentialExcluded:
-		return crypto.ErrSecurityKeyEnrolled
+		return keystore.ErrSecurityKeyEnrolled
 	case fidoErrUnsupportedExt:
-		return crypto.ErrSecurityKeyNoHMAC
+		return keystore.ErrSecurityKeyNoHMAC
 	case fidoErrActionTimeout, fidoErrUserActionTimeout, fidoErrOperationDenied:
 		// CTAP2 answers OPERATION_DENIED when no touch came in time; a
 		// YubiKey has no way to deny, so that is all it means there.
-		return crypto.ErrTouchTimeout
+		return keystore.ErrTouchTimeout
 	case fidoErrKeepaliveCancel:
-		return crypto.ErrCancelled
+		return keystore.ErrCancelled
 	case fidoErrRX:
-		return fmt.Errorf("%w: no answer from %s (unplugged, or it waited too long)", crypto.ErrTouchTimeout, s.name)
+		return fmt.Errorf("%w: no answer from %s (unplugged, or it waited too long)", keystore.ErrTouchTimeout, s.name)
 	}
 	return fmt.Errorf("%s: %s", s.name, s.l.strerr(rc))
 }
@@ -575,7 +576,7 @@ func (s *session) probe(ctx context.Context, creds [][]byte) (found []byte, err 
 	if rc := l.assertSetClientdataHash(a, cdh, uintptr(len(cdh))); rc != fidoOK {
 		return nil, s.err(rc)
 	}
-	if rc := l.assertSetRP(a, cstr(crypto.SecurityKeyRPID)); rc != fidoOK {
+	if rc := l.assertSetRP(a, cstr(keystore.SecurityKeyRPID)); rc != fidoOK {
 		return nil, s.err(rc)
 	}
 	for _, c := range creds {
@@ -609,7 +610,7 @@ var errNoProbe = errors.New("the security key cannot be asked without a touch")
 // verification: the one assertion path both enrolling and unlocking use.
 func (s *session) prf(ctx context.Context, id, input []byte, reason string) ([]byte, error) {
 	l := s.l
-	salt := crypto.PRFSalt(input)
+	salt := keystore.PRFSalt(input)
 	var out []byte
 	err := s.withUser(ctx, func() int32 {
 		a := l.assertNew()
@@ -620,7 +621,7 @@ func (s *session) prf(ctx context.Context, id, input []byte, reason string) ([]b
 		cdh := clientDataHash()
 		for _, rc := range []int32{
 			l.assertSetClientdataHash(a, cdh, uintptr(len(cdh))),
-			l.assertSetRP(a, cstr(crypto.SecurityKeyRPID)),
+			l.assertSetRP(a, cstr(keystore.SecurityKeyRPID)),
 			l.assertAllowCred(a, id, uintptr(len(id))),
 			l.assertSetExtensions(a, fidoExtHMACSecret),
 			l.assertSetHMACSalt(a, salt[:], uintptr(len(salt))),
@@ -689,7 +690,7 @@ func has(list []string, s string) bool {
 // Enroll creates a credential on the one security key connected, asking
 // to plug one in when none is, and gets its first PRF output. Two touches:
 // one to create, one to derive.
-func (a *Authenticator) Enroll(ctx context.Context, req crypto.EnrollRequest) (*crypto.EnrollResult, error) {
+func (a *Authenticator) Enroll(ctx context.Context, req keystore.EnrollRequest) (*keystore.EnrollResult, error) {
 	l, err := load()
 	if err != nil {
 		return nil, err
@@ -714,14 +715,14 @@ func (a *Authenticator) Enroll(ctx context.Context, req crypto.EnrollRequest) (*
 	}
 	defer s.close()
 	if !l.devIsFIDO2(s.dev) {
-		return nil, crypto.ErrSecurityKeyNoHMAC
+		return nil, keystore.ErrSecurityKeyNoHMAC
 	}
 	exts, err := s.extensions()
 	if err != nil {
 		return nil, err
 	}
 	if !has(exts, "hmac-secret") {
-		return nil, crypto.ErrSecurityKeyNoHMAC
+		return nil, keystore.ErrSecurityKeyNoHMAC
 	}
 	if len(req.Exclude) > 0 {
 		found, err := s.probe(ctx, req.Exclude)
@@ -729,7 +730,7 @@ func (a *Authenticator) Enroll(ctx context.Context, req crypto.EnrollRequest) (*
 			return nil, err
 		}
 		if found != nil {
-			return nil, crypto.ErrSecurityKeyEnrolled
+			return nil, keystore.ErrSecurityKeyEnrolled
 		}
 	}
 	if err := s.verifyUser(ctx); err != nil {
@@ -790,13 +791,13 @@ func (a *Authenticator) Enroll(ctx context.Context, req crypto.EnrollRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	return &crypto.EnrollResult{CredentialID: id, AAGUID: aaguid, Device: s.name, Output: out}, nil
+	return &keystore.EnrollResult{CredentialID: id, AAGUID: aaguid, Device: s.name, Output: out}, nil
 }
 
 // Derive finds the connected security key that holds one of the
 // credentials, without a touch, asking to plug it in when none does, and
 // gets its PRF output with the PIN and a touch.
-func (a *Authenticator) Derive(ctx context.Context, req crypto.DeriveRequest) (*crypto.DeriveResult, error) {
+func (a *Authenticator) Derive(ctx context.Context, req keystore.DeriveRequest) (*keystore.DeriveResult, error) {
 	l, err := load()
 	if err != nil {
 		return nil, err
@@ -805,7 +806,7 @@ func (a *Authenticator) Derive(ctx context.Context, req crypto.DeriveRequest) (*
 	for i, c := range req.Credentials {
 		ids[i] = c.ID
 	}
-	var res *crypto.DeriveResult
+	var res *keystore.DeriveResult
 	var openErr error
 	probed := map[string]bool{} // connected devices that hold none of the credentials
 	pass := 0
@@ -861,12 +862,12 @@ func (a *Authenticator) Derive(ctx context.Context, req crypto.DeriveRequest) (*
 		if openErr != nil {
 			return nil, openErr
 		}
-		return nil, fmt.Errorf("%w: plug in %s", crypto.ErrNoSecurityKey, wantedKeys(req))
+		return nil, fmt.Errorf("%w: plug in %s", keystore.ErrNoSecurityKey, wantedKeys(req))
 	}
 	return res, err
 }
 
-func (a *Authenticator) derive(ctx context.Context, s *session, req crypto.DeriveRequest, id []byte) (*crypto.DeriveResult, error) {
+func (a *Authenticator) derive(ctx context.Context, s *session, req keystore.DeriveRequest, id []byte) (*keystore.DeriveResult, error) {
 	var input []byte
 	for _, c := range req.Credentials {
 		if bytes.Equal(c.ID, id) {
@@ -874,21 +875,21 @@ func (a *Authenticator) derive(ctx context.Context, s *session, req crypto.Deriv
 		}
 	}
 	if input == nil {
-		return nil, crypto.ErrNoSecurityKey
+		return nil, keystore.ErrNoSecurityKey
 	}
 	if err := s.verifyUser(ctx); err != nil {
 		return nil, err
 	}
-	out, err := s.prf(ctx, id, input, "to unlock key "+crypto.ShortFingerprint(req.Fingerprint))
+	out, err := s.prf(ctx, id, input, "to unlock key "+keys.ShortFingerprint(req.Fingerprint))
 	if err != nil {
 		return nil, err
 	}
-	return &crypto.DeriveResult{CredentialID: id, Output: out}, nil
+	return &keystore.DeriveResult{CredentialID: id, Output: out}, nil
 }
 
 // wantedKeys names the enrolled security keys, for the prompt to plug one
 // in and the error when none was.
-func wantedKeys(req crypto.DeriveRequest) string {
+func wantedKeys(req keystore.DeriveRequest) string {
 	if len(req.Credentials) == 1 {
 		return fmt.Sprintf("the security key %q", req.Credentials[0].Label)
 	}

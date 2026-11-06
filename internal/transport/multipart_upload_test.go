@@ -20,7 +20,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
 )
 
 // patternSource is a large source that costs no memory: each byte is a
@@ -267,7 +267,7 @@ func TestUpload_BatchesURLsAndRegistersNothing(t *testing.T) {
 	u := newUploadServer(t, 12*part+1234, part)
 	src := patternSource{u.size}
 	var last int64
-	err := u.client(t).MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{OnProgress: func(n, total int64) {
+	err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", src, u.size, MultipartUploadOptions{OnProgress: func(n, total int64) {
 		if total != u.size || n > total {
 			t.Errorf("progress %d of %d", n, total)
 		}
@@ -329,7 +329,7 @@ func TestUpload_ResumesFromStorage(t *testing.T) {
 	u.stored[3] = MultipartPartStatus{PartNumber: 3, Etag: strings.Repeat("0", 32), Size: part}
 	var first int64 = -1
 	var book logBook
-	err := u.client(t).MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{Logger: book.logger(), OnProgress: func(n, _ int64) {
+	err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", src, u.size, MultipartUploadOptions{Logger: book.logger(), OnProgress: func(n, _ int64) {
 		if first < 0 {
 			first = n
 		}
@@ -351,9 +351,9 @@ func TestUpload_ResumesFromStorage(t *testing.T) {
 	if first != 4*part {
 		t.Fatalf("progress started at %d, want the kept %d bytes", first, 4*part)
 	}
-	book.has(t, "resume", "stored parts kept", map[string]any{"parts": 4, "size": api.Bytes(4 * part), "parts_left": 4})
+	book.has(t, "resume", "stored parts kept", map[string]any{"parts": 4, "size": logattr.Bytes(4 * part), "parts_left": 4})
 	// Its rate is of what it sent, not of the kept parts.
-	book.has(t, "upload", "upload complete", map[string]any{"size": api.Bytes(8 * part), "parts": 8, "sent": api.Bytes(4 * part)})
+	book.has(t, "upload", "upload complete", map[string]any{"size": logattr.Bytes(8 * part), "parts": 8, "sent": logattr.Bytes(4 * part)})
 }
 
 // Storage refusing a URL (expired) gets the part presigned again; a
@@ -366,7 +366,7 @@ func TestUpload_RecoversFromRefusalsFailuresAndStalls(t *testing.T) {
 	u.fail[2] = 2
 	u.stall[4] = 1
 	var book logBook
-	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
+	if err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
 		t.Fatal(err)
 	}
 	// Each retry is logged with the attempt it starts: part 2 failed on its
@@ -395,7 +395,7 @@ func TestUpload_GivesUpAfterTheAttempts(t *testing.T) {
 	const part = S3MinPartSize
 	u := newUploadServer(t, 2*part, part)
 	u.fail[2] = 100
-	err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{})
+	err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{})
 	u.locked(func() {
 		if err == nil || !strings.Contains(err.Error(), "part 2") || u.puts[2] != multipartAttempts {
 			t.Fatalf("err %v after %d attempts", err, u.puts[2])
@@ -409,7 +409,7 @@ func TestUpload_GivesUpAfterTheAttempts(t *testing.T) {
 // The upload refuses data whose size does not match the revision.
 func TestUpload_RefusesASizeMismatch(t *testing.T) {
 	u := newUploadServer(t, 4*S3MinPartSize, S3MinPartSize)
-	err := u.client(t).MultipartUploadOpts("rev-1", patternSource{9 * S3MinPartSize}, 9*S3MinPartSize, MultipartUploadOptions{})
+	err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", patternSource{9 * S3MinPartSize}, 9*S3MinPartSize, MultipartUploadOptions{})
 	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
 		t.Fatalf("err %v", err)
 	}
@@ -421,11 +421,11 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 	const part = S3MinPartSize
 	u := newUploadServer(t, 3*part, part)
 	var book logBook
-	if err := u.client(t).MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
+	if err := u.client(t).MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{Logger: book.logger()}); err != nil {
 		t.Fatal(err)
 	}
 	book.has(t, "upload", "plan", map[string]any{
-		"transfer": "multipart", "size": api.Bytes(3 * part), "parts": 3, "part_size": api.Bytes(part),
+		"transfer": "multipart", "size": logattr.Bytes(3 * part), "parts": 3, "part_size": logattr.Bytes(part),
 		"url_batch": 100, "url_renew_before": 30 * time.Second,
 	})
 	book.has(t, "upload", "retry plan", map[string]any{
@@ -435,19 +435,19 @@ func TestUpload_ReportsItsPlan(t *testing.T) {
 	// the threads module with its own reason.
 	book.has(t, "upload.threads", "plan", map[string]any{
 		"mode": "adaptive", "start": 1, "max": 3, "cap": 32, "window": 5 * time.Second, "fast_window": 2 * time.Second,
-		"fast_rate": api.Rate(4e6), "gain_pct": 10, "part_time": time.Minute,
+		"fast_rate": logattr.Rate(4e6), "gain_pct": 10, "part_time": time.Minute,
 	})
 	if n := len(book.all("upload", "part complete")); n != 3 {
 		t.Errorf("%d parts logged complete, want 3", n)
 	}
-	book.has(t, "upload", "upload complete", map[string]any{"size": api.Bytes(3 * part), "parts": 3, "sent": api.Bytes(3 * part)})
+	book.has(t, "upload", "upload complete", map[string]any{"size": logattr.Bytes(3 * part), "parts": 3, "sent": logattr.Bytes(3 * part)})
 	if kept := book.all("resume", "stored parts kept"); len(kept) != 0 {
 		t.Errorf("a fresh upload logged kept parts: %v", kept)
 	}
 
 	var fixed logBook
 	u2 := newUploadServer(t, 3*part, part)
-	if err := u2.client(t).MultipartUploadOpts("rev-1", patternSource{u2.size}, u2.size, MultipartUploadOptions{Threads: 2, Logger: fixed.logger()}); err != nil {
+	if err := u2.client(t).MultipartUploadOpts(context.Background(), "rev-1", patternSource{u2.size}, u2.size, MultipartUploadOptions{Threads: 2, Logger: fixed.logger()}); err != nil {
 		t.Fatal(err)
 	}
 	fixed.has(t, "upload.threads", "plan", map[string]any{"mode": "fixed", "threads": 2, "requested": 2})
@@ -472,8 +472,7 @@ func TestUpload_SlowLinkKeepsFinishedPartsForResume(t *testing.T) {
 	c := u.client(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
-	c = c.WithContext(ctx)
-	if err := c.MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{}); err == nil {
+	if err := c.MultipartUploadOpts(ctx, "rev-1", src, u.size, MultipartUploadOptions{}); err == nil {
 		t.Fatal("the upload finished before the interrupt; slow the link")
 	}
 	var kept []int
@@ -488,8 +487,7 @@ func TestUpload_SlowLinkKeepsFinishedPartsForResume(t *testing.T) {
 		t.Fatalf("after moving 5 parts' worth of data, storage kept parts %v, want at least 3", kept)
 	}
 
-	c = c.WithContext(context.Background())
-	if err := c.MultipartUploadOpts("rev-1", src, u.size, MultipartUploadOptions{}); err != nil {
+	if err := c.MultipartUploadOpts(context.Background(), "rev-1", src, u.size, MultipartUploadOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	u.locked(func() {
@@ -544,7 +542,7 @@ func TestUpload_LeavesOnePartWhenEachConnectionIsLimited(t *testing.T) {
 				}
 			}
 		}()
-		err := c.MultipartUploadOpts("rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{
+		err := c.MultipartUploadOpts(context.Background(), "rev-1", patternSource{u.size}, u.size, MultipartUploadOptions{
 			Status: &status,
 			Logger: book.logger(),
 		})

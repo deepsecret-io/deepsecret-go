@@ -8,20 +8,20 @@ package fido2
 import (
 	"context"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
 // Enroll is not supported by this build.
-func (a *Authenticator) Enroll(context.Context, crypto.EnrollRequest) (*crypto.EnrollResult, error) {
-	return nil, crypto.ErrNoSecurityKeySupport
+func (a *Authenticator) Enroll(context.Context, keystore.EnrollRequest) (*keystore.EnrollResult, error) {
+	return nil, keystore.ErrNoSecurityKeySupport
 }
 
 // Derive is not supported by this build.
-func (a *Authenticator) Derive(context.Context, crypto.DeriveRequest) (*crypto.DeriveResult, error) {
-	return nil, crypto.ErrNoSecurityKeySupport
+func (a *Authenticator) Derive(context.Context, keystore.DeriveRequest) (*keystore.DeriveResult, error) {
+	return nil, keystore.ErrNoSecurityKeySupport
 }
 
 // Check reports that this build has no security key support.
 func Check() (Status, error) {
-	return Status{}, crypto.ErrNoSecurityKeySupport
+	return Status{}, keystore.ErrNoSecurityKeySupport
 }

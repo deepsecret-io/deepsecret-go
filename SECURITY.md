@@ -4,7 +4,7 @@ The SDK is the part of DeepSecret that encrypts, decrypts and handles keys, and 
 
 ## Reporting a vulnerability
 
-Report it through GitHub: open this repository's [Security tab](https://github.com/deepsecret-io/sdk/security) and choose **Report a vulnerability**. Only you and the maintainers can see the report.
+Report it through GitHub: open this repository's [Security tab](https://github.com/deepsecret-io/deepsecret-go/security) and choose **Report a vulnerability**. Only you and the maintainers can see the report.
 
 Please do not open a public issue, pull request or discussion about a security problem. We will reply in the report, work on the fix with you there, and agree with you when to publish the details.
 

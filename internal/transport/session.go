@@ -11,9 +11,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/deepsecret-io/sdk/api"
 )
+
+// SessionStore keeps a login session's token where the next run finds it.
+// Refreshing rotates the token: the server revokes the old one, so a
+// client set up with a store saves every refreshed token, and loads the
+// stored one when its own is refused, since another process holding the
+// same session may have refreshed it first.
+type SessionStore struct {
+	// Load returns the stored token, without the "bearer:" prefix.
+	Load func() (string, error)
+	// Save stores a refreshed token. An error does not fail the request
+	// that triggered the refresh; the store should report it.
+	Save func(token string, expiresAt time.Time) error
+}
 
 // A session token lasts an hour, and so does a session left unused.
 // The client renews its token on use once an eighth of the token's
@@ -39,7 +50,7 @@ const refreshTimeout = 15 * time.Second
 
 // SetSessionStore makes the client persist its refreshed session tokens.
 // It only matters for a client authenticated with "bearer:" and a token.
-func (c *Client) SetSessionStore(s api.SessionStore) {
+func (c *Client) SetSessionStore(s SessionStore) {
 	c.authMu.Lock()
 	c.session = &s
 	c.authMu.Unlock()
@@ -56,13 +67,13 @@ func (c *Client) credential() string {
 // freshCredential returns the credential for a request, renewing a
 // session token that is due (renewDue). A failed renewal is left to the
 // request: the server refuses it if the token is no good.
-func (c *Client) freshCredential() string {
+func (c *Client) freshCredential(ctx context.Context) string {
 	key := c.credential()
 	if !isBearer(key) {
 		return key
 	}
 	if claims, ok := tokenClaims(strings.TrimPrefix(key, "bearer:")); ok && claims.renewDue(time.Now()) {
-		_ = c.renewSession(key)
+		_ = c.renewSession(ctx, key)
 		return c.credential()
 	}
 	return key
@@ -71,7 +82,7 @@ func (c *Client) freshCredential() string {
 // renewSession replaces the session token stale: with a newer one of the
 // same account from the store, or by refreshing it. Concurrent callers
 // holding the same stale token renew it once.
-func (c *Client) renewSession(stale string) error {
+func (c *Client) renewSession(ctx context.Context, stale string) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 	if c.credential() != stale {
@@ -84,13 +95,13 @@ func (c *Client) renewSession(stale string) error {
 		return errRefreshedRecently
 	}
 	c.refreshedAt = time.Now()
-	token, err := c.refreshToken(stale)
+	token, err := c.refreshToken(ctx, stale)
 	if err != nil {
 		// Another process with the same session may have refreshed first,
 		// which revoked this token: give it a moment to save its new one.
 		for range 3 {
 			select {
-			case <-c.ctx.Done():
+			case <-ctx.Done():
 				return err
 			case <-time.After(500 * time.Millisecond):
 			}
@@ -112,14 +123,14 @@ func (c *Client) renewSession(stale string) error {
 }
 
 // refreshToken exchanges the session token in key for a new one.
-func (c *Client) refreshToken(key string) (string, error) {
+func (c *Client) refreshToken(ctx context.Context, key string) (string, error) {
 	// The server revokes the old token as soon as it answers, so a refresh
 	// cut short when this call is cancelled could lose the new token and
 	// end the session for every call sharing it. It runs to its end, within
 	// a bound of its own.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), refreshTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 	defer cancel()
-	resp, err := c.WithContext(ctx).send("POST", refreshPath, []byte("{}"), key)
+	resp, err := c.send(ctx, "POST", refreshPath, []byte("{}"), key)
 	if err != nil {
 		return "", fmt.Errorf("refresh session: %w", err)
 	}

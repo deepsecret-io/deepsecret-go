@@ -2,8 +2,9 @@
 // Copyright 2026 DeepSecret
 
 // Package transport is the SDK's HTTP client: API requests, login session
-// renewal, and presigned uploads and downloads. The sdk package makes a view of
-// it for each call, with the call's context (WithContext).
+// renewal, and presigned uploads and downloads. Every call that makes a request
+// takes the context that ends it, including object-storage uploads and downloads,
+// so a cancelled call unblocks instead of waiting for the per-call timeout.
 package transport
 
 import (
@@ -27,12 +28,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/apierror"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // Bounds on the response bodies the client holds in memory, so a hostile or
 // broken server cannot exhaust it. A body over its bound fails with
-// api.ErrResponseTooLarge; it is never cut short and used.
+// apierror.ErrResponseTooLarge; it is never cut short and used.
 const (
 	// maxAPIResponseSize bounds an API response. The largest the API sends
 	// is a secret's revision list: up to 100 revisions (the top tier's
@@ -54,14 +56,14 @@ const (
 // be longer than limit bytes.
 func readBody(resp *http.Response, limit int64) ([]byte, error) {
 	if resp.ContentLength > limit {
-		return nil, fmt.Errorf("%w: %d bytes, the limit is %d", api.ErrResponseTooLarge, resp.ContentLength, limit)
+		return nil, fmt.Errorf("%w: %d bytes, the limit is %d", apierror.ErrResponseTooLarge, resp.ContentLength, limit)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("%w: over %d bytes", api.ErrResponseTooLarge, limit)
+		return nil, fmt.Errorf("%w: over %d bytes", apierror.ErrResponseTooLarge, limit)
 	}
 	return b, nil
 }
@@ -77,17 +79,6 @@ type Response struct {
 
 // Client manages authentication and HTTP communication with the DeepSecret API.
 type Client struct {
-	*core
-
-	// ctx ends this view's requests, including object-storage uploads and
-	// downloads, so a cancelled call unblocks instead of waiting for the
-	// per-call timeout. See WithContext.
-	ctx context.Context
-}
-
-// core is what every view of a client shares: its connections and its login
-// session.
-type core struct {
 	baseURL    string
 	httpClient *http.Client
 
@@ -96,7 +87,7 @@ type core struct {
 	// by authMu; refreshMu makes concurrent refreshes one and guards
 	// refreshedAt, when the client last asked for a refresh.
 	apiKey      string
-	session     *api.SessionStore
+	session     *SessionStore
 	authMu      sync.Mutex
 	refreshMu   sync.Mutex
 	refreshedAt time.Time
@@ -112,18 +103,6 @@ type core struct {
 	// tests lower.
 	maxResponse int64
 }
-
-// WithContext is c for one call: its requests end with ctx. It shares c's
-// connections and login session, so it is cheap to make.
-func (c *Client) WithContext(ctx context.Context) *Client {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return &Client{core: c.core, ctx: ctx}
-}
-
-// Context is the context that ends this client's requests.
-func (c *Client) Context() context.Context { return c.ctx }
 
 // isLocalhostURL returns true if the URL targets loopback (127.0.0.1, ::1,
 // localhost). These are the only hosts where HTTP is acceptable (dev/testing).
@@ -240,8 +219,8 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
-		MaxIdleConns:          2 * api.MaxDownloadConcurrency,
-		MaxIdleConnsPerHost:   api.MaxDownloadConcurrency,
+		MaxIdleConns:          2 * transfer.MaxDownloadConcurrency,
+		MaxIdleConnsPerHost:   transfer.MaxDownloadConcurrency,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -253,26 +232,13 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 		},
 	}
 
-	return &Client{ctx: context.Background(), core: &core{
+	return &Client{
 		baseURL:       base,
 		apiKey:        apiKey,
 		httpClient:    apiClient,
 		presignClient: presignClient,
 		maxResponse:   maxAPIResponseSize,
-	}}, nil
-}
-
-// NewClientFromEnv creates a client from DS_API_URL and DS_API_KEY env vars.
-func NewClientFromEnv() (*Client, error) {
-	u := os.Getenv("DS_API_URL")
-	if u == "" {
-		return nil, fmt.Errorf("DS_API_URL environment variable not set")
-	}
-	key := os.Getenv("DS_API_KEY")
-	if key == "" {
-		return nil, fmt.Errorf("DS_API_KEY environment variable not set")
-	}
-	return NewClient(u, key)
+	}, nil
 }
 
 // BaseURL returns the configured API base URL.
@@ -281,8 +247,8 @@ func (c *Client) BaseURL() string { return c.baseURL }
 // CheckMaintenance probes the API with an unauthenticated /health request.
 // Returns (true, message) if the API is in maintenance mode, (false, "") if
 // it's serving normally, and a non-nil error if the probe itself failed.
-func (c *Client) CheckMaintenance() (bool, string, error) {
-	req, err := http.NewRequestWithContext(c.ctx, "GET", c.baseURL+"/api/v1/health", nil)
+func (c *Client) CheckMaintenance(ctx context.Context) (bool, string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/health", nil)
 	if err != nil {
 		return false, "", err
 	}
@@ -309,28 +275,30 @@ func (c *Client) CheckMaintenance() (bool, string, error) {
 // ── HTTP methods ─────────────────────────────────────────────────────────────
 
 // Get performs an authenticated GET request.
-func (c *Client) Get(path string) (*Response, error) { return c.do("GET", path, nil) }
+func (c *Client) Get(ctx context.Context, path string) (*Response, error) {
+	return c.do(ctx, "GET", path, nil)
+}
 
 // Post performs an authenticated POST request with a JSON body.
-func (c *Client) Post(path string, body any) (*Response, error) {
-	return c.do("POST", path, body)
+func (c *Client) Post(ctx context.Context, path string, body any) (*Response, error) {
+	return c.do(ctx, "POST", path, body)
 }
 
 // Put performs an authenticated PUT request with a JSON body.
-func (c *Client) Put(path string, body any) (*Response, error) {
-	return c.do("PUT", path, body)
+func (c *Client) Put(ctx context.Context, path string, body any) (*Response, error) {
+	return c.do(ctx, "PUT", path, body)
 }
 
 // Delete performs an authenticated DELETE request with an optional JSON body.
-func (c *Client) Delete(path string, body any) (*Response, error) {
-	return c.do("DELETE", path, body)
+func (c *Client) Delete(ctx context.Context, path string, body any) (*Response, error) {
+	return c.do(ctx, "DELETE", path, body)
 }
 
 // do sends an API request. A session token close to expiry is refreshed
 // first, and a request refused with 401 is sent once more if the session
 // could be renewed: a 401 comes from authentication, before the handler
 // runs, so the retry cannot repeat an action.
-func (c *Client) do(method, path string, body any) (*Response, error) {
+func (c *Client) do(ctx context.Context, method, path string, body any) (*Response, error) {
 	if err := checkPath(path); err != nil {
 		return nil, err
 	}
@@ -341,24 +309,24 @@ func (c *Client) do(method, path string, body any) (*Response, error) {
 			return nil, fmt.Errorf("marshal body: %w", err)
 		}
 	}
-	key := c.freshCredential()
-	resp, err := c.send(method, path, data, key)
-	if isBearer(key) && errors.Is(err, api.ErrUnauthorized) && c.renewSession(key) == nil {
+	key := c.freshCredential(ctx)
+	resp, err := c.send(ctx, method, path, data, key)
+	if isBearer(key) && errors.Is(err, apierror.ErrUnauthorized) && c.renewSession(ctx, key) == nil {
 		if renewed := c.credential(); renewed != key {
-			return c.send(method, path, data, renewed)
+			return c.send(ctx, method, path, data, renewed)
 		}
 	}
 	return resp, err
 }
 
 // send makes one API request authenticated with key.
-func (c *Client) send(method, path string, data []byte, key string) (*Response, error) {
+func (c *Client) send(ctx context.Context, method, path string, data []byte, key string) (*Response, error) {
 	var bodyReader io.Reader
 	if data != nil {
 		bodyReader = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(c.ctx, method, c.baseURL+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -386,12 +354,12 @@ func (c *Client) send(method, path string, data []byte, key string) (*Response, 
 	}
 
 	if resp.StatusCode == http.StatusServiceUnavailable && apiResp.Maintenance {
-		return &apiResp, &api.MaintenanceError{Message: apiResp.Error}
+		return &apiResp, &apierror.MaintenanceError{Message: apiResp.Error}
 	}
 
 	if !apiResp.Success {
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-		return &apiResp, &api.Error{
+		return &apiResp, &apierror.Error{
 			StatusCode: resp.StatusCode,
 			Code:       apiResp.ErrorCode,
 			Message:    apiResp.Error,
@@ -476,15 +444,15 @@ func checkPath(path string) error {
 	segments, _, _ := strings.Cut(path, "?")
 	for segment := range strings.SplitSeq(strings.TrimPrefix(segments, "/"), "/") {
 		if segment == "" || segment == "." || segment == ".." {
-			return api.ErrInvalidID
+			return apierror.ErrInvalidID
 		}
 	}
 	return nil
 }
 
 // presignUploadURL requests a presigned upload URL via the org-scoped endpoint.
-func (c *Client) presignUploadURL(orgID, objectKey string, expiryMinutes int) (string, error) {
-	resp, err := c.Post("/api/v1/orgs/"+PathSegment(orgID)+"/storage/presign", map[string]any{
+func (c *Client) presignUploadURL(ctx context.Context, orgID, objectKey string, expiryMinutes int) (string, error) {
+	resp, err := c.Post(ctx, "/api/v1/orgs/"+PathSegment(orgID)+"/storage/presign", map[string]any{
 		"key":            objectKey,
 		"operation":      "put",
 		"expiry_minutes": expiryMinutes,
@@ -502,8 +470,8 @@ func (c *Client) presignUploadURL(orgID, objectKey string, expiryMinutes int) (s
 }
 
 // presignDownloadURL requests a presigned download URL via the revision-scoped endpoint.
-func (c *Client) presignDownloadURL(revisionID string, expiryMinutes int) (string, error) {
-	plan, err := c.presignDownloadPlan(revisionID, expiryMinutes)
+func (c *Client) presignDownloadURL(ctx context.Context, revisionID string, expiryMinutes int) (string, error) {
+	plan, err := c.presignDownloadPlan(ctx, revisionID, expiryMinutes)
 	if err != nil {
 		return "", err
 	}
@@ -523,8 +491,8 @@ type PresignDownloadPlan struct {
 // presignDownloadPlan requests a presigned download URL plus size hints so
 // the caller can pick a transport strategy. Only ONE call is made: the
 // response is reused for every Range GET in a parallel download.
-func (c *Client) presignDownloadPlan(revisionID string, expiryMinutes int) (*PresignDownloadPlan, error) {
-	resp, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/presign", map[string]any{
+func (c *Client) presignDownloadPlan(ctx context.Context, revisionID string, expiryMinutes int) (*PresignDownloadPlan, error) {
+	resp, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/presign", map[string]any{
 		"expiry_minutes": expiryMinutes,
 	})
 	if err != nil {
@@ -543,8 +511,8 @@ func (c *Client) presignDownloadPlan(revisionID string, expiryMinutes int) (*Pre
 
 // ConfirmUpload asks the backend to HEAD the uploaded object and mark the
 // revision as uploaded. Downloads are blocked until this succeeds.
-func (c *Client) ConfirmUpload(revisionID string) error {
-	_, err := c.Post("/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/confirm", map[string]any{})
+func (c *Client) ConfirmUpload(ctx context.Context, revisionID string) error {
+	_, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/confirm", map[string]any{})
 	if err != nil {
 		return fmt.Errorf("confirm upload: %w", err)
 	}
@@ -556,24 +524,24 @@ func (c *Client) ConfirmUpload(revisionID string) error {
 // by S3 presigned PUT). For convenience, use [PresignUpload] with []byte data.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadReader(orgID, objectKey string, r io.ReadSeeker, size int64, contentMD5 string, expiryMinutes int) error {
-	url, err := c.presignUploadURL(orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+func (c *Client) PresignUploadReader(ctx context.Context, orgID, objectKey string, r io.ReadSeeker, size int64, contentMD5 string, expiryMinutes int) error {
+	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return err
 	}
-	return c.uploadReaderToPresignedURL(url, r, size, contentMD5)
+	return c.uploadReaderToPresignedURL(ctx, url, r, size, contentMD5)
 }
 
 // PresignDownloadReader gets a presigned GET URL and returns a reader for the
 // response body. The caller MUST close the returned ReadCloser.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignDownloadReader(revisionID string, expiryMinutes int) (io.ReadCloser, int64, error) {
-	presignedURL, err := c.presignDownloadURL(revisionID, resolveExpiryMinutes(expiryMinutes))
+func (c *Client) PresignDownloadReader(ctx context.Context, revisionID string, expiryMinutes int) (io.ReadCloser, int64, error) {
+	presignedURL, err := c.presignDownloadURL(ctx, revisionID, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return nil, 0, err
 	}
-	getReq, gerr := http.NewRequestWithContext(c.ctx, "GET", presignedURL, nil)
+	getReq, gerr := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
 	if gerr != nil {
 		return nil, 0, gerr
 	}
@@ -593,12 +561,12 @@ func (c *Client) PresignDownloadReader(revisionID string, expiryMinutes int) (io
 // Convenience wrapper: computes MD5 and size automatically.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUpload(orgID, objectKey string, data []byte, expiryMinutes int) error {
-	url, err := c.presignUploadURL(orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+func (c *Client) PresignUpload(ctx context.Context, orgID, objectKey string, data []byte, expiryMinutes int) error {
+	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return err
 	}
-	return c.uploadToPresignedURL(url, data)
+	return c.uploadToPresignedURL(ctx, url, data)
 }
 
 // PresignUploadFrom uploads the size bytes of src to a presigned PUT URL
@@ -607,19 +575,19 @@ func (c *Client) PresignUpload(orgID, objectKey string, data []byte, expiryMinut
 // follows the upload as one part on one connection.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadFrom(orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int, status *TransferStatus) error {
+func (c *Client) PresignUploadFrom(ctx context.Context, orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int, status *TransferStatus) error {
 	h := md5.New() // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	if _, err := io.Copy(h, io.NewSectionReader(src, 0, size)); err != nil {
 		return fmt.Errorf("read payload: %w", err)
 	}
 	contentMD5 := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	url, err := c.presignUploadURL(orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return err
 	}
 	status.start(size, 1, 0, 0, nil)
 	conn := status.begin(1, size)
-	err = c.putToPresignedURL(url, func() (io.Reader, error) {
+	err = c.putToPresignedURL(ctx, url, func() (io.Reader, error) {
 		return io.NewSectionReader(src, 0, size), nil
 	}, size, contentMD5, func(transferred, total int64) {
 		conn.set(transferred)
@@ -682,10 +650,9 @@ func presignTimeout(size int64) time.Duration {
 // putToPresignedURL is the shared body-shipping core for every presign upload.
 // It runs the retry loop, applies exponential backoff, and forwards the
 // progress callback if one is supplied.
-func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Reader, error), size int64, contentMD5 string, onProgress func(int64, int64)) error {
+func (c *Client) putToPresignedURL(ctx context.Context, presignedURL string, makeBody func() (io.Reader, error), size int64, contentMD5 string, onProgress func(int64, int64)) error {
 	timeout := presignTimeout(size)
 
-	ctx := c.ctx
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Bail before scheduling more work if the caller already hit Ctrl+C.
@@ -744,7 +711,7 @@ func (c *Client) putToPresignedURL(presignedURL string, makeBody func() (io.Read
 	return fmt.Errorf("upload failed after %d retries: %w", maxRetries, lastErr)
 }
 
-func (c *Client) uploadReaderToPresignedURL(presignedURL string, r io.ReadSeeker, size int64, contentMD5 string) error {
+func (c *Client) uploadReaderToPresignedURL(ctx context.Context, presignedURL string, r io.ReadSeeker, size int64, contentMD5 string) error {
 	first := true
 	makeBody := func() (io.Reader, error) {
 		if first {
@@ -756,13 +723,13 @@ func (c *Client) uploadReaderToPresignedURL(presignedURL string, r io.ReadSeeker
 		}
 		return r, nil
 	}
-	return c.putToPresignedURL(presignedURL, makeBody, size, contentMD5, nil)
+	return c.putToPresignedURL(ctx, presignedURL, makeBody, size, contentMD5, nil)
 }
 
-func (c *Client) uploadToPresignedURL(presignedURL string, data []byte) error {
+func (c *Client) uploadToPresignedURL(ctx context.Context, presignedURL string, data []byte) error {
 	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
-	return c.putToPresignedURL(presignedURL, func() (io.Reader, error) {
+	return c.putToPresignedURL(ctx, presignedURL, func() (io.Reader, error) {
 		return bytes.NewReader(data), nil
 	}, int64(len(data)), contentMD5, nil)
 }
@@ -790,14 +757,14 @@ func (pr *progressCallbackReader) Read(p []byte) (int, error) {
 // onProgress is called with (bytesTransferred, totalBytes) during upload.
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadWithProgress(orgID, objectKey string, data []byte, onProgress func(int64, int64), expiryMinutes int) error {
-	url, err := c.presignUploadURL(orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+func (c *Client) PresignUploadWithProgress(ctx context.Context, orgID, objectKey string, data []byte, onProgress func(int64, int64), expiryMinutes int) error {
+	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return err
 	}
 	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
 	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
-	return c.putToPresignedURL(url, func() (io.Reader, error) {
+	return c.putToPresignedURL(ctx, url, func() (io.Reader, error) {
 		return bytes.NewReader(data), nil
 	}, int64(len(data)), contentMD5, onProgress)
 }

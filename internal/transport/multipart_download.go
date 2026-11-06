@@ -17,7 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/apierror"
+	"github.com/deepsecret-io/deepsecret-go/internal/logattr"
+	"github.com/deepsecret-io/deepsecret-go/transfer"
 )
 
 // ── Parallel Range download ─────────────────────────────────────────────────
@@ -58,7 +60,7 @@ func downloadPartSize(size int64) int64 {
 // MultipartDownloadOptions configures parallel Range downloads.
 type MultipartDownloadOptions struct {
 	// Threads fixes the number of concurrent Range GETs, at most
-	// api.MaxDownloadConcurrency. 0 adapts it to the link.
+	// transfer.MaxDownloadConcurrency. 0 adapts it to the link.
 	Threads int
 
 	// PartSize overrides the range size. 0 picks it from the object's
@@ -152,7 +154,7 @@ var errPresignRefused = errors.New("presigned URL refused (403)")
 // does not bypass integrity, and neither do ranges kept from an earlier
 // download. Range responses are size-bounded, so a compromised S3 cannot
 // over-read into adjacent objects' data.
-func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, opts MultipartDownloadOptions) error {
+func (c *Client) DownloadToFile(ctx context.Context, revisionID string, dst io.WriterAt, size int64, opts MultipartDownloadOptions) error {
 	if size <= 0 {
 		return fmt.Errorf("download: invalid size %d", size)
 	}
@@ -164,16 +166,16 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	for _, r := range have {
 		held += r[1] - r[0]
 	}
-	log := api.Module(api.Logger(opts.Logger), "download")
+	log := logattr.Module(logattr.Logger(opts.Logger), "download")
 	started := time.Now()
 	complete := func(fetched int64) {
 		elapsed := time.Since(started)
-		log.Info("download complete", "size", api.Bytes(size), "fetched", api.Bytes(fetched),
-			"elapsed", elapsed.Round(time.Millisecond), "rate", api.RateOf(fetched, elapsed))
+		log.Info("download complete", "size", logattr.Bytes(size), "fetched", logattr.Bytes(fetched),
+			"elapsed", elapsed.Round(time.Millisecond), "rate", logattr.RateOf(fetched, elapsed))
 	}
 
 	urls := &presignedDownload{c: c, revisionID: revisionID, expiry: resolveExpiryMinutes(opts.PresignExpiryMinutes)}
-	plan, err := urls.renew("")
+	plan, err := urls.renew(ctx, "")
 	if err != nil {
 		return err
 	}
@@ -212,21 +214,21 @@ func (c *Client) DownloadToFile(revisionID string, dst io.WriterAt, size int64, 
 	case plan.PartSize > downloadPartSize(size):
 		sizing = "server"
 	}
-	ctx, cancel := context.WithCancelCause(c.ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	lim := newLimiter(ctx, opts.Threads, min(api.MaxDownloadConcurrency, len(spans)), 0)
+	lim := newLimiter(ctx, opts.Threads, min(transfer.MaxDownloadConcurrency, len(spans)), 0)
 	sched := newRangeScheduler(spans, opts.Status, minSplit)
 	// One presigned URL serves every range; once every range has started,
 	// an idle connection splits the range in flight with the most left
 	// (split_min is the smallest half).
-	planArgs := []any{"size", api.Bytes(size)}
+	planArgs := []any{"size", logattr.Bytes(size)}
 	if held > 0 {
-		planArgs = append(planArgs, "held", api.Bytes(held))
+		planArgs = append(planArgs, "held", logattr.Bytes(held))
 	}
-	log.Debug("plan", append(planArgs, "ranges", len(spans), "range_size", api.Bytes(partSize), "sizing", sizing,
-		"url_expiry", time.Duration(urls.expiry)*time.Minute, "url_renew_before", urls.renewMargin(), "split_min", api.Bytes(sched.minSplit))...)
-	threads := api.Module(log, "threads")
-	threads.Debug("plan", threadsPlan(lim, opts.Threads, api.MaxDownloadConcurrency, "range")...)
+	log.Debug("plan", append(planArgs, "ranges", len(spans), "range_size", logattr.Bytes(partSize), "sizing", sizing,
+		"url_expiry", time.Duration(urls.expiry)*time.Minute, "url_renew_before", urls.renewMargin(), "split_min", logattr.Bytes(sched.minSplit))...)
+	threads := logattr.Module(log, "threads")
+	threads.Debug("plan", threadsPlan(lim, opts.Threads, transfer.MaxDownloadConcurrency, "range")...)
 	log.Debug("retry plan", retryPlan()...)
 	go lim.tune(ctx, func(from, to int, rate float64, reason string) {
 		logThreads(threads, from, to, rate, reason)
@@ -296,14 +298,14 @@ type presignedDownload struct {
 
 // current returns the URL to use, renewing it first when it is close to
 // expiring.
-func (p *presignedDownload) current() (string, error) {
+func (p *presignedDownload) current(ctx context.Context) (string, error) {
 	p.mu.Lock()
 	url, renewAt := p.url, p.renewAt
 	p.mu.Unlock()
 	if time.Now().Before(renewAt) {
 		return url, nil
 	}
-	plan, err := p.renew(url)
+	plan, err := p.renew(ctx, url)
 	if err != nil {
 		return "", err
 	}
@@ -311,13 +313,13 @@ func (p *presignedDownload) current() (string, error) {
 }
 
 // renew presigns again unless another worker already replaced stale.
-func (p *presignedDownload) renew(stale string) (*PresignDownloadPlan, error) {
+func (p *presignedDownload) renew(ctx context.Context, stale string) (*PresignDownloadPlan, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.url != "" && p.url != stale && time.Now().Before(p.renewAt) {
 		return &PresignDownloadPlan{URL: p.url}, nil
 	}
-	plan, err := p.c.presignDownloadPlan(p.revisionID, p.expiry)
+	plan, err := p.c.presignDownloadPlan(ctx, p.revisionID, p.expiry)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +445,7 @@ func newRangeScheduler(spans [][2]int64, status *TransferStatus, minSplit int64)
 func (s *rangeScheduler) take(log *slog.Logger) *piece {
 	p, victim, size := s.pick()
 	if victim != nil {
-		log.Debug("range split", "part", victim.n, "new_part", p.n, "size", api.Bytes(size))
+		log.Debug("range split", "part", victim.n, "new_part", p.n, "size", logattr.Bytes(size))
 	}
 	return p
 }
@@ -499,7 +501,7 @@ func (c *Client) downloadPiece(ctx context.Context, log *slog.Logger, urls *pres
 	t0 := time.Now()
 	complete := func() {
 		start, end := p.extent()
-		api.Trace(log, "range complete", "part", p.n, "offset", start, "size", api.Bytes(end-start), "elapsed", time.Since(t0).Round(time.Millisecond))
+		logattr.Trace(log, "range complete", "part", p.n, "offset", start, "size", logattr.Bytes(end-start), "elapsed", time.Since(t0).Round(time.Millisecond))
 	}
 	for attempt := 0; attempt < multipartAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -520,7 +522,7 @@ func (c *Client) downloadPiece(ctx context.Context, log *slog.Logger, urls *pres
 		if from >= to {
 			break
 		}
-		url, err := urls.current()
+		url, err := urls.current(ctx)
 		if err != nil {
 			return err
 		}
@@ -532,7 +534,7 @@ func (c *Client) downloadPiece(ctx context.Context, log *slog.Logger, urls *pres
 				return ctx.Err()
 			}
 			if errors.Is(err, errPresignRefused) {
-				if _, rerr := urls.renew(url); rerr != nil {
+				if _, rerr := urls.renew(ctx, url); rerr != nil {
 					return rerr
 				}
 				renewed = true
@@ -545,7 +547,7 @@ func (c *Client) downloadPiece(ctx context.Context, log *slog.Logger, urls *pres
 			if attempt+1 < multipartAttempts {
 				next, end := p.rest()
 				log.Warn("retrying request", "part", p.n, "attempt", attempt+2, "attempts", multipartAttempts,
-					"offset", next, "size", api.Bytes(end-next), "error", err)
+					"offset", next, "size", logattr.Bytes(end-next), "error", err)
 			}
 			continue
 		}
@@ -686,7 +688,7 @@ func isDownloadRetryable(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var apiErr *api.Error
+	var apiErr *apierror.Error
 	if errors.As(err, &apiErr) {
 		return apiErr.StatusCode >= 500 || apiErr.StatusCode == http.StatusTooManyRequests
 	}

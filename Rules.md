@@ -20,18 +20,26 @@ The SDK must be usable standalone without the CLI.
 - CLI, UI, or other clients must not reimplement SDK logic
 
 2. Layering inside SDK
-- sdk/ → the public client and its workflows: secrets, accounts, known keys
-- sdk/api → API errors, transfer status, log conventions
-- sdk/crypto → key pairs, key files, fingerprints, safety numbers
-- sdk/fido2 → security keys
-- sdk/internal/transport → HTTP, presigned uploads and downloads
-- sdk/internal/protocol → sealing, opening, the manifest, wraps, the stream
-- sdk/internal/payload → CBOR encoding/decoding
-- sdk/internal/archive → file expansion + tar
-- sdk/internal/compress → compression primitives
+- deepsecret (root) → client setup only: no domain code
+- identity → account, orgs, groups, keys registered on the server
+- secrets → send, receive, local files, list, revoke, policy, resume, storage
+- trust → the keys this device knows: list, accept, verify, forget
+- keys → key pairs, fingerprints, safety numbers; no file access
+- keystore → key files, protection, security key slots, recovery codes
+- fido2 → security keys
+- apierror → what the server answered
+- transfer → a transfer's state, phases and limits
+- internal/transport → HTTP, presigned uploads and downloads
+- internal/protocol → sealing, opening, the manifest, wraps, the stream
+- internal/directory → fetching people's keys from the server, bundle signing
+- internal/knownkeys → the known keys store and trust policy
+- internal/payload → CBOR encoding/decoding
+- internal/archive → file expansion + tar
+- internal/compress → compression primitives
 
 3. No cross-layer leakage
-- crypto, protocol, payload, archive and compress must not depend on transport
+- keys, keystore, protocol, payload, archive and compress must not depend on transport
+- a test enforces this: structure_test.go
 - only top-level SDK layers orchestrate across packages
 
 ---
@@ -46,8 +54,8 @@ The SDK must be usable standalone without the CLI.
 Examples:
 - EncryptText
 - EncryptPaths
-- DecryptSecret
-- DescribeSecretFull
+- Decrypt
+- DescribeFull
 - UpdatePolicy
 
 Never expose raw endpoint logic to callers.

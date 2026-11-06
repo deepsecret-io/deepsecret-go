@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
 func TestTrustedLibrary(t *testing.T) {
@@ -147,7 +147,7 @@ func TestWaitForKey(t *testing.T) {
 			}
 			return false, nil
 		})
-		if !errors.Is(err, crypto.ErrCancelled) {
+		if !errors.Is(err, keystore.ErrCancelled) {
 			t.Fatalf("err = %v, want ErrCancelled", err)
 		}
 	})
@@ -159,7 +159,7 @@ func TestWaitForKey(t *testing.T) {
 // checks only, with no touch or PIN.
 func TestDeriveWithoutAnEnrolledKey(t *testing.T) {
 	st, err := Check()
-	if errors.Is(err, crypto.ErrNoSecurityKeySupport) {
+	if errors.Is(err, keystore.ErrNoSecurityKeySupport) {
 		t.Skipf("no security key support here: %v", err)
 	}
 	if err != nil {
@@ -168,12 +168,12 @@ func TestDeriveWithoutAnEnrolledKey(t *testing.T) {
 	t.Logf("libfido2 %s, %d devices", st.Library, len(st.Devices))
 	shortWait(t, 300*time.Millisecond, 100*time.Millisecond)
 	p := &countPrompt{}
-	_, err = New(p).Derive(context.Background(), crypto.DeriveRequest{
-		RPID:        crypto.SecurityKeyRPID,
+	_, err = New(p).Derive(context.Background(), keystore.DeriveRequest{
+		RPID:        keystore.SecurityKeyRPID,
 		Fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-		Credentials: []crypto.DeriveCredential{{ID: make([]byte, 64), PRFInput: make([]byte, 32), Label: "Test key"}},
+		Credentials: []keystore.DeriveCredential{{ID: make([]byte, 64), PRFInput: make([]byte, 32), Label: "Test key"}},
 	})
-	if !errors.Is(err, crypto.ErrNoSecurityKey) {
+	if !errors.Is(err, keystore.ErrNoSecurityKey) {
 		t.Errorf("Derive = %v, want ErrNoSecurityKey", err)
 	}
 	if len(p.inserts) != 1 || p.inserts[0] != `the security key "Test key"` {

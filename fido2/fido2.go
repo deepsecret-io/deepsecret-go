@@ -2,15 +2,15 @@
 // Copyright 2026 DeepSecret
 
 // Package fido2 lets a FIDO2 security key, such as a YubiKey, unlock a
-// DeepSecret key file (sdk/docs/yubikey-design.md). It implements
-// crypto.Authenticator on top of Yubico's libfido2.
+// DeepSecret key file (docs/yubikey-design.md). It implements
+// keystore.Authenticator on top of Yubico's libfido2.
 //
 // libfido2 is loaded at run time, the first time a security key is used,
 // from the system's library directories only (Homebrew or MacPorts on
 // macOS, the distribution's package on Linux). A program that never uses a
 // security key never needs it. Builds with the nofido2 tag, and builds for
 // other systems, have no security key support and return
-// crypto.ErrNoSecurityKeySupport.
+// keystore.ErrNoSecurityKeySupport.
 //
 // Every request uses user verification (the security key PIN, or a
 // fingerprint on a key with a built-in reader) and a touch.
@@ -21,7 +21,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
 // Prompter shows the user what a security key needs. The CLI and the
@@ -43,12 +43,12 @@ type Prompter interface {
 	Insert(want string)
 }
 
-// Authenticator is a crypto.Authenticator backed by libfido2.
+// Authenticator is a keystore.Authenticator backed by libfido2.
 type Authenticator struct {
 	prompter Prompter
 }
 
-var _ crypto.Authenticator = (*Authenticator)(nil)
+var _ keystore.Authenticator = (*Authenticator)(nil)
 
 // New returns an Authenticator that asks the user through p.
 func New(p Prompter) *Authenticator {

@@ -10,7 +10,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	"github.com/deepsecret-io/sdk/internal/canon"
+	"github.com/deepsecret-io/deepsecret-go/internal/canon"
 )
 
 // ── Per-recipient wraps (protocol v4 §4) ────────────────────────────────────

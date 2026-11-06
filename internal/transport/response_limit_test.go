@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/api"
+	"github.com/deepsecret-io/deepsecret-go/apierror"
 )
 
 // A server that streams a response past the bound, without saying how
@@ -35,13 +36,13 @@ func TestAPIResponseOverLimitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.maxResponse = limit
-	if _, err := c.Get("/api/v1/actors/me"); !errors.Is(err, api.ErrResponseTooLarge) {
-		t.Fatalf("err = %v, want api.ErrResponseTooLarge", err)
+	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want apierror.ErrResponseTooLarge", err)
 	}
 
 	// The same response within the bound is read whole.
 	c.maxResponse = 65 * limit
-	if _, err := c.Get("/api/v1/actors/me"); err != nil {
+	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); err != nil {
 		t.Fatalf("a body under the bound failed: %v", err)
 	}
 }
@@ -58,8 +59,8 @@ func TestAPIResponseDeclaredOverLimitFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Get("/api/v1/actors/me"); !errors.Is(err, api.ErrResponseTooLarge) {
-		t.Fatalf("err = %v, want api.ErrResponseTooLarge", err)
+	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want apierror.ErrResponseTooLarge", err)
 	}
 }
 
@@ -74,8 +75,8 @@ func TestHealthProbeOverLimitFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.CheckMaintenance(); !errors.Is(err, api.ErrResponseTooLarge) {
-		t.Fatalf("err = %v, want api.ErrResponseTooLarge", err)
+	if _, _, err := c.CheckMaintenance(context.Background()); !errors.Is(err, apierror.ErrResponseTooLarge) {
+		t.Fatalf("err = %v, want apierror.ErrResponseTooLarge", err)
 	}
 }
 

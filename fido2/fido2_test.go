@@ -3,7 +3,9 @@
 
 package fido2
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestDeviceName(t *testing.T) {
 	cases := map[string]string{

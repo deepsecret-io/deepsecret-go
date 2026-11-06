@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
 // extractedFile is a flattened view of a tar entry on disk, used by tests
