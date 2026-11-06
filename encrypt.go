@@ -21,12 +21,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/archive"
-	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/crypto"
-	"github.com/deepsecret-io/sdk/identity"
-	"github.com/deepsecret-io/sdk/payload"
-	"github.com/deepsecret-io/sdk/secrets"
+	"github.com/deepsecret-io/sdk/internal/archive"
+	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/sdk/internal/payload"
+	"github.com/deepsecret-io/sdk/internal/protocol"
+	"github.com/deepsecret-io/sdk/internal/transport"
 )
 
 // ── High-level Encrypt Functions ─────────────────────────────────────────────
@@ -41,8 +41,9 @@ import (
 // EncryptText encrypts a text message for one or more recipients and
 // uploads it once.
 //
-//	result, _ := client.EncryptText([]string{"bob@example.com"}, "hello world", sdk.EncryptOptions{})
-func (c *Client) EncryptText(recipients []string, text string, opt EncryptOptions) (*EncryptResult, error) {
+//	result, _ := client.EncryptText(ctx, []string{"bob@example.com"}, "hello world", sdk.EncryptOptions{})
+func (c *Client) EncryptText(ctx context.Context, recipients []string, text string, opt EncryptOptions) (*EncryptResult, error) {
+	c = c.with(ctx)
 
 	p := payload.Payload{Type: "message", Message: text}
 	data, err := payload.Marshal(p)
@@ -55,11 +56,12 @@ func (c *Client) EncryptText(recipients []string, text string, opt EncryptOption
 // EncryptData encrypts key-value pairs for one or more recipients and
 // uploads them once.
 //
-//	result, _ := client.EncryptData([]string{"bob@example.com"}, map[string]string{
+//	result, _ := client.EncryptData(ctx, []string{"bob@example.com"}, map[string]string{
 //	    "DB_PASSWORD": "s3cret",
 //	    "API_KEY":     "ak_123",
 //	}, sdk.EncryptOptions{})
-func (c *Client) EncryptData(recipients []string, kvPairs map[string]string, opt EncryptOptions) (*EncryptResult, error) {
+func (c *Client) EncryptData(ctx context.Context, recipients []string, kvPairs map[string]string, opt EncryptOptions) (*EncryptResult, error) {
+	c = c.with(ctx)
 
 	var entries []payload.KeyValuePair
 	for k, v := range kvPairs {
@@ -73,56 +75,12 @@ func (c *Client) EncryptData(recipients []string, kvPairs map[string]string, opt
 	return c.encryptAndSend(recipients, memPlaintext("data", data, nil), opt)
 }
 
-// EncryptFile encrypts a single file for one or more recipients and
-// uploads it once. The file streams from disk.
-//
-//	result, _ := client.EncryptFile([]string{"bob@example.com"}, "./report.pdf", sdk.EncryptOptions{})
-func (c *Client) EncryptFile(recipients []string, filePath string, opt EncryptOptions) (*EncryptResult, error) {
-
-	if opt.Name == "" {
-		opt.Name = filepath.Base(filePath)
-	}
-	return c.EncryptFiles(recipients, []string{filePath}, opt)
-}
-
-// EncryptFiles encrypts multiple files for one or more recipients and
-// uploads them once. Each file is named by its base name and streams from
-// disk.
-//
-//	result, _ := client.EncryptFiles([]string{"bob@example.com"}, []string{
-//	    "./report.pdf",
-//	    "./data.csv",
-//	}, sdk.EncryptOptions{})
-func (c *Client) EncryptFiles(recipients []string, filePaths []string, opt EncryptOptions) (*EncryptResult, error) {
-
-	if _, err := preflightFileSize(filePaths, maxPayloadSize(opt)); err != nil {
-		return nil, err
-	}
-	seen := make(map[string]bool, len(filePaths))
-	srcs := make([]payload.FileSource, len(filePaths))
-	for i, fp := range filePaths {
-		info, err := os.Stat(fp)
-		if err != nil {
-			return nil, fmt.Errorf("stat %s: %w", fp, err)
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("%s is not a regular file", fp)
-		}
-		name := filepath.Base(fp)
-		if seen[name] {
-			return nil, fmt.Errorf("two files are named %q: a secret's files need distinct names", name)
-		}
-		seen[name] = true
-		srcs[i] = fileSource(name, fp, info)
-	}
-	return c.encryptAndSend(recipients, filesPlaintext(srcs), opt)
-}
-
 // EncryptBytes encrypts raw binary data for one or more recipients as a
 // single-file payload.
 //
-//	result, _ := client.EncryptBytes([]string{"bob@example.com"}, jsonBytes, sdk.EncryptOptions{})
-func (c *Client) EncryptBytes(recipients []string, raw []byte, opt EncryptOptions) (*EncryptResult, error) {
+//	result, _ := client.EncryptBytes(ctx, []string{"bob@example.com"}, jsonBytes, sdk.EncryptOptions{})
+func (c *Client) EncryptBytes(ctx context.Context, recipients []string, raw []byte, opt EncryptOptions) (*EncryptResult, error) {
+	c = c.with(ctx)
 
 	h := sha256.Sum256(raw)
 	file := payload.FileEntry{
@@ -136,46 +94,27 @@ func (c *Client) EncryptBytes(recipients []string, raw []byte, opt EncryptOption
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	meta := []secrets.FileMetaEntry{{Name: file.Name, Size: file.Size, SHA256: file.SHA256}}
+	meta := []fileMetaEntry{{Name: file.Name, Size: file.Size, SHA256: file.SHA256}}
 	return c.encryptAndSend(recipients, memPlaintext("files", data, meta), opt)
-}
-
-// EncryptDir encrypts all files in a directory (recursively) for one or
-// more recipients.
-//
-//	result, _ := client.EncryptDir([]string{"bob@example.com"}, "./project", sdk.EncryptOptions{
-//	    Archive:    true,
-//	    Compress:   compress.Zstd,
-//	    SkipHidden: true,
-//	})
-func (c *Client) EncryptDir(recipients []string, dirPath string, opt EncryptOptions) (*EncryptResult, error) {
-
-	if opt.Name == "" {
-		opt.Name = filepath.Base(dirPath)
-	}
-
-	expanded, err := archive.ExpandPaths([]string{dirPath}, opt.SkipHidden)
-	if err != nil {
-		return nil, err
-	}
-
-	archiveOn, archiveReason := shouldArchive(expanded, opt)
-	emitArchiveDecision(opt, archiveOn, archiveReason, expanded)
-	if archiveOn {
-		return c.encryptArchive(recipients, expanded, opt)
-	}
-	return c.encryptExpandedFiles(recipients, expanded, opt)
 }
 
 // EncryptPaths encrypts a mix of files and directories for one or more
 // recipients. Directories are expanded recursively. Supports archive mode
 // and auto-archive.
 //
-//	result, _ := client.EncryptPaths([]string{"bob@example.com"}, []string{
+//	result, _ := client.EncryptPaths(ctx, []string{"bob@example.com"}, []string{
 //	    "./src",
 //	    "./README.md",
 //	}, sdk.EncryptOptions{Archive: true})
-func (c *Client) EncryptPaths(recipients []string, paths []string, opt EncryptOptions) (*EncryptResult, error) {
+func (c *Client) EncryptPaths(ctx context.Context, recipients []string, paths []string, opt EncryptOptions) (*EncryptResult, error) {
+	c = c.with(ctx)
+	if opt.Name == "" && len(paths) == 1 {
+		// One file or folder names the secret, unless it has no name of
+		// its own, as "." has not.
+		if base := filepath.Base(paths[0]); base != "." && base != string(filepath.Separator) {
+			opt.Name = base
+		}
+	}
 
 	expanded, err := archive.ExpandPaths(paths, opt.SkipHidden)
 	if err != nil {
@@ -215,23 +154,6 @@ func regularFiles(expanded []archive.ExpandedFile) int {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-// preflightFileSize stats all files and returns total size. Returns an error if
-// the projected size exceeds the limit, before any file contents are read.
-func preflightFileSize(paths []string, limit int64) (int64, error) {
-	var total int64
-	for _, p := range paths {
-		info, err := os.Stat(p)
-		if err != nil {
-			return 0, fmt.Errorf("stat %s: %w", p, err)
-		}
-		total += info.Size()
-		if limit > 0 && total > limit {
-			return total, fmt.Errorf("projected size %d bytes exceeds limit %d bytes: reduce input or increase MaxPayloadSize", total, limit)
-		}
-	}
-	return total, nil
-}
 
 // preflightExpandedSize stats all expanded files and returns total size.
 // Uses Lstat so dangling symlinks don't error out the whole encrypt; only
@@ -332,6 +254,10 @@ func (c *Client) encryptExpandedFiles(recipients []string, expanded []archive.Ex
 		if err != nil {
 			return nil, fmt.Errorf("stat %s: %w", ef.FullPath, err)
 		}
+		if !info.Mode().IsRegular() {
+			// A FIFO would block the send, and a device would go out empty.
+			return nil, fmt.Errorf("%s is not a regular file", ef.FullPath)
+		}
 		if seen[ef.RelPath] {
 			return nil, fmt.Errorf("two files would be named %q: a secret's files need distinct names", ef.RelPath)
 		}
@@ -384,7 +310,7 @@ type plaintext struct {
 	// files are listed in files_meta. For streamed files they are set when
 	// write completes, since their SHA-256 is computed as they stream. An
 	// archive lists none.
-	files []secrets.FileMetaEntry
+	files []fileMetaEntry
 
 	archived       bool
 	archiveEntries int   // an archive's entries, folders and links included
@@ -397,7 +323,7 @@ type plaintext struct {
 }
 
 // memPlaintext is an encoded payload already in memory.
-func memPlaintext(payloadType string, data []byte, files []secrets.FileMetaEntry) *plaintext {
+func memPlaintext(payloadType string, data []byte, files []fileMetaEntry) *plaintext {
 	return &plaintext{payloadType: payloadType, size: int64(len(data)), files: files, inMemory: true,
 		write: func(w io.Writer) error {
 			_, err := w.Write(data)
@@ -416,9 +342,9 @@ func filesPlaintext(srcs []payload.FileSource) *plaintext {
 		if err != nil {
 			return err
 		}
-		p.files = make([]secrets.FileMetaEntry, len(srcs))
+		p.files = make([]fileMetaEntry, len(srcs))
 		for i, s := range srcs {
-			p.files[i] = secrets.FileMetaEntry{Name: s.Name, Size: s.Size, SHA256: sums[i]}
+			p.files[i] = fileMetaEntry{Name: s.Name, Size: s.Size, SHA256: sums[i]}
 		}
 		return nil
 	}
@@ -498,9 +424,9 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 }
 
 // sealPlaintext writes p, compressed with algo unless it is None, through
-// crypto.Seal into dst. It returns the sealed manifest and wraps, and how
+// protocol.Seal into dst. It returns the sealed manifest and wraps, and how
 // many bytes p wrote before compression. It stops when ctx is done.
-func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compress.Algorithm, sender *crypto.KeyPair, pubs []*crypto.PublicKeys, params crypto.SealParams, onProgress func(done, total int64)) (*crypto.Sealed, int64, error) {
+func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compress.Algorithm, sender *crypto.KeyPair, pubs []*crypto.PublicKeys, params protocol.SealParams, onProgress func(done, total int64)) (*protocol.Sealed, int64, error) {
 	pr, pw := io.Pipe()
 	var written int64
 	done := make(chan error, 1)
@@ -534,7 +460,7 @@ func sealPlaintext(ctx context.Context, dst io.Writer, p *plaintext, algo compre
 	}()
 
 	bw := bufio.NewWriterSize(dst, 1<<20)
-	sealed, sealErr := crypto.Seal(bw, ctxReader{ctx, pr}, sender, pubs, params)
+	sealed, sealErr := protocol.Seal(bw, ctxReader{ctx, pr}, sender, pubs, params)
 	// Unblocks the writer when Seal stopped early.
 	_ = pr.Close() // io.PipeReader.Close always returns nil.
 	writeErr := <-done
@@ -611,24 +537,16 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 
 	// Resolve actor info (always needed for org_id; also used for tier validation)
 	// Single line per phase. "Loading X..." pre-events were noise.
-	actorInfo, err := identity.WhoAmI(c.api)
+	actorInfo, err := c.senderAccount(opt)
 	if err != nil {
-		return nil, fmt.Errorf("fetch actor info: %w", err)
+		return nil, err
 	}
 	if actorInfo.OrgID == "" {
 		return nil, fmt.Errorf("no organization found: activate a plan first")
 	}
 	api.Module(log, "auth").Debug("account resolved", "actor_id", actorInfo.ID, "org_id", actorInfo.OrgID, "tier", actorInfo.TierName)
 
-	// Phase 5 removed per-tier limits from /api/me. The backend
-	// authoritatively enforces max payload size, TTL policy, and IP
-	// lock policy in CreateSecret + UpdatePolicies; the SDK no longer
-	// duplicates the rules client-side. opt.ValidateTier is retained
-	// in the API surface for source compatibility but is now a no-op:
-	// any policy violation surfaces as an HTTP error from the server.
-	_ = opt.ValidateTier
-
-	kp, senderFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	kp, senderFP, err := c.loadIdentity(opt.Identity, opt.unlock())
 	if err != nil {
 		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
@@ -646,7 +564,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	actorIDs := make([]string, len(recipients))
 	var firstUse []Recipient
 	for i, email := range recipients {
-		actorID, err := identity.ResolveRecipientID(c.api, email)
+		actorID, err := resolveRecipientID(c.api, email)
 		if err != nil {
 			return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
 		}
@@ -662,7 +580,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		logRecipientKeys(log, email, actorID, keys.Fingerprint, self, first)
 	}
 
-	algo, err := chooseCompression(p, opt.Compress, log)
+	algo, err := chooseCompression(p, compress.Algorithm(opt.Compress), log)
 	if err != nil {
 		return nil, err
 	}
@@ -677,13 +595,14 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 			return nil, err
 		}
 	}
-	defer sp.Close()
+	defer func() { _ = sp.Close() }()
 	logEncryptPlan(log, len(pubs))
 	api.Module(log, "encrypt").Debug("ciphertext storage", sp.logArgs(spoolNeed(p.size))...)
 
+	opt.phase(PhaseEncrypting)
 	tEnc := time.Now()
 	name := secretName(opt)
-	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, crypto.SealParams{
+	sealed, written, err := sealPlaintext(c.api.Context(), sp, p, algo, kp, pubs, protocol.SealParams{
 		RevisionID:  revisionID,
 		SecretName:  name,
 		PayloadType: p.payloadType,
@@ -698,17 +617,17 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	digestHex := hex.EncodeToString(m.PayloadDigest)
 	compressionLabel, compressionRatio, originalSize := compressionSummary(p, algo, m, written)
 
-	inputs := make([]secrets.RecipientInput, len(recipients))
+	inputs := make([]recipientInput, len(recipients))
 	sentTo := make([]Recipient, len(recipients))
 	for i, pub := range pubs {
 		w, ok := sealed.Wrap(pub.Fingerprint)
 		if !ok {
-			return nil, fmt.Errorf("encrypt: no wrap was made for %s", recipients[i])
+			return nil, fmt.Errorf("encrypt: no wrap was made for %s", recipients[i]) // #nosec G602 -- pubs holds one key per recipient
 		}
-		in := secrets.RecipientInput{
+		in := recipientInput{
 			RecipientID:    actorIDs[i],
 			KeyFingerprint: pub.Fingerprint,
-			Wrap:           secrets.Wrap{Enc: w.Enc, Ct: w.Ciphertext},
+			Wrap:           secretWrap{Enc: w.Enc, Ct: w.Ciphertext},
 		}
 		if actorIDs[i] == actorInfo.ID {
 			// The caller's own org is known. For anyone else the server
@@ -716,12 +635,12 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 			in.RecipientOrgID = actorInfo.OrgID
 		}
 		inputs[i] = in
-		sentTo[i] = Recipient{Email: recipients[i], Fingerprint: pub.Fingerprint}
+		sentTo[i] = Recipient{Email: recipients[i], Fingerprint: pub.Fingerprint} // #nosec G602 -- pubs holds one key per recipient
 	}
 
 	// The server checks the manifest against revision_id, name, size,
 	// checksum_sha256 and key_fingerprint, so they are taken from it.
-	req := &secrets.CreateRequest{
+	req := &createRequest{
 		OrgID:           actorInfo.OrgID,
 		Name:            name,
 		RevisionID:      m.RevisionID,
@@ -729,7 +648,7 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		FilesCount:      len(p.files),
 		Size:            m.CiphertextSize,
 		Etag:            digestHex[:16],
-		KDF:             crypto.KDF,
+		KDF:             protocol.KDF,
 		ProtocolVersion: m.Version,
 		CipherSuite:     m.CipherSuite,
 		PayloadType:     p.payloadType,
@@ -772,15 +691,17 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 	if len(req.AllowedIPs) > 0 {
 		createArgs = append(createArgs, "allowed_ips", len(req.AllowedIPs))
 	}
-	// The server adds a revision to a secret of this name the sender has,
-	// or creates the secret with this as its first revision.
+	// The upload begins with the create call. The server adds a revision
+	// to a secret of this name the sender has, or creates the secret with
+	// this as its first revision.
+	opt.phase(PhaseUploading)
 	secretLog.Debug("creating revision", createArgs...)
-	secret, revoked, err := secrets.Create(c.api, req)
+	secret, revoked, err := createSecret(c.api, req)
 	if err != nil {
 		// A send under an existing name that leaves out people who have
 		// access now is refused unless RevokeMissing is set. The server's
 		// message names them, so surface it as is.
-		var apiErr *api.APIError
+		var apiErr *api.Error
 		if errors.Is(err, api.ErrConflict) && errors.As(err, &apiErr) && apiErr.Message != "" {
 			return nil, fmt.Errorf("send refused (%w): %s", api.ErrConflict, apiErr.Message)
 		}
@@ -811,18 +732,18 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 		}
 		// The multipart upload logs its plan, and its completion once the
 		// server has assembled the parts.
-		if err := c.api.MultipartUploadOpts(revisionID, sp, size, api.MultipartUploadOptions{
+		if err := c.api.MultipartUploadOpts(revisionID, sp, size, transport.MultipartUploadOptions{
 			Threads:    opt.UploadThreads,
 			OnProgress: opt.OnUploadProgress,
 			Logger:     opt.Logger,
-			Status:     opt.UploadStatus,
+			Status:     opt.UploadStatus.transport(),
 		}); err != nil {
 			return nil, uploadFailed(sp, pending, err)
 		}
 	} else {
-		api.LogSinglePutPlan(log, size, opt.PresignExpiryMinutes)
+		transport.LogSinglePutPlan(log, size, opt.PresignExpiryMinutes)
 		tUp := time.Now()
-		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus); err != nil {
+		if err := c.api.PresignUploadFrom(actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus.transport()); err != nil {
 			return nil, fmt.Errorf("upload: %w", err)
 		}
 
@@ -865,12 +786,12 @@ func (c *Client) encryptAndSend(recipients []string, p *plaintext, opt EncryptOp
 
 // loadIdentity loads the local key pair with the fingerprint (or prefix)
 // fp, or the primary identity registered on the server when fp is empty,
-// and returns it with its full fingerprint.
-func (c *Client) loadIdentity(fp, password string) (*crypto.KeyPair, string, error) {
+// unlocking it once with u, and returns it with its full fingerprint.
+func (c *Client) loadIdentity(fp string, u crypto.Unlock) (*crypto.KeyPair, string, error) {
 	if fp == "" {
-		return identity.LoadPrimaryIdentity(c.api, password)
+		return loadPrimaryIdentityWith(c.api.Context(), c.api, c.keys(), u)
 	}
-	kp, err := crypto.LoadKeyPair(fp, password)
+	kp, err := crypto.UnlockKeyPair(c.api.Context(), c.keys(), fp, u)
 	if err != nil {
 		return nil, "", fmt.Errorf("%s: %w", crypto.ShortFingerprint(fp), err)
 	}
@@ -884,16 +805,16 @@ func (c *Client) loadIdentity(fp, password string) (*crypto.KeyPair, string, err
 // recipientKeys fetches a recipient's primary public keys, verified against
 // their fingerprint and both self-signatures. When the recipient is the
 // sender (self), the keys must also be a key pair on this device, the
-// sending identity senderFP or another: see identity.CheckOwnKeys.
+// sending identity senderFP or another: see checkOwnKeys.
 // Anyone else's must pass checkKey against known, what this device knows
 // on the server; a key new to it is reported as first, for recordFirstUse
 // once the send succeeds.
 func (c *Client) recipientKeys(known map[string][]knownKeyDisk, email string, self bool, senderFP string) (keys *crypto.PublicKeys, first bool, err error) {
-	if keys, err = identity.GetRecipientKeys(c.api, email); err != nil {
+	if keys, err = getRecipientKeys(c.api, email); err != nil {
 		return nil, false, fmt.Errorf("resolve recipient %s: %w", email, err)
 	}
 	if self {
-		err = identity.CheckOwnKeys(keys, senderFP)
+		err = checkOwnKeys(c.keys(), keys, senderFP)
 		if err != nil && ownAccount(known[strings.ToLower(email)]) {
 			err = fmt.Errorf("%w (%s is recorded as your own account on this device; if it is not yours, forget it)", err, email)
 		}
@@ -917,6 +838,19 @@ func keyTrust(own, first bool) string {
 		return "first_use"
 	}
 	return "known"
+}
+
+// senderAccount is the sender's account: the one the caller gave, or else
+// the server's answer now.
+func (c *Client) senderAccount(opt EncryptOptions) (*ActorInfo, error) {
+	if opt.Account != nil {
+		return opt.Account, nil
+	}
+	a, err := whoAmI(c.api)
+	if err != nil {
+		return nil, fmt.Errorf("fetch actor info: %w", err)
+	}
+	return a, nil
 }
 
 // secretName is the name a send goes under: opt.Name without surrounding
@@ -959,7 +893,7 @@ func chooseCompression(p *plaintext, want compress.Algorithm, log *slog.Logger) 
 // ("tar+zstd", "zstd" or ""), the compressed size as a percentage of the
 // original, and the original size. written is what p wrote before
 // compression.
-func compressionSummary(p *plaintext, algo compress.Algorithm, m *crypto.Manifest, written int64) (string, float64, int64) {
+func compressionSummary(p *plaintext, algo compress.Algorithm, m *protocol.Manifest, written int64) (string, float64, int64) {
 	switch {
 	case p.archived:
 		ratio := 0.0

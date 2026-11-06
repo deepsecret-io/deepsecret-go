@@ -85,7 +85,7 @@ func TestLoadKeyPairRejectsLegacyVersion(t *testing.T) {
 	fp, _ := Fingerprint(kp)
 	tmpDir := t.TempDir()
 
-	// Save with version 0 (legacy — no version field)
+	// Save with version 0 (legacy: no version field)
 	kp.StorageVersion = 0
 	data, _ := json.MarshalIndent(kp, "", "  ")
 	os.WriteFile(filepath.Join(tmpDir, fp+".json"), data, 0600)

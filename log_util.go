@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/compress"
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/sdk/internal/protocol"
 )
 
 // humanBytes renders a byte count in IEC units ("12.50 MiB") for error
@@ -77,13 +77,13 @@ func logRecipientKeys(log *slog.Logger, email, actorID, fp string, own, first bo
 // logEncryptPlan logs how a payload is sealed for n recipients: the
 // protocol's cipher suite and chunk size, under a fresh content key.
 func logEncryptPlan(log *slog.Logger, n int) {
-	api.Module(log, "encrypt").Debug("plan", "cipher_suite", crypto.CipherSuite, "chunk_size", api.Bytes(crypto.ChunkSize), "recipients", n)
+	api.Module(log, "encrypt").Debug("plan", "cipher_suite", protocol.CipherSuite, "chunk_size", api.Bytes(protocol.ChunkSize), "recipients", n)
 }
 
 // logSealed logs a sealed payload: its compression, its encryption and the
 // signed manifest. written is what the payload wrote before compression,
 // in elapsed.
-func logSealed(log *slog.Logger, algo compress.Algorithm, sealed *crypto.Sealed, written int64, elapsed time.Duration) {
+func logSealed(log *slog.Logger, algo compress.Algorithm, sealed *protocol.Sealed, written int64, elapsed time.Duration) {
 	m := sealed.Manifest
 	if algo != compress.None {
 		api.Module(log, "compress").Debug("payload compressed", "algorithm", algo, "size", api.Bytes(written), "compressed", api.Bytes(m.PlaintextSize))
@@ -94,9 +94,9 @@ func logSealed(log *slog.Logger, algo compress.Algorithm, sealed *crypto.Sealed,
 		"payload_sha256", hex.EncodeToString(m.PayloadDigest), "recipients", len(m.Recipients))
 }
 
-// logManifestVerified logs a manifest crypto.Open verified, and the wrap
+// logManifestVerified logs a manifest protocol.Open verified, and the wrap
 // it opened for this device's key.
-func logManifestVerified(log *slog.Logger, m *crypto.Manifest, size int) {
+func logManifestVerified(log *slog.Logger, m *protocol.Manifest, size int) {
 	api.Module(log, "manifest").Debug("manifest verified", "revision_id", m.RevisionID, "size", api.Bytes(int64(size)),
 		"version", m.Version, "cipher_suite", m.CipherSuite, "payload_type", m.PayloadType,
 		"sender_fingerprint", m.SenderFingerprint, "recipients", len(m.Recipients), "ciphertext", api.Bytes(m.CiphertextSize),
@@ -105,7 +105,7 @@ func logManifestVerified(log *slog.Logger, m *crypto.Manifest, size int) {
 
 // logPayloadVerified logs a payload whose ciphertext a decrypt pass
 // checked against the signed manifest.
-func logPayloadVerified(log *slog.Logger, m *crypto.Manifest) {
+func logPayloadVerified(log *slog.Logger, m *protocol.Manifest) {
 	api.Module(log, "verify").Debug("payload verified", "payload_sha256", hex.EncodeToString(m.PayloadDigest),
 		"checked", "size and digest, then every chunk in order to the last-chunk flag")
 }

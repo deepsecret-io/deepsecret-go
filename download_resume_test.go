@@ -40,7 +40,7 @@ func sendLarge(t *testing.T, f *fakeAPI) (string, []byte) {
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	data := randomBytes(t, 20*mib)
 	writeFile(t, src, data, 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,8 +56,7 @@ func interruptedDownload(t *testing.T, f *fakeAPI, dir string) (string, []byte, 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bob := f.client("bob@example.com")
-	bob.SetRootContext(ctx)
-	_, _, err := bob.DecryptToDir(secretID, t.TempDir(), DecryptOptions{
+	_, _, err := bob.DecryptToDir(ctx, secretID, t.TempDir(), DecryptOptions{
 		ResumeDir: dir, DownloadThreads: 1,
 		OnDownloadProgress: func(done, _ int64) {
 			if done >= 8*mib {
@@ -125,7 +124,7 @@ func TestInterruptedDownloadResumes(t *testing.T) {
 
 	before, presigns := rangeCount(f)
 	out := t.TempDir()
-	res, _, err := f.client("bob@example.com").DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
+	res, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
 	if err != nil {
 		t.Fatalf("resumed decrypt: %v", err)
 	}
@@ -162,7 +161,7 @@ func TestFinishedDownloadIsKeptUntilDecrypted(t *testing.T) {
 	writeFile(t, filepath.Join(out, "backup.bin"), []byte("already here"), 0o600)
 
 	bob := f.client("bob@example.com")
-	o, err := bob.OpenSecret(secretID, DecryptOptions{ResumeDir: dir})
+	o, err := bob.OpenSecret(context.Background(), secretID, DecryptOptions{ResumeDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +177,7 @@ func TestFinishedDownloadIsKeptUntilDecrypted(t *testing.T) {
 	}
 
 	before, presigns := rangeCount(f)
-	res, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{Overwrite: true})
+	res, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{Overwrite: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,14 +214,14 @@ func TestKeptDownloadThatFailsItsCheckIsDiscarded(t *testing.T) {
 
 	bob := f.client("bob@example.com")
 	out := t.TempDir()
-	_, _, err = bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
+	_, _, err = bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
 	if err == nil || !strings.Contains(err.Error(), "does not match the signed manifest") || !strings.Contains(err.Error(), "kept from an earlier download") {
 		t.Fatalf("decrypt of a changed kept download: %v", err)
 	}
 	assertEmptyDir(t, out)
 	assertEmptyDir(t, dir)
 
-	res, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
+	res, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
 	if err != nil || res.ResumedBytes != 0 {
 		t.Fatalf("fresh decrypt: %v, resumed %d", err, res.ResumedBytes)
 	}
@@ -274,7 +273,7 @@ func TestKeptDownloadThatDisagreesStartsOver(t *testing.T) {
 
 			before, _ := rangeCount(f)
 			dest := t.TempDir()
-			res, _, err := f.client("bob@example.com").DecryptToDir(secretID, dest, DecryptOptions{ResumeDir: dir}, WriteOptions{})
+			res, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), secretID, dest, DecryptOptions{ResumeDir: dir}, WriteOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -303,7 +302,7 @@ func TestKeptDownloadIsLockedWhileInUse(t *testing.T) {
 
 	bob := f.client("bob@example.com")
 	out := t.TempDir()
-	if _, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "another decrypt is downloading") {
+	if _, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "another decrypt is downloading") {
 		t.Fatalf("second decrypt: %v", err)
 	}
 	if err := DiscardPendingDownload(dir, interrupted.Download.RevisionID); err == nil {
@@ -321,7 +320,7 @@ func TestKeptDownloadIsLockedWhileInUse(t *testing.T) {
 
 	// Released, and over a week old, it still resumes: a decrypt never
 	// prunes the download it continues.
-	res, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
+	res, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{})
 	if err != nil || res.ResumedBytes != 8*mib {
 		t.Fatalf("decrypt once released: %v, resumed %d", err, res.ResumedBytes)
 	}
@@ -391,8 +390,7 @@ func TestDownloadStoppedBeforeAnyRangeKeepsNothing(t *testing.T) {
 	}
 	f.mu.Unlock()
 	bob := f.client("bob@example.com")
-	bob.SetRootContext(ctx)
-	_, _, err := bob.DecryptToDir(secretID, t.TempDir(), DecryptOptions{ResumeDir: dir}, WriteOptions{})
+	_, _, err := bob.DecryptToDir(ctx, secretID, t.TempDir(), DecryptOptions{ResumeDir: dir}, WriteOptions{})
 	var interrupted *DownloadInterruptedError
 	if err == nil || errors.As(err, &interrupted) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("decrypt stopped before any range: %v", err)
@@ -431,7 +429,7 @@ func TestKeptDownloadRecordsRangesAsTheyFinish(t *testing.T) {
 	f.mu.Unlock()
 
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(secretID, out, DecryptOptions{ResumeDir: dir, DownloadThreads: 1}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), secretID, out, DecryptOptions{ResumeDir: dir, DownloadThreads: 1}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	<-release
@@ -448,13 +446,13 @@ func TestSmallDecryptsLeaveResumeDirAlone(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "small.bin")
 	data := randomBytes(t, mib)
 	writeFile(t, src, data, 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(t.TempDir(), "kept")
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{ResumeDir: dir}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "small.bin"), data, 0o600)
@@ -472,7 +470,7 @@ func TestSplitTailDecrypts(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "big.bin")
 	data := randomBytes(t, 40*mib)
 	writeFile(t, src, data, 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +495,7 @@ func TestSplitTailDecrypts(t *testing.T) {
 
 	before, _ := rangeCount(f)
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{ResumeDir: dir, DownloadThreads: 2}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{ResumeDir: dir, DownloadThreads: 2}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	select {

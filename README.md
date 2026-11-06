@@ -11,22 +11,17 @@ End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 ## Architecture
 
 ```
-sdk/                 ← orchestration (encrypt, decrypt, revoke)
-├── api/             ← HTTP client, presigned upload/download
-├── identity/        ← actor info, key management, resolution
-├── secrets/         ← secret CRUD, creation request types
-├── payload/         ← CBOR payload types (wire format)
-├── crypto/          ← payload stream, HPKE wraps, signed manifest, keystore
-├── compress/        ← streaming zstd compression/decompression
-├── archive/         ← tar creation/extraction, path validation
+sdk/                 ← the client: encrypt, decrypt, revoke, accounts and keys
+├── api/             ← API errors, transfer status, log conventions
+├── crypto/          ← key pairs, key files, fingerprints, safety numbers
+├── fido2/           ← security keys, through libfido2
+├── internal/        ← protocol, transport, payload, archive and compression
 └── examples/
 ```
 
-**Standalone packages** (no API dependency, portable to other languages):
-- `crypto/`: encryption, signing, key management
-- `compress/`: streaming zstd
-- `archive/`: tar, path validation, file expansion
-- `payload/`: CBOR payload types
+Build on the `sdk` package. It checks every key against the ones this device knows and refuses a rollback, which the protocol underneath cannot do on its own, so the protocol is internal. To port the SDK to another language, follow [PROTOCOL_V4.md](PROTOCOL_V4.md).
+
+Every call that can block takes a `context.Context` first and ends when it does.
 
 ## Quick Start
 
@@ -39,14 +34,14 @@ if err != nil {
 }
 
 // Encrypt a message once for two recipients (you are a recipient only if listed)
-res, _ := client.EncryptText([]string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
+res, _ := client.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
 
 // Decrypt, as one of the recipients
-result, _ := client.DecryptSecret(res.Secret.ID)
+result, _ := client.DecryptSecret(ctx, res.Secret.ID, sdk.DecryptOptions{})
 fmt.Println(result.Message)
 
 // Revoke one recipient
-client.RevokeRecipient(res.Secret.ID, "bob@example.com")
+client.RevokeRecipient(ctx, res.Secret.ID, "bob@example.com")
 ```
 
 ## Encrypt Options
@@ -69,7 +64,7 @@ sdk.EncryptOptions{
 
 Files stream, so memory stays flat at any size, up to 100 GiB a secret.
 
-- **Send.** `EncryptFile`, `EncryptFiles`, `EncryptDir` and `EncryptPaths` read
+- **Send.** `EncryptPaths` reads
   each file once, encode, compress and seal it chunk by chunk into a private
   temporary file holding only ciphertext, then upload from that file.
 - **Receive.** `OpenSecret` downloads the ciphertext into a temporary file.
@@ -81,14 +76,14 @@ Files stream, so memory stays flat at any size, up to 100 GiB a secret.
   `TempDir` in the options or `DEEPSECRET_TMPDIR`, else the system temp
   directory is used. A send checks before it reads anything.
 - **In memory.** `EncryptText`, `EncryptData` and `EncryptBytes`, and
-  `DecryptSecretFull` for payloads up to `DefaultMaxInMemorySize` (256 MiB).
+  `DecryptSecret` for payloads up to `DefaultMaxInMemorySize` (256 MiB).
 
 ```go
 // Write a files secret of any size to disk
-result, written, err := client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+result, written, err := client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
 
 // Or open first, then choose where it goes
-opened, err := client.OpenSecret(secretID, sdk.DecryptOptions{})
+opened, err := client.OpenSecret(ctx, secretID, sdk.DecryptOptions{})
 defer opened.Close()
 if opened.Result.PayloadType == "files" {
     written, err = opened.WriteFiles("./out", sdk.WriteOptions{Overwrite: false})
@@ -159,15 +154,16 @@ network, so memory does not grow with part size or threads.
   new one.
 
 ```go
-client.SetSessionStore(sdk.SessionStore{Load: loadToken, Save: saveToken})
+client, err := sdk.NewClient(url, "bearer:"+token,
+    sdk.WithSessionStore(sdk.SessionStore{Load: loadToken, Save: saveToken}))
 
-_, err := client.EncryptFile(to, "backup.tar", sdk.EncryptOptions{ResumeDir: dir})
+_, err = client.EncryptPaths(ctx, to, []string{"backup.tar"}, sdk.EncryptOptions{ResumeDir: dir})
 var interrupted *sdk.UploadInterruptedError
 if errors.As(err, &interrupted) {
-    _, err = client.ResumeUpload(dir, interrupted.Upload.RevisionID, sdk.ResumeOptions{})
+    _, err = client.ResumeUpload(ctx, dir, interrupted.Upload.RevisionID, sdk.ResumeOptions{})
 }
 
-_, _, err = client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{ResumeDir: downloads}, sdk.WriteOptions{})
+_, _, err = client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{ResumeDir: downloads}, sdk.WriteOptions{})
 var stopped *sdk.DownloadInterruptedError
 if errors.As(err, &stopped) {
     // The same call later fetches only what stopped.Download lacks.
@@ -198,7 +194,7 @@ Logs never hold plaintext, keys, passwords, tokens or presigned URLs.
 
 ```go
 logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: api.LevelTrace}))
-_, err := client.EncryptFile(to, "backup.tar", sdk.EncryptOptions{Logger: logger})
+_, err := client.EncryptPaths(ctx, to, []string{"backup.tar"}, sdk.EncryptOptions{Logger: logger})
 ```
 
 ## Recipient Keys
@@ -214,9 +210,17 @@ belongs to:
   recorded as yours, so what the server later says about who you are cannot
   change it. For one of your accounts only key pairs on this device pass: a
   send to it must use one, and a secret from it must be signed by one. If
-  the server says you are someone this device knows as another person, the
-  send or registration is refused. A secret signed by a key on this device
-  is yours.
+  the server says you are someone this device knows as another person (by a
+  key that is not on this device, or one recorded for another of your
+  accounts), the send or registration is refused, as is one that would
+  record a key of one of your accounts for another: a key belongs to one
+  account. An account this device knows only by other key pairs on it, as
+  when one of your accounts sent to another before this device knew both
+  were yours, is recorded as yours when the server says you are it, on a
+  send or a key registration. That trusts how this device first learned those keys: a
+  server that listed one of them for a contact then could get that contact
+  recorded as yours, after which sends to them are refused until you forget
+  it. A secret signed by a key on this device is yours.
 - **Everyone else's: trust on first use.** The first send to someone, or
   the first secret from them, accepts their key and reports it
   (`EncryptResult.FirstUse`, `DecryptResult.SenderFirstUse`) so you can
@@ -245,55 +249,40 @@ belongs to:
 
 Known keys, and the newest signing time opened per secret, are kept per
 API server in `~/.deepsecret/known_keys.json` (mode 0600;
-`SetKnownKeysFile` moves it). A damaged file refuses sends rather than
+`WithKnownKeysFile` moves it). A damaged file refuses sends rather than
 accepting any key again.
 
 ## Packages
 
-### `sdk/crypto`: Cryptographic Primitives
+### `sdk/api`: Errors, Status and Logging
+
+| Name | Description |
+|---|---|
+| `Error`, `ErrNotFound`, `ErrForbidden`, ... | What the server answered; branch with `errors.Is` |
+| `IsMaintenanceError`, `MaintenanceMessage` | The API is under maintenance |
+| `TransferSnapshot`, `ConnectionStatus` | A transfer's state, from `sdk.TransferStatus.Snapshot` |
+| `Module`, `LevelTrace`, `Bytes`, `Rate` | The SDK's log conventions |
+
+### `sdk/crypto`: Keys
 
 | Function | Description |
 |---|---|
 | `GenerateKeyPair()` | Generate Ed25519 + ML-DSA-65 + X25519 + ML-KEM-768 key pair |
 | `Fingerprint(kp)` | Full SHA-256 hex fingerprint (64 chars) |
-| `Seal` / `SealBytes(pt, sender, recipients, params)` | Encrypt once, wrap the content key per recipient, sign the manifest |
-| `Open(manifest, wrap, recipient, params)` | Verify the manifest, open the caller's wrap |
-| `Opened.Decrypt` / `DecryptTo` | Check the payload digest, then decrypt the chunks |
-| `UnmarshalManifest(data)` | Inspect a manifest without opening it |
-| `SaveKeyPair` / `LoadKeyPair` | Password-protected key storage |
+| `SafetyNumber`, `PairSafetyNumber` | A fingerprint as digits to compare aloud |
+| `SaveKeyPairTo` / `LoadKeyPairFrom` | Password-protected key storage |
+| `ReadKeyFileInfo` | How a key file is protected, and its slots, without unlocking it |
+| `UnlockKeyPair` | Unlock any key file: password, security key or recovery code |
+| `EditKeyFile` / `NewSecurityKeyFile` | Protect a key pair with security keys, add or remove them, set a recovery code |
 
-### `sdk/compress`: Streaming Compression
-
-| Function | Description |
-|---|---|
-| `NewCompressWriter(w, algo)` | Streaming compressor (primary) |
-| `NewDecompressReader(r, algo)` | Streaming decompressor (primary) |
-| `Compress(data, algo)` | Convenience []byte compression |
-| `Decompress(data, algo, limits)` | Bounded decompression |
-
-Algorithms: `compress.Zstd`, `compress.None`
-
-### `sdk/archive`: Tar & File Operations
+### `sdk/fido2`: Security Keys
 
 | Function | Description |
 |---|---|
-| `WriteTar(w, files, algo)` | Stream files → tar → writer (primary) |
-| `WriteTarStream(w, entries, algo)` | Stream reader-backed entries → tar |
-| `ExtractTarReader(r, dir, algo, limits)` | Stream tar → disk (primary) |
-| `ValidateArchivePath(name)` | Portable archive path validation |
-| `ExpandPaths(paths, skipHidden)` | Recursive file expansion |
+| `New(prompter)` | A `crypto.Authenticator` for YubiKeys and other FIDO2 keys, through libfido2 loaded at run time |
+| `Check()` | Whether libfido2 is installed, and which security keys are connected |
 
-### `sdk/payload`: Wire Format
-
-CBOR-encoded payload types with canonical deterministic encoding.
-
-### `sdk/identity`: Identity Management
-
-Actor info, key resolution, sync, fingerprint lookup.
-
-### `sdk/secrets`: Secret CRUD
-
-List, describe, delete, create secrets, fetch a revision's manifest and wrap, and revoke recipients via the API.
+Builds with `-tags nofido2`, and builds for Windows, have no security key support.
 
 ## Encryption Protocol (v4)
 
@@ -340,7 +329,7 @@ in it (`github.com/deepsecret-io/sdk/v2`).
 To release, from a clean, pushed `main`:
 
 ```bash
-task release VERSION=v0.3.1
+task release VERSION=v0.4.0
 ```
 
 It refuses a version that is not vMAJOR.MINOR.PATCH or not newer than the
@@ -353,12 +342,12 @@ tag is permanent: the Go module mirror keeps it even if it is deleted.
 
 The SDK is designed for portability:
 
-- **Standalone packages**: `crypto/`, `compress/`, `archive/`, `payload/` have no HTTP dependency
+- **Specification**: [PROTOCOL_V4.md](PROTOCOL_V4.md)
 - **Wire format**: CBOR (RFC 8949) with canonical encoding, deterministic across languages
 - **Compression**: Zstandard (RFC 8878), implementations in every language
 - **Encryption**: HPKE (RFC 9180) with X25519-ML-KEM-768 (Go stdlib `crypto/hpke`) for wraps, AES-256-GCM in 1 MiB chunks for payloads
 - **Signing**: Ed25519 (RFC 8032) and ML-DSA-65 (FIPS 204), both required
-- **Test vectors**: `crypto/v4_vector_test.go` pins every deterministic v4 value
+- **Test vectors**: `internal/protocol/v4_vector_test.go` pins every deterministic v4 value
 - **Archive paths**: strict portable format (forward-slash, no traversal, validated)
 
 Key porting targets: TypeScript/Node.js, Python, Rust, Swift, Kotlin

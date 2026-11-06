@@ -24,7 +24,7 @@ func interruptedSend(t *testing.T, f *fakeAPI, dir string) ([]byte, *UploadInter
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	data := randomBytes(t, 12<<20)
 	writeFile(t, src, data, 0o600)
-	_, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{ResumeDir: dir, UploadThreads: 1})
+	_, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{ResumeDir: dir, UploadThreads: 1})
 	var interrupted *UploadInterruptedError
 	if !errors.As(err, &interrupted) {
 		t.Fatalf("send: %v, want an interrupted upload", err)
@@ -57,7 +57,7 @@ func TestInterruptedSendResumes(t *testing.T) {
 	before := f.puts
 	f.mu.Unlock()
 	alice := f.client("alice@example.com")
-	if _, err := alice.ResumeUpload(dir, rev, ResumeOptions{}); err != nil {
+	if _, err := alice.ResumeUpload(context.Background(), dir, rev, ResumeOptions{}); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	f.mu.Lock()
@@ -72,7 +72,7 @@ func TestInterruptedSendResumes(t *testing.T) {
 	assertEmptyDir(t, dir)
 
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
@@ -100,8 +100,7 @@ func TestCancelledSendResumes(t *testing.T) {
 		}
 	}
 	alice := f.client("alice@example.com")
-	alice.SetRootContext(ctx)
-	_, err := alice.EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{ResumeDir: dir, UploadThreads: 1})
+	_, err := alice.EncryptPaths(ctx, []string{"bob@example.com"}, []string{src}, EncryptOptions{ResumeDir: dir, UploadThreads: 1})
 	var interrupted *UploadInterruptedError
 	if !errors.As(err, &interrupted) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled send: %v, want an interrupted upload caused by the cancel", err)
@@ -118,7 +117,7 @@ func TestCancelledSendResumes(t *testing.T) {
 	f.afterPart = nil
 	before := f.puts
 	f.mu.Unlock()
-	if _, err := f.client("alice@example.com").ResumeUpload(dir, interrupted.Upload.RevisionID, ResumeOptions{}); err != nil {
+	if _, err := f.client("alice@example.com").ResumeUpload(context.Background(), dir, interrupted.Upload.RevisionID, ResumeOptions{}); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	f.mu.Lock()
@@ -129,7 +128,7 @@ func TestCancelledSendResumes(t *testing.T) {
 	}
 	assertEmptyDir(t, dir)
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), interrupted.Upload.SecretID, out, DecryptOptions{}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
@@ -141,7 +140,7 @@ func TestDiscardPendingUpload(t *testing.T) {
 	_, interrupted := interruptedSend(t, f, dir)
 	rev := interrupted.Upload.RevisionID
 	alice := f.client("alice@example.com")
-	if err := alice.DiscardPendingUpload(dir, rev); err != nil {
+	if err := alice.DiscardPendingUpload(context.Background(), dir, rev); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -151,7 +150,7 @@ func TestDiscardPendingUpload(t *testing.T) {
 		t.Fatal("the upload was not aborted on the server")
 	}
 	assertEmptyDir(t, dir)
-	if _, err := alice.ResumeUpload(dir, rev, ResumeOptions{}); err == nil {
+	if _, err := alice.ResumeUpload(context.Background(), dir, rev, ResumeOptions{}); err == nil {
 		t.Fatal("resumed a discarded upload")
 	}
 }
@@ -161,10 +160,10 @@ func TestPendingUploadsRefuseOddIDs(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	alice := f.client("alice@example.com")
 	for _, id := range []string{"../etc", "", "a/b"} {
-		if _, err := alice.ResumeUpload(t.TempDir(), id, ResumeOptions{}); err == nil {
+		if _, err := alice.ResumeUpload(context.Background(), t.TempDir(), id, ResumeOptions{}); err == nil {
 			t.Errorf("resume %q accepted", id)
 		}
-		if err := alice.DiscardPendingUpload(t.TempDir(), id); err == nil {
+		if err := alice.DiscardPendingUpload(context.Background(), t.TempDir(), id); err == nil {
 			t.Errorf("discard %q accepted", id)
 		}
 	}
@@ -177,7 +176,7 @@ func TestFailedSendWithoutResumeDirKeepsNothing(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	writeFile(t, src, randomBytes(t, 6<<20), 0o600)
-	_, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{TempDir: tmp})
+	_, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{TempDir: tmp})
 	var interrupted *UploadInterruptedError
 	if err == nil || errors.As(err, &interrupted) {
 		t.Fatalf("send: %v", err)

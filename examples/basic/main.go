@@ -6,14 +6,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/deepsecret-io/sdk"
-	"github.com/deepsecret-io/sdk/compress"
-	"github.com/deepsecret-io/sdk/secrets"
 )
 
 func main() {
@@ -34,7 +33,7 @@ func main() {
 	}
 
 	// ── Authenticate ──
-	me, err := client.WhoAmI()
+	me, err := client.WhoAmI(context.Background())
 	if err != nil {
 		log.Fatal("whoami: ", err)
 	}
@@ -42,14 +41,14 @@ func main() {
 	fmt.Printf("Plan: %s | Status: %s\n\n", me.TierName, me.SubscriptionStatus)
 
 	// ── Identity ──
-	_, fp, err := client.LoadPrimaryIdentity("")
+	_, fp, err := client.LoadPrimaryIdentity(context.Background(), "")
 	if err != nil {
 		log.Fatal("identity: ", err)
 	}
 	fmt.Printf("Primary key: %s\n\n", fp)
 
 	// ── Encrypt text ──
-	secret, err := client.EncryptText(recipients, "Hello from the DeepSecret Go SDK!", sdk.EncryptOptions{
+	secret, err := client.EncryptText(context.Background(), recipients, "Hello from the DeepSecret Go SDK!", sdk.EncryptOptions{
 		Name: "sdk-basic-text",
 	})
 	if err != nil {
@@ -58,39 +57,39 @@ func main() {
 	fmt.Printf("Encrypted text → %s (name=%s)\n", secret.Secret.ID, secret.Secret.Name)
 
 	// Decrypt it back
-	result, err := client.DecryptSecret(secret.Secret.ID)
+	result, err := client.DecryptSecret(context.Background(), secret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt text: ", err)
 	}
-	fmt.Printf("Decrypted: type=%s message=%q\n\n", result.Type, result.Message)
+	fmt.Printf("Decrypted: type=%s message=%q\n\n", result.Decrypted.Type, result.Decrypted.Message)
 
 	// ── Encrypt key-value data ──
-	kvSecret, err := client.EncryptData(recipients, map[string]string{
+	kvSecret, err := client.EncryptData(context.Background(), recipients, map[string]string{
 		"DB_HOST":     "db.internal:5432",
 		"DB_PASSWORD": "super-secret-password",
 		"API_KEY":     "ak_live_xyz123",
 	}, sdk.EncryptOptions{
 		Name:     "sdk-basic-data",
-		Compress: compress.Zstd,
+		Compress: sdk.CompressZstd,
 	})
 	if err != nil {
 		log.Fatal("encrypt data: ", err)
 	}
 	fmt.Printf("Encrypted data → %s\n", kvSecret.Secret.ID)
 
-	kvResult, err := client.DecryptSecret(kvSecret.Secret.ID)
+	kvResult, err := client.DecryptSecret(context.Background(), kvSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt data: ", err)
 	}
-	fmt.Printf("Decrypted: type=%s\n", kvResult.Type)
-	for _, kv := range kvResult.Entries {
+	fmt.Printf("Decrypted: type=%s\n", kvResult.Decrypted.Type)
+	for _, kv := range kvResult.Decrypted.Entries {
 		fmt.Printf("  %s = %s\n", kv.Key, kv.Value)
 	}
 	fmt.Println()
 
 	// ── Encrypt raw bytes ──
 	jsonPayload := []byte(`{"event":"deploy","version":"2.1.0","env":"production"}`)
-	byteSecret, err := client.EncryptBytes(recipients, jsonPayload, sdk.EncryptOptions{
+	byteSecret, err := client.EncryptBytes(context.Background(), recipients, jsonPayload, sdk.EncryptOptions{
 		Name: "sdk-basic-bytes",
 	})
 	if err != nil {
@@ -98,14 +97,14 @@ func main() {
 	}
 	fmt.Printf("Encrypted bytes → %s\n", byteSecret.Secret.ID)
 
-	byteResult, err := client.DecryptSecret(byteSecret.Secret.ID)
+	byteResult, err := client.DecryptSecret(context.Background(), byteSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt bytes: ", err)
 	}
-	fmt.Printf("Decrypted: %s\n\n", byteResult.Message)
+	fmt.Printf("Decrypted: %s\n\n", byteResult.Decrypted.Message)
 
 	// ── List secrets ──
-	sent, total, err := client.ListSentSecrets(secrets.ListOptions{Limit: 5})
+	sent, total, err := client.ListSentSecrets(context.Background(), sdk.ListOptions{Limit: 5})
 	if err != nil {
 		log.Fatal("list sent: ", err)
 	}
@@ -115,7 +114,7 @@ func main() {
 	}
 
 	// ── Describe secret ──
-	info, err := client.DescribeSecret(secret.Secret.ID)
+	info, err := client.DescribeSecret(context.Background(), secret.Secret.ID)
 	if err != nil {
 		log.Fatal("describe: ", err)
 	}
@@ -124,7 +123,7 @@ func main() {
 	fmt.Printf("  Size: %d bytes, Revisions: %d\n", info.TotalSize, info.RevisionCount)
 
 	// ── Delete secrets ──
-	if err := client.DeleteSecrets([]string{secret.Secret.ID, kvSecret.Secret.ID, byteSecret.Secret.ID}); err != nil {
+	if err := client.DeleteSecrets(context.Background(), []string{secret.Secret.ID, kvSecret.Secret.ID, byteSecret.Secret.ID}); err != nil {
 		log.Fatal("delete: ", err)
 	}
 	fmt.Println("\nCleaned up example secrets.")

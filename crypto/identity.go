@@ -12,6 +12,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+
+	"github.com/deepsecret-io/sdk/internal/canon"
 )
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -85,7 +87,7 @@ type PublicKeys struct {
 }
 
 // FingerprintLen is the length of a full hex-encoded SHA-256 fingerprint.
-const FingerprintLen = 64
+const FingerprintLen = canon.FingerprintLen
 
 // ── Key Generation ───────────────────────────────────────────────────────────
 

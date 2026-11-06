@@ -5,6 +5,7 @@ package sdk
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -14,16 +15,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/uuid"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/crypto"
-	"github.com/deepsecret-io/sdk/identity"
+	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/sdk/internal/protocol"
 )
 
 // ── Local files ──────────────────────────────────────────────────────────────
@@ -53,7 +52,7 @@ const (
 	localMagic = "deepsecret-local-v1"
 
 	// maxLocalHeader bounds the map after the payload: a manifest of at
-	// most 1 MiB and crypto.MaxRecipients wraps of about 1.2 KB each.
+	// most 1 MiB and protocol.MaxRecipients wraps of about 1.2 KB each.
 	maxLocalHeader = 4 << 20
 
 	// maxEmailLen is the longest email address (RFC 5321).
@@ -96,7 +95,7 @@ var localDecMode = func() cbor.DecMode {
 		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
 		IndefLength:       cbor.IndefLengthForbidden,
 		MaxNestedLevels:   4,
-		MaxArrayElements:  crypto.MaxRecipients,
+		MaxArrayElements:  protocol.MaxRecipients,
 		MaxMapPairs:       16,
 		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
 	}.DecMode()
@@ -140,11 +139,11 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 
 	// The sender's email goes in the file, so the recipient's client can
 	// check the signing key against the keys that account registered.
-	me, err := identity.WhoAmI(c.api)
+	me, err := c.senderAccount(opt)
 	if err != nil {
-		return nil, fmt.Errorf("fetch actor info: %w", err)
+		return nil, err
 	}
-	kp, senderFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	kp, senderFP, err := c.loadIdentity(opt.Identity, opt.unlock())
 	if err != nil {
 		return nil, fmt.Errorf("load sender identity: %w", err)
 	}
@@ -167,7 +166,7 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 		}
 		logRecipientKeys(log, email, "", keys.Fingerprint, self, first)
 	}
-	algo, err := chooseCompression(p, opt.Compress, log)
+	algo, err := chooseCompression(p, compress.Algorithm(opt.Compress), log)
 	if err != nil {
 		return nil, err
 	}
@@ -190,8 +189,9 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 	if _, err := f.Write(head); err != nil {
 		return nil, fmt.Errorf("write %s: %w", out, err)
 	}
+	opt.phase(PhaseEncrypting)
 	tEnc := time.Now()
-	sealed, written, err := sealPlaintext(c.api.Context(), f, p, algo, kp, pubs, crypto.SealParams{
+	sealed, written, err := sealPlaintext(c.api.Context(), f, p, algo, kp, pubs, protocol.SealParams{
 		RevisionID:  uuid.New().String(),
 		SecretName:  secretName(opt),
 		PayloadType: p.payloadType,
@@ -277,13 +277,14 @@ func (c *Client) encryptToFile(recipients []string, p *plaintext, opt EncryptOpt
 // WriteFiles, which check the payload's digest before any plaintext.
 // OnDownloadProgress reports the copy. Revision and the download options
 // do not apply.
-func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, error) {
+func (c *Client) OpenLocalFile(ctx context.Context, path string, opt DecryptOptions) (*OpenedSecret, error) {
+	c = c.with(ctx)
 	log := api.Logger(opt.Logger)
 	f, err := os.Open(path) // #nosec G304 -- the local file the caller asked to open; its contents are checked as untrusted.
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -299,17 +300,17 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	// does not cover: they are checked below.
 	api.Module(log, "decrypt").Debug("local file read", "file", path, "sender", hdr.SenderEmail, "wraps", len(hdr.Wraps), "payload_size", api.Bytes(payloadSize))
 
-	kp, localFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	kp, localFP, err := c.loadIdentity(opt.Identity, opt.unlock())
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
 	}
 	logKeyPair(log, localFP, opt.Identity)
-	var wrap *crypto.Wrap
+	var wrap *protocol.Wrap
 	emails := make(map[string]string, len(hdr.Wraps))
 	for _, w := range hdr.Wraps {
 		emails[w.Fingerprint] = w.Email
 		if w.Fingerprint == localFP {
-			wrap = &crypto.Wrap{RecipientFingerprint: localFP, Enc: w.Enc, Ciphertext: w.Ct}
+			wrap = &protocol.Wrap{RecipientFingerprint: localFP, Enc: w.Enc, Ciphertext: w.Ct}
 		}
 	}
 	if wrap == nil {
@@ -319,7 +320,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	// The manifest is parsed here for the sender's fingerprint only; Open
 	// verifies it in full, with the Ed25519 key of the sender's registered
 	// key of that fingerprint.
-	peek, err := crypto.UnmarshalManifest(hdr.Manifest)
+	peek, err := protocol.UnmarshalManifest(hdr.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -328,14 +329,14 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if id, err := uuid.Parse(peek.RevisionID); err != nil || id.String() != peek.RevisionID {
 		return nil, fmt.Errorf("%s: malformed local file: the revision ID is not a UUID", path)
 	}
-	senderED25519, err := identity.ResolveED25519ByEmail(c.api, hdr.SenderEmail, peek.SenderFingerprint)
+	senderED25519, err := resolveED25519ByEmail(c.api, hdr.SenderEmail, peek.SenderFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
 	}
 	// A local file is opened by path, not by a name or id the server
 	// gives, so its manifest's own revision and name are the ones asked
 	// for. Result shows the signed name.
-	opened, err := crypto.Open(hdr.Manifest, wrap, kp, crypto.OpenParams{
+	opened, err := protocol.Open(hdr.Manifest, wrap, kp, protocol.OpenParams{
 		RevisionID:    peek.RevisionID,
 		SecretName:    peek.SecretName,
 		SenderED25519: senderED25519,
@@ -380,6 +381,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 	if opt.OnDownloadProgress != nil {
 		src = &copyProgress{r: src, total: payloadSize, onProgress: opt.OnDownloadProgress}
 	}
+	opt.phase(PhaseReading)
 	if n, err := io.Copy(sp, ctxReader{o.ctx, src}); err != nil || n != payloadSize {
 		_ = o.Close() // the read error is returned; the spool holds ciphertext only, in a private (0700) directory.
 		if err == nil {
@@ -399,7 +401,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 			checked++
 			if checked > maxCheckedLabels {
 				email = ""
-			} else if _, err := identity.ResolveED25519ByEmail(c.api, email, r.Fingerprint); err != nil {
+			} else if _, err := resolveED25519ByEmail(c.api, email, r.Fingerprint); err != nil {
 				// Not shown whatever the reason: the account does not own
 				// the key, or the lookup failed.
 				api.Module(log, "verify").Warn("recipient label not verified", "email", email, "fingerprint", r.Fingerprint, "error", err)
@@ -424,6 +426,7 @@ func (c *Client) OpenLocalFile(path string, opt DecryptOptions) (*OpenedSecret, 
 		CipherSuite:          m.CipherSuite,
 		PayloadDigest:        hex.EncodeToString(m.PayloadDigest),
 		EncryptedSize:        m.CiphertextSize,
+		PlaintextSize:        m.PlaintextSize,
 	}
 	return o, nil
 }
@@ -437,7 +440,7 @@ func LocalFileRecipients(path string) ([]Recipient, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -523,15 +526,16 @@ func (h *localHeader) validate() error {
 
 // plausibleEmail accepts what could be an email address and nothing that
 // could change the path it is looked up under or the terminal it is
-// printed to: only printable characters, no spaces, controls or
-// formatting marks.
+// printed to, or pass for another address: only printable ASCII, as the
+// server accepts, so no spaces, controls, formatting marks or lookalike
+// letters from other scripts.
 func plausibleEmail(s string) bool {
 	at := strings.LastIndexByte(s, '@')
-	if len(s) > maxEmailLen || at < 1 || at == len(s)-1 || !utf8.ValidString(s) {
+	if len(s) > maxEmailLen || at < 1 || at == len(s)-1 {
 		return false
 	}
-	for _, r := range s {
-		if r == ' ' || !unicode.IsPrint(r) || strings.ContainsRune("/\\?#%", r) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c <= ' ' || c > '~' || strings.IndexByte("/\\?#%", c) >= 0 {
 			return false
 		}
 	}

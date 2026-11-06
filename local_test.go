@@ -5,6 +5,7 @@ package sdk
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"os"
 	"path/filepath"
@@ -13,13 +14,13 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/sdk/internal/protocol"
 )
 
 // openLocal opens path as email and decrypts it in memory.
 func (f *fakeAPI) openLocal(email, path string) (*DecryptResult, error) {
 	f.t.Helper()
-	o, err := f.client(email).OpenLocalFile(path, DecryptOptions{})
+	o, err := f.client(email).OpenLocalFile(context.Background(), path, DecryptOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +39,7 @@ func TestLocalFileRoundTrip(t *testing.T) {
 	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
 	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
 
-	res, err := f.client(alice.email).EncryptText([]string{bob.email, carol.email}, "offline hello", EncryptOptions{Name: "note", LocalFile: path})
+	res, err := f.client(alice.email).EncryptText(context.Background(), []string{bob.email, carol.email}, "offline hello", EncryptOptions{Name: "note", LocalFile: path})
 	if err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
@@ -111,11 +112,11 @@ func TestLocalFileWithLargeFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "disk"+LocalFileExt)
-	if _, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, filepath.Join(src, "disk.img"), EncryptOptions{LocalFile: path}); err != nil {
+	if _, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{filepath.Join(src, "disk.img")}, EncryptOptions{LocalFile: path}); err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
 
-	o, err := f.client("bob@example.com").OpenLocalFile(path, DecryptOptions{TempDir: t.TempDir()})
+	o, err := f.client("bob@example.com").OpenLocalFile(context.Background(), path, DecryptOptions{TempDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -138,20 +139,20 @@ func TestLocalFileOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "a"+LocalFileExt)
 	c := f.client("alice@example.com")
-	if _, err := c.EncryptText([]string{"bob@example.com"}, "one", EncryptOptions{LocalFile: path}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{"bob@example.com"}, "one", EncryptOptions{LocalFile: path}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.EncryptText([]string{"bob@example.com"}, "two", EncryptOptions{LocalFile: path}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, err := c.EncryptText(context.Background(), []string{"bob@example.com"}, "two", EncryptOptions{LocalFile: path}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second write over the file: %v", err)
 	}
-	if _, err := c.EncryptText([]string{"bob@example.com"}, "two", EncryptOptions{LocalFile: path, LocalOverwrite: true}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{"bob@example.com"}, "two", EncryptOptions{LocalFile: path, LocalOverwrite: true}); err != nil {
 		t.Fatalf("overwrite: %v", err)
 	}
 	if out, err := f.openLocal("bob@example.com", path); err != nil || out.Decrypted.Message != "two" {
 		t.Fatalf("after overwrite: %+v, %v", out, err)
 	}
 	// A failed send leaves nothing behind.
-	if _, err := c.EncryptText([]string{"nobody@example.com"}, "x", EncryptOptions{LocalFile: filepath.Join(dir, "b"+LocalFileExt)}); err == nil {
+	if _, err := c.EncryptText(context.Background(), []string{"nobody@example.com"}, "x", EncryptOptions{LocalFile: filepath.Join(dir, "b"+LocalFileExt)}); err == nil {
 		t.Fatal("a send to an unknown recipient succeeded")
 	}
 	entries, _ := os.ReadDir(dir)
@@ -186,7 +187,7 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "mallory@example.com")
 	dir := t.TempDir()
 	orig := filepath.Join(dir, "orig"+LocalFileExt)
-	if _, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, "the real one", EncryptOptions{LocalFile: orig}); err != nil {
+	if _, err := f.client("alice@example.com").EncryptText(context.Background(), []string{"bob@example.com"}, "the real one", EncryptOptions{LocalFile: orig}); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(orig)
@@ -225,7 +226,7 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	// it a path; it is checked before the signature.
 	pathID := variant("path-id", clone())
 	rewriteHeader(t, pathID, func(h *localHeader) {
-		m, err := crypto.UnmarshalManifest(h.Manifest)
+		m, err := protocol.UnmarshalManifest(h.Manifest)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,10 +253,11 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 }
 
 // Emails from a file are looked up and printed, so they may not hold path
-// characters, controls (C0 or C1, such as an ANSI escape) or formatting
-// marks such as a right-to-left override.
+// characters, controls (C0 or C1, such as an ANSI escape), formatting marks
+// such as a right-to-left override, or letters from other scripts that
+// pass for another address.
 func TestPlausibleEmail(t *testing.T) {
-	for _, s := range []string{"alice@example.com", "o'brien+x@example.co.uk", "ünï@exämple.com"} {
+	for _, s := range []string{"alice@example.com", "o'brien+x@example.co.uk"} {
 		if !plausibleEmail(s) {
 			t.Errorf("%q refused", s)
 		}
@@ -264,6 +266,7 @@ func TestPlausibleEmail(t *testing.T) {
 		"", "alice", "@example.com", "alice@", "a b@example.com", "a/b@example.com", "../x@y",
 		"a\x1b[31m@example.com", "a\u009b31m@example.com", "a\u202e@example.com", "a\x00@example.com",
 		"bad\xff@example.com", strings.Repeat("a", 250) + "@example.com",
+		"ünï@exämple.com", "\u0430lice@example.com", "a\u00a0b@example.com",
 	} {
 		if plausibleEmail(s) {
 			t.Errorf("%q accepted", s)

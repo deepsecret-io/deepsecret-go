@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/secrets"
+	"github.com/deepsecret-io/sdk/internal/transport"
 )
 
 // ── Resumable sends ─────────────────────────────────────────────────────────
@@ -147,7 +148,7 @@ func pruneAbandoned(dir, except string) {
 
 // startUpload records a multipart upload about to start, when its spool
 // can resume. The record is what ResumeUpload and ListPendingUploads read.
-func (c *Client) startUpload(sp *spool, secret *secrets.Secret, revisionID string, size int64) (*PendingUpload, error) {
+func (c *Client) startUpload(sp *spool, secret *Secret, revisionID string, size int64) (*PendingUpload, error) {
 	if sp.resume != "upload" {
 		return nil, nil
 	}
@@ -178,7 +179,7 @@ func uploadFailed(sp *spool, p *PendingUpload, err error) error {
 // resumable reports whether an upload that failed with err can resume:
 // not when the server refuses access or has dropped the upload.
 func resumable(err error) bool {
-	var apiErr *api.APIError
+	var apiErr *api.Error
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
 		case http.StatusForbidden, http.StatusNotFound, http.StatusGone:
@@ -269,7 +270,8 @@ func ListPendingUploads(dir string) ([]PendingUpload, error) {
 // parts storage holds stay and the rest are sent; on success the folder is
 // removed. A failure that can resume again returns an
 // UploadInterruptedError.
-func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*PendingUpload, error) {
+func (c *Client) ResumeUpload(ctx context.Context, dir, revisionID string, opt ResumeOptions) (*PendingUpload, error) {
+	c = c.with(ctx)
 	pdir, err := pendingDir(dir, revisionID, "upload folder")
 	if err != nil {
 		return nil, err
@@ -288,15 +290,15 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 	if err != nil {
 		return nil, fmt.Errorf("open upload file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if info, err := f.Stat(); err != nil || info.Size() != p.Size {
 		return nil, fmt.Errorf("upload file of %s is not %d bytes; discard it and send again", revisionID, p.Size)
 	}
-	err = c.api.MultipartUploadOpts(revisionID, f, p.Size, api.MultipartUploadOptions{
+	err = c.api.MultipartUploadOpts(revisionID, f, p.Size, transport.MultipartUploadOptions{
 		Threads:    opt.UploadThreads,
 		OnProgress: opt.OnUploadProgress,
 		Logger:     opt.Logger,
-		Status:     opt.UploadStatus,
+		Status:     opt.UploadStatus.transport(),
 	})
 	if err != nil {
 		if !resumable(err) {
@@ -316,7 +318,8 @@ func (c *Client) ResumeUpload(dir, revisionID string, opt ResumeOptions) (*Pendi
 // DiscardPendingUpload aborts the pending upload of revisionID on the
 // server, which frees what it stored, and removes its folder from dir. An
 // upload the server already dropped or finished is removed all the same.
-func (c *Client) DiscardPendingUpload(dir, revisionID string) error {
+func (c *Client) DiscardPendingUpload(ctx context.Context, dir, revisionID string) error {
+	c = c.with(ctx)
 	pdir, err := pendingDir(dir, revisionID, "upload folder")
 	if err != nil {
 		return err
@@ -325,7 +328,7 @@ func (c *Client) DiscardPendingUpload(dir, revisionID string) error {
 		return fmt.Errorf("no pending upload %s", revisionID)
 	}
 	if err := c.api.MultipartAbort(revisionID); err != nil {
-		var apiErr *api.APIError
+		var apiErr *api.Error
 		if !errors.As(err, &apiErr) || (apiErr.StatusCode != http.StatusNotFound && apiErr.StatusCode != http.StatusConflict && apiErr.StatusCode != http.StatusGone) {
 			return err
 		}

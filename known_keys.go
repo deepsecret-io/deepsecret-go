@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 
 	"github.com/deepsecret-io/sdk/api"
 	"github.com/deepsecret-io/sdk/crypto"
-	"github.com/deepsecret-io/sdk/identity"
+	"github.com/deepsecret-io/sdk/internal/protocol"
 )
 
 // ── Known keys: trust on first use ──────────────────────────────────────────
@@ -36,8 +37,13 @@ import (
 // this device pass for them. One is recorded when a key is registered for
 // it, or by this device's first send on the server; a later send adds only
 // the key it used to an account already recorded. An account the server
-// claims for the caller that this device knows as someone else is refused,
-// never recorded.
+// claims for the caller that this device knows as someone else, by a key
+// that is not on this device or is recorded for another of the user's
+// accounts, is refused, never recorded; so is recording, for one of them, a
+// key recorded for another. One known only by other key pairs on
+// this device, as when another of the user's accounts sent to it before
+// this device knew it was theirs, is taken as the user's own: it is
+// recorded, those keys with it (recordOwnAccount says what that trusts).
 
 // knownKeysVersion is the version of the known keys file. Files with any
 // other version are refused.
@@ -147,10 +153,6 @@ func (e *StaleRevisionError) Error() string {
 		e.RevisionID, e.SignedAt.UTC().Format(time.RFC3339), e.SecretName, e.SenderEmail, e.NewestSeen.UTC().Format(time.RFC3339))
 }
 
-// SetKnownKeysFile makes c keep known keys in path instead of
-// DefaultKnownKeysFile.
-func (c *Client) SetKnownKeysFile(path string) { c.knownKeysFile = path }
-
 // KnownKeys returns the keys this device accepted for email on c's server,
 // or for everyone when email is empty, sorted by email, with the keys it
 // used with the user's own accounts.
@@ -184,15 +186,15 @@ func (c *Client) KnownKeys(email string) ([]KnownKey, error) {
 // secrets they signed. It must be a full fingerprint of a key the server
 // lists for email, with valid self-signatures, and email must not be one of
 // the user's own accounts.
-func (c *Client) AcceptKey(email, fingerprint string) error {
-	return c.trustKey(email, fingerprint, KeyAccepted)
+func (c *Client) AcceptKey(ctx context.Context, email, fingerprint string) error {
+	return c.with(ctx).trustKey(email, fingerprint, KeyAccepted)
 }
 
 // VerifyKey records that the user compared fingerprint, one of email's
 // keys, with them. It accepts it as AcceptKey does, replacing their other
 // keys, and has the same requirements.
-func (c *Client) VerifyKey(email, fingerprint string) error {
-	return c.trustKey(email, fingerprint, KeyVerified)
+func (c *Client) VerifyKey(ctx context.Context, email, fingerprint string) error {
+	return c.with(ctx).trustKey(email, fingerprint, KeyVerified)
 }
 
 // ForgetKey removes fingerprint from the keys this device accepted for
@@ -236,7 +238,7 @@ func (c *Client) trustKey(email, fingerprint string, state KeyState) error {
 	if !fullFingerprint(fingerprint) {
 		return errFullFingerprint
 	}
-	if _, err := identity.ResolveED25519ByEmail(c.api, email, fingerprint); err != nil {
+	if _, err := resolveED25519ByEmail(c.api, email, fingerprint); err != nil {
 		return err
 	}
 	server := c.knownServer()
@@ -278,12 +280,25 @@ func (c *Client) trustKey(email, fingerprint string, state KeyState) error {
 // returns the people this device knows on the server. Once recorded, only
 // key pairs on this device pass for email, whatever the server says later.
 //
-// An email this device knows as someone else (any key accepted for them)
-// is refused: the server is claiming the caller is them. Otherwise email is
-// recorded when registering (a key is being registered for it), when it is
-// already recorded (fp is added), or when it is the first account recorded
-// on the server. A send on a device with other accounts recorded leaves a
-// new one unrecorded: the server's claim alone does not make it the user's.
+// A key belongs to one account: fp is never recorded for email while it is
+// recorded for another of the user's accounts, whose key the server would
+// be passing off as email's; that is refused. An email this device knows
+// as someone else is refused too: the server is claiming the caller is
+// them. Someone else's is a key accepted for email that is not a key pair
+// on this device, or that is recorded for another of the user's accounts.
+// Any other key pair on this device accepted for email, as when another of
+// the user's accounts sent to this one before this device knew it was
+// theirs, is taken as the user's own and recorded as such with email. That
+// trusts how the key was first used: a server that listed such a key for a
+// contact on first contact, and now says the caller is them, gets them
+// recorded as the user's own, so sends to them refuse their real key until
+// the user forgets it. The same server could instead have listed a key of
+// its own for them on that first contact and read what was sent to them,
+// the trade-off trust on first use accepts. Otherwise email is recorded
+// when registering (a key is being registered for it), when it is already
+// recorded (fp is added), or when it is the first account recorded on the
+// server. A send on a device with other accounts recorded leaves a new one
+// unrecorded: the server's claim alone does not make it the user's.
 func (c *Client) recordOwnAccount(email, fp string, registering bool) (map[string][]knownKeyDisk, error) {
 	email = strings.ToLower(email)
 	if !plausibleEmail(email) {
@@ -295,24 +310,60 @@ func (c *Client) recordOwnAccount(email, fp string, registering bool) (map[strin
 	err := c.knownKeys().update(func(d *knownKeysDisk) bool {
 		people = d.peopleOn(server)
 		keys := people[email]
-		if i := slices.IndexFunc(keys, func(k knownKeyDisk) bool { return k.State != KeyOwn }); i >= 0 {
-			refused = fmt.Errorf("the server says you are %s, but this device knows %s as someone else (key %s): refusing to continue (possible impersonation by the server)",
-				email, email, crypto.ShortFingerprint(keys[i].Fingerprint))
+		for _, k := range keys {
+			why := ""
+			switch other := ownerOf(people, k.Fingerprint, email); {
+			case k.State == KeyOwn:
+				continue
+			case other != "":
+				why = "your account " + other + "'s key"
+			case !c.isLocalKey(k.Fingerprint):
+				why = "which is not on this device"
+			default:
+				continue
+			}
+			refused = fmt.Errorf("the server says you are %s, but this device knows %s as someone else (key %s, %s): refusing to continue (possible impersonation by the server; if %s is your own account, forget that key first)",
+				email, email, crypto.ShortFingerprint(k.Fingerprint), why, email)
 			return false
 		}
-		switch {
-		case slices.ContainsFunc(keys, func(k knownKeyDisk) bool { return k.Fingerprint == fp }):
-			return false
-		case !registering && len(keys) == 0 && hasOwnAccount(people):
+		add := !slices.ContainsFunc(keys, func(k knownKeyDisk) bool { return k.Fingerprint == fp }) &&
+			(registering || len(keys) > 0 || !hasOwnAccount(people))
+		if other := ownerOf(people, fp, email); add && other != "" {
+			refused = fmt.Errorf("the server says you are %s, but the key used here, %s, is your account %s's key: refusing to continue (possible impersonation by the server)",
+				email, crypto.ShortFingerprint(fp), other)
 			return false
 		}
-		people[email] = append(keys, knownKeyDisk{Fingerprint: fp, State: KeyOwn, FirstSeen: time.Now().UTC()})
-		return true
+		changed := add
+		for i, k := range keys {
+			if k.State != KeyOwn {
+				keys[i] = knownKeyDisk{Fingerprint: k.Fingerprint, State: KeyOwn, FirstSeen: k.FirstSeen}
+				changed = true
+			}
+		}
+		if add {
+			keys = append(keys, knownKeyDisk{Fingerprint: fp, State: KeyOwn, FirstSeen: time.Now().UTC()})
+		}
+		if changed {
+			people[email] = keys
+		}
+		return changed
 	})
 	if err == nil {
 		err = refused
 	}
 	return people, err
+}
+
+// ownerOf returns the user's own account, other than email, that fp is
+// recorded for in people, or "". A key belongs to one account: the server
+// listing it for another is lying.
+func ownerOf(people map[string][]knownKeyDisk, fp, email string) string {
+	for e, keys := range people {
+		if e != email && slices.ContainsFunc(keys, func(k knownKeyDisk) bool { return k.State == KeyOwn && k.Fingerprint == fp }) {
+			return e
+		}
+	}
+	return ""
 }
 
 // hasOwnAccount reports whether any of people is one of the user's own
@@ -361,11 +412,11 @@ func (c *Client) recordFirstUse(people []Recipient, sender bool) error {
 
 // checkSenderKey checks fp, the key whose signatures on a secret from email
 // just verified, and logs why it is trusted. A key on this device is the
-// user's own and passes, unless this device knows email as someone else:
-// the server names the sender, so a local key must not make the user's own
-// secret pass as theirs. Anyone else's key must pass checkKey. It changes
-// nothing: a key new to this device is reported as first, for
-// recordFirstUse once the decrypt succeeds.
+// user's own and passes only for one of the user's own accounts recorded
+// here: the server names the sender, so a local key must not make the
+// user's own secret pass as someone else's, known or new. Anyone else's key
+// must pass checkKey. It changes nothing: a key new to this device is
+// reported as first, for recordFirstUse once the decrypt succeeds.
 func (c *Client) checkSenderKey(email, fp string, log *slog.Logger) (bool, error) {
 	verified := func(own, first bool) {
 		api.Module(log, "verify").Debug("sender key verified", "email", email, "fingerprint", fp, "trust", keyTrust(own, first))
@@ -376,8 +427,14 @@ func (c *Client) checkSenderKey(email, fp string, log *slog.Logger) (bool, error
 	}
 	people := disk.Servers[c.knownServer()]
 	lower := strings.ToLower(email)
-	if isLocalKey(fp) {
-		if keys := people[lower]; len(keys) > 0 && !ownAccount(keys) {
+	if c.isLocalKey(fp) {
+		keys := people[lower]
+		switch {
+		case ownAccount(keys):
+		case len(keys) == 0:
+			return false, fmt.Errorf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sync your identity for it first)",
+				crypto.ShortFingerprint(fp), email, email)
+		default:
 			if err := keyCheck(lower, fp, true, keys); err != nil {
 				return false, err
 			}
@@ -395,7 +452,7 @@ func (c *Client) checkSenderKey(email, fp string, log *slog.Logger) (bool, error
 // checkNewest refuses m, the revision the server gives as its secret's
 // latest, when this device already opened a revision of the same secret
 // from email that was signed later.
-func (c *Client) checkNewest(email string, m *crypto.Manifest) error {
+func (c *Client) checkNewest(email string, m *protocol.Manifest) error {
 	disk, err := c.knownKeys().read()
 	if err != nil {
 		return err
@@ -410,7 +467,7 @@ func (c *Client) checkNewest(email string, m *crypto.Manifest) error {
 
 // newestRecorder records m's signing time as the newest of its secret from
 // email, once a decrypt of it succeeded. It never lowers a recorded time.
-func (c *Client) newestRecorder(email string, m *crypto.Manifest) func() error {
+func (c *Client) newestRecorder(email string, m *protocol.Manifest) func() error {
 	server, sender, name, signed := c.knownServer(), strings.ToLower(email), m.SecretName, m.Timestamp
 	return func() error {
 		return c.knownKeys().update(func(d *knownKeysDisk) bool {
@@ -483,10 +540,10 @@ func ownAccount(keys []knownKeyDisk) bool {
 	return slices.ContainsFunc(keys, func(k knownKeyDisk) bool { return k.State == KeyOwn })
 }
 
-// isLocalKey reports whether fp is a key pair stored on this device: the
-// user's own.
-func isLocalKey(fp string) bool {
-	_, err := crypto.LoadPublicKeys(fp)
+// isLocalKey reports whether fp is a key pair stored on this device, in
+// c's key pair directory: the user's own.
+func (c *Client) isLocalKey(fp string) bool {
+	_, err := crypto.LoadPublicKeysFrom(c.keys(), fp)
 	return err == nil
 }
 
@@ -498,7 +555,7 @@ func (c *Client) knownKeys() knownKeysFile {
 	if c.knownKeysFile != "" {
 		return knownKeysFile(c.knownKeysFile)
 	}
-	return knownKeysFile(DefaultKnownKeysFile())
+	return knownKeysFile(filepath.Join(filepath.Dir(c.keys()), "known_keys.json"))
 }
 
 var errFullFingerprint = errors.New("a full key fingerprint is 64 hex characters")

@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// The safety number vectors (sdk/PROTOCOL_V4.md §11), reproduced
+// The safety number vectors (PROTOCOL_V4.md §11), reproduced
 // independently in Python with hashlib. Every client computes the same
 // digits from the same fingerprint.
 var safetyNumberVectors = []struct{ fingerprint, number string }{

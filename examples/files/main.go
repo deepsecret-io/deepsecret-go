@@ -6,12 +6,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 
 	"github.com/deepsecret-io/sdk"
-	"github.com/deepsecret-io/sdk/compress"
 )
 
 func main() {
@@ -31,7 +31,7 @@ func main() {
 		log.Fatal("new client: ", err)
 	}
 
-	me, err := client.WhoAmI()
+	me, err := client.WhoAmI(context.Background())
 	if err != nil {
 		log.Fatal("whoami: ", err)
 	}
@@ -40,7 +40,7 @@ func main() {
 	var cleanupIDs []string
 
 	// ── Single file ──
-	fileSecret, err := client.EncryptFile(recipients, "./sdk/examples/files/main.go", sdk.EncryptOptions{
+	fileSecret, err := client.EncryptPaths(context.Background(), recipients, []string{"./sdk/examples/files/main.go"}, sdk.EncryptOptions{
 		Name: "sdk-file-example",
 	})
 	if err != nil {
@@ -49,23 +49,23 @@ func main() {
 	cleanupIDs = append(cleanupIDs, fileSecret.Secret.ID)
 	fmt.Printf("Encrypted file → %s (name=%s)\n", fileSecret.Secret.ID, fileSecret.Secret.Name)
 
-	fileResult, err := client.DecryptSecret(fileSecret.Secret.ID)
+	fileResult, err := client.DecryptSecret(context.Background(), fileSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt file: ", err)
 	}
-	fmt.Printf("Decrypted: %d files\n", len(fileResult.Files))
-	for _, f := range fileResult.Files {
+	fmt.Printf("Decrypted: %d files\n", len(fileResult.Decrypted.Files))
+	for _, f := range fileResult.Decrypted.Files {
 		fmt.Printf("  %s (%d bytes, sha256=%s…)\n", f.Name, len(f.Data), f.SHA256[:16])
 	}
 	fmt.Println()
 
 	// ── Multiple files ──
-	multiSecret, err := client.EncryptFiles(recipients, []string{
+	multiSecret, err := client.EncryptPaths(context.Background(), recipients, []string{
 		"./sdk/examples/files/main.go",
 		"./sdk/examples/basic/main.go",
 	}, sdk.EncryptOptions{
 		Name:     "sdk-multi-files",
-		Compress: compress.Zstd,
+		Compress: sdk.CompressZstd,
 	})
 	if err != nil {
 		log.Fatal("encrypt files: ", err)
@@ -73,17 +73,17 @@ func main() {
 	cleanupIDs = append(cleanupIDs, multiSecret.Secret.ID)
 	fmt.Printf("Encrypted %d files → %s\n", 2, multiSecret.Secret.ID)
 
-	multiResult, err := client.DecryptSecret(multiSecret.Secret.ID)
+	multiResult, err := client.DecryptSecret(context.Background(), multiSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt files: ", err)
 	}
-	for _, f := range multiResult.Files {
+	for _, f := range multiResult.Decrypted.Files {
 		fmt.Printf("  %s (%d bytes)\n", f.Name, len(f.Data))
 	}
 	fmt.Println()
 
 	// ── Directory (individual files) ──
-	dirSecret, err := client.EncryptDir(recipients, "./sdk/examples", sdk.EncryptOptions{
+	dirSecret, err := client.EncryptPaths(context.Background(), recipients, []string{"./sdk/examples"}, sdk.EncryptOptions{
 		Name:       "sdk-dir-example",
 		SkipHidden: true,
 	})
@@ -93,21 +93,21 @@ func main() {
 	cleanupIDs = append(cleanupIDs, dirSecret.Secret.ID)
 	fmt.Printf("Encrypted directory → %s\n", dirSecret.Secret.ID)
 
-	dirResult, err := client.DecryptSecret(dirSecret.Secret.ID)
+	dirResult, err := client.DecryptSecret(context.Background(), dirSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt dir: ", err)
 	}
-	fmt.Printf("Decrypted: %d files\n", len(dirResult.Files))
-	for _, f := range dirResult.Files {
+	fmt.Printf("Decrypted: %d files\n", len(dirResult.Decrypted.Files))
+	for _, f := range dirResult.Decrypted.Files {
 		fmt.Printf("  %s (%d bytes)\n", f.Name, len(f.Data))
 	}
 	fmt.Println()
 
 	// ── Directory as archive (privacy mode with zstd) ──
-	archiveSecret, err := client.EncryptDir(recipients, "./sdk/examples", sdk.EncryptOptions{
+	archiveSecret, err := client.EncryptPaths(context.Background(), recipients, []string{"./sdk/examples"}, sdk.EncryptOptions{
 		Name:       "sdk-archive-zstd",
 		Archive:    true,
-		Compress:   compress.Zstd,
+		Compress:   sdk.CompressZstd,
 		SkipHidden: true,
 	})
 	if err != nil {
@@ -116,16 +116,16 @@ func main() {
 	cleanupIDs = append(cleanupIDs, archiveSecret.Secret.ID)
 	fmt.Printf("Encrypted archive (zstd) → %s\n", archiveSecret.Secret.ID)
 
-	archiveResult, err := client.DecryptSecret(archiveSecret.Secret.ID)
+	archiveResult, err := client.DecryptSecret(context.Background(), archiveSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt archive: ", err)
 	}
-	fmt.Printf("Decrypted: %d file(s), archive name: %s\n", len(archiveResult.Files), archiveResult.Files[0].Name)
-	fmt.Printf("  Archive size: %d bytes\n", len(archiveResult.Files[0].Data))
+	fmt.Printf("Decrypted: %d file(s), archive name: %s\n", len(archiveResult.Decrypted.Files), archiveResult.Decrypted.Files[0].Name)
+	fmt.Printf("  Archive size: %d bytes\n", len(archiveResult.Decrypted.Files[0].Data))
 	fmt.Println()
 
 	// ── Mixed paths ──
-	mixedSecret, err := client.EncryptPaths(recipients, []string{
+	mixedSecret, err := client.EncryptPaths(context.Background(), recipients, []string{
 		"./sdk/examples/basic",
 		"./sdk/examples/files/main.go",
 	}, sdk.EncryptOptions{
@@ -138,17 +138,17 @@ func main() {
 	cleanupIDs = append(cleanupIDs, mixedSecret.Secret.ID)
 	fmt.Printf("Encrypted mixed paths → %s\n", mixedSecret.Secret.ID)
 
-	mixedResult, err := client.DecryptSecret(mixedSecret.Secret.ID)
+	mixedResult, err := client.DecryptSecret(context.Background(), mixedSecret.Secret.ID, sdk.DecryptOptions{})
 	if err != nil {
 		log.Fatal("decrypt paths: ", err)
 	}
-	fmt.Printf("Decrypted: %d files\n", len(mixedResult.Files))
-	for _, f := range mixedResult.Files {
+	fmt.Printf("Decrypted: %d files\n", len(mixedResult.Decrypted.Files))
+	for _, f := range mixedResult.Decrypted.Files {
 		fmt.Printf("  %s (%d bytes)\n", f.Name, len(f.Data))
 	}
 
 	// ── Cleanup ──
-	if err := client.DeleteSecrets(cleanupIDs); err != nil {
+	if err := client.DeleteSecrets(context.Background(), cleanupIDs); err != nil {
 		log.Fatal("delete: ", err)
 	}
 	fmt.Printf("\nCleaned up %d example secrets.\n", len(cleanupIDs))

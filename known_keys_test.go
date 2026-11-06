@@ -5,6 +5,7 @@ package sdk
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -20,11 +21,10 @@ import (
 	"github.com/deepsecret-io/sdk/crypto"
 )
 
-// forgetLocalKey removes a's key pair from this device, so it is someone
-// else's key here: the fake keeps every actor's keys in one directory.
+// forgetLocalKey removes a's key pair from their device.
 func forgetLocalKey(t *testing.T, a *fakeActor) {
 	t.Helper()
-	if err := os.Remove(filepath.Join(crypto.DefaultKeysDir(), a.fp+".json")); err != nil {
+	if err := os.Remove(filepath.Join(a.keys, a.fp+".json")); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -38,7 +38,7 @@ func rotate(t *testing.T, a *fakeActor) {
 		t.Fatal(err)
 	}
 	fp, _ := crypto.Fingerprint(kp)
-	if err := crypto.SaveKeyPair(fp, kp, ""); err != nil {
+	if err := crypto.SaveKeyPairTo(a.keys, fp, kp, ""); err != nil {
 		t.Fatal(err)
 	}
 	a.old = append(a.old, a.kp)
@@ -74,13 +74,14 @@ func knownKeys(t *testing.T, c *Client, email string) map[string]KnownKey {
 func TestFirstSendAcceptsRecipientKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
-	// The default file, under the user's home.
+	// The default file, under the user's home, alice's device.
+	t.Setenv("HOME", filepath.Dir(filepath.Dir(alice.keys)))
 	c, err := NewClient(f.srv.URL, alice.email)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := c.EncryptText([]string{alice.email, bob.email}, "hello", EncryptOptions{Name: "n"})
+	res, err := c.EncryptText(context.Background(), []string{alice.email, bob.email}, "hello", EncryptOptions{Name: "n"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +98,7 @@ func TestFirstSendAcceptsRecipientKey(t *testing.T) {
 		t.Fatalf("known keys file: %v, %v", info, err)
 	}
 
-	res, err = c.EncryptText([]string{bob.email}, "again", EncryptOptions{Name: "n2"})
+	res, err = c.EncryptText(context.Background(), []string{bob.email}, "again", EncryptOptions{Name: "n2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +114,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
 	c := f.client(alice.email)
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
 	}
 	creates := f.creates
@@ -121,7 +122,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	old := bob.fp
 	rotate(t, bob)
 	got := bob.fp
-	_, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"})
+	_, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"})
 	var changed *KeyChangedError
 	if !errors.As(err, &changed) {
 		t.Fatalf("send: %v, want a KeyChangedError", err)
@@ -130,7 +131,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 		t.Fatalf("error %+v", changed)
 	}
 	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{LocalFile: path}); !errors.As(err, &changed) {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{LocalFile: path}); !errors.As(err, &changed) {
 		t.Fatalf("local send: %v, want a KeyChangedError", err)
 	}
 	if f.creates != creates {
@@ -142,17 +143,17 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	other, _ := crypto.GenerateKeyPair()
 	otherFP, _ := crypto.Fingerprint(other)
 	for _, fp := range []string{got[:16], "", otherFP, got + "0", strings.Repeat("z", 64)} {
-		if err := c.AcceptKey(bob.email, fp); err == nil {
+		if err := c.AcceptKey(context.Background(), bob.email, fp); err == nil {
 			t.Errorf("accepted %q", fp)
 		}
 	}
-	if err := c.AcceptKey("not an email", got); err == nil {
+	if err := c.AcceptKey(context.Background(), "not an email", got); err == nil {
 		t.Error("accepted a key for a malformed email")
 	}
-	if err := c.AcceptKey(strings.ToUpper(bob.email), strings.ToUpper(got)); err != nil {
+	if err := c.AcceptKey(context.Background(), strings.ToUpper(bob.email), strings.ToUpper(got)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatalf("send after accepting: %v", err)
 	}
 	known := knownKeys(t, c, bob.email)
@@ -161,10 +162,10 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	}
 
 	// Verifying raises a key's state; accepting never lowers it.
-	if err := c.VerifyKey(bob.email, got); err != nil {
+	if err := c.VerifyKey(context.Background(), bob.email, got); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.AcceptKey(bob.email, got); err != nil {
+	if err := c.AcceptKey(context.Background(), bob.email, got); err != nil {
 		t.Fatal(err)
 	}
 	if known := knownKeys(t, c, bob.email); known[got].State != KeyVerified {
@@ -172,7 +173,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	}
 
 	// Your own account takes no accepted key.
-	if err := c.AcceptKey(alice.email, alice.fp); err == nil || !strings.Contains(err.Error(), "your own account") {
+	if err := c.AcceptKey(context.Background(), alice.email, alice.fp); err == nil || !strings.Contains(err.Error(), "your own account") {
 		t.Fatalf("accepting a key for your own account: %v", err)
 	}
 
@@ -183,7 +184,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	if n, err := c.ForgetKey(bob.email, ""); err != nil || n != 2 {
 		t.Fatalf("forget: %d, %v", n, err)
 	}
-	res, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"})
+	res, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"})
 	if err != nil || len(res.FirstUse) != 1 {
 		t.Fatalf("send after forgetting: %+v, %v", res, err)
 	}
@@ -196,19 +197,19 @@ func TestAcceptReplacesOldKeys(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
 	c := f.client(alice.email)
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
 	}
 	first, firstFP := bob.kp, bob.fp
 	rotate(t, bob)
 	second, secondFP := bob.kp, bob.fp
-	if err := c.AcceptKey(bob.email, secondFP); err != nil {
+	if err := c.AcceptKey(context.Background(), bob.email, secondFP); err != nil {
 		t.Fatal(err)
 	}
 
 	setPrimary(bob, first)
 	creates := f.creates
-	_, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"})
+	_, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"})
 	var changed *KeyChangedError
 	if !errors.As(err, &changed) {
 		t.Fatalf("send to a replaced key: %v, want a KeyChangedError", err)
@@ -221,26 +222,26 @@ func TestAcceptReplacesOldKeys(t *testing.T) {
 	}
 
 	// Accepting it again makes it the key sends go to.
-	if err := c.AcceptKey(bob.email, firstFP); err != nil {
+	if err := c.AcceptKey(context.Background(), bob.email, firstFP); err != nil {
 		t.Fatal(err)
 	}
 	if known := knownKeys(t, c, bob.email); known[firstFP].Replaced || !known[secondFP].Replaced {
 		t.Fatalf("known keys %+v, want the first key current", known)
 	}
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatalf("send after accepting again: %v", err)
 	}
 
 	// So does verifying one.
 	setPrimary(bob, second)
-	if err := c.VerifyKey(bob.email, secondFP); err != nil {
+	if err := c.VerifyKey(context.Background(), bob.email, secondFP); err != nil {
 		t.Fatal(err)
 	}
 	known := knownKeys(t, c, bob.email)
 	if known[secondFP].State != KeyVerified || known[secondFP].Replaced || !known[firstFP].Replaced {
 		t.Fatalf("known keys %+v, want the second key verified and current", known)
 	}
-	if _, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatalf("send after verifying: %v", err)
 	}
 }
@@ -254,12 +255,12 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
 	send := func(text string) (string, string) {
 		t.Helper()
-		res, err := f.client(alice.email).EncryptText([]string{bob.email}, text, EncryptOptions{Name: text})
+		res, err := f.client(alice.email).EncryptText(context.Background(), []string{bob.email}, text, EncryptOptions{Name: text})
 		if err != nil {
 			t.Fatal(err)
 		}
 		path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
-		if _, err := f.client(alice.email).EncryptText([]string{bob.email}, text, EncryptOptions{LocalFile: path}); err != nil {
+		if _, err := f.client(alice.email).EncryptText(context.Background(), []string{bob.email}, text, EncryptOptions{LocalFile: path}); err != nil {
 			t.Fatal(err)
 		}
 		forgetLocalKey(t, alice)
@@ -268,14 +269,14 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 	cb := f.client(bob.email)
 
 	firstID, path := send("one")
-	res, err := cb.DecryptSecretFull(firstID, DecryptOptions{})
+	res, err := cb.DecryptSecret(context.Background(), firstID, DecryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.SenderFirstUse || res.SenderEmail != alice.email || res.SenderFingerprint != alice.fp {
 		t.Fatalf("first decrypt %+v", res)
 	}
-	if res, err = cb.DecryptSecretFull(firstID, DecryptOptions{}); err != nil || res.SenderFirstUse {
+	if res, err = cb.DecryptSecret(context.Background(), firstID, DecryptOptions{}); err != nil || res.SenderFirstUse {
 		t.Fatalf("second decrypt %+v, %v", res, err)
 	}
 	if res, err = f.openLocal(bob.email, path); err != nil || res.SenderFirstUse {
@@ -286,7 +287,7 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 	rotate(t, alice)
 	id, path := send("two")
 	var changed *KeyChangedError
-	if _, err := cb.DecryptSecretFull(id, DecryptOptions{}); !errors.As(err, &changed) {
+	if _, err := cb.DecryptSecret(context.Background(), id, DecryptOptions{}); !errors.As(err, &changed) {
 		t.Fatalf("decrypt: %v, want a KeyChangedError", err)
 	}
 	if changed.Email != alice.email || !changed.Sender || changed.Got != alice.fp || len(changed.Known) != 1 || changed.Known[0] != old {
@@ -296,10 +297,10 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 		t.Fatalf("local file: %v, want a KeyChangedError", err)
 	}
 
-	if err := cb.AcceptKey(alice.email, alice.fp); err != nil {
+	if err := cb.AcceptKey(context.Background(), alice.email, alice.fp); err != nil {
 		t.Fatal(err)
 	}
-	if res, err = cb.DecryptSecretFull(id, DecryptOptions{}); err != nil || res.SenderFirstUse {
+	if res, err = cb.DecryptSecret(context.Background(), id, DecryptOptions{}); err != nil || res.SenderFirstUse {
 		t.Fatalf("decrypt after accepting: %+v, %v", res, err)
 	}
 	if _, err = f.openLocal(bob.email, path); err != nil {
@@ -308,13 +309,13 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 
 	// The first secret is signed with the replaced key, which still checks
 	// it until bob forgets that key.
-	if _, err := cb.DecryptSecretFull(firstID, DecryptOptions{}); err != nil {
+	if _, err := cb.DecryptSecret(context.Background(), firstID, DecryptOptions{}); err != nil {
 		t.Fatalf("decrypt a secret signed with the replaced key: %v", err)
 	}
 	if n, err := cb.ForgetKey(alice.email, old); err != nil || n != 1 {
 		t.Fatalf("forget: %d, %v", n, err)
 	}
-	if _, err := cb.DecryptSecretFull(firstID, DecryptOptions{}); !errors.As(err, &changed) {
+	if _, err := cb.DecryptSecret(context.Background(), firstID, DecryptOptions{}); !errors.As(err, &changed) {
 		t.Fatalf("decrypt with the replaced key forgotten: %v, want a KeyChangedError", err)
 	}
 }
@@ -325,11 +326,11 @@ func TestDecryptOwnSecret(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	alice := f.actors["alice@example.com"]
 	c := f.client(alice.email)
-	res, err := c.EncryptText([]string{alice.email}, "for me", EncryptOptions{Name: "n"})
+	res, err := c.EncryptText(context.Background(), []string{alice.email}, "for me", EncryptOptions{Name: "n"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := c.DecryptSecretFull(res.Secret.ID, DecryptOptions{})
+	out, err := c.DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{})
 	if err != nil || out.SenderFirstUse {
 		t.Fatalf("decrypt %+v, %v", out, err)
 	}
@@ -346,20 +347,20 @@ func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "mallory@example.com")
 	alice, bob, mallory := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["mallory@example.com"]
 	cb := f.client(bob.email)
-	resA, err := f.client(alice.email).EncryptText([]string{bob.email}, "from alice", EncryptOptions{Name: "a"})
+	resA, err := f.client(alice.email).EncryptText(context.Background(), []string{bob.email}, "from alice", EncryptOptions{Name: "a"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	forgetLocalKey(t, alice)
-	if _, err := cb.DecryptSecretFull(resA.Secret.ID, DecryptOptions{}); err != nil {
+	if _, err := cb.DecryptSecret(context.Background(), resA.Secret.ID, DecryptOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	note, err := cb.EncryptText([]string{bob.email}, "bob's note", EncryptOptions{Name: "n"})
+	note, err := cb.EncryptText(context.Background(), []string{bob.email}, "bob's note", EncryptOptions{Name: "n"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
-	if _, err := cb.EncryptText([]string{bob.email}, "bob's note", EncryptOptions{LocalFile: path}); err != nil {
+	if _, err := cb.EncryptText(context.Background(), []string{bob.email}, "bob's note", EncryptOptions{LocalFile: path}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -368,7 +369,7 @@ func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 	alice.old = append(alice.old, bob.kp)
 	f.mu.Unlock()
 	var changed *KeyChangedError
-	if res, err := cb.DecryptSecretFull(note.Secret.ID, DecryptOptions{}); !errors.As(err, &changed) {
+	if res, err := cb.DecryptSecret(context.Background(), note.Secret.ID, DecryptOptions{}); !errors.As(err, &changed) {
 		t.Fatalf("relabeled own secret: %+v, %v, want a KeyChangedError", res, err)
 	}
 	relabelLocalSender(t, path, alice.email)
@@ -383,8 +384,40 @@ func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 	mallory.old = append(mallory.old, bob.kp)
 	f.secrets[note.Secret.ID].senderID = mallory.id
 	f.mu.Unlock()
-	if _, err := cb.DecryptSecretFull(note.Secret.ID, DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "invalid sender email") {
+	if _, err := cb.DecryptSecret(context.Background(), note.Secret.ID, DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "invalid sender email") {
 		t.Fatalf("sender email with a space: %v, want it refused", err)
+	}
+}
+
+// A key pair on this device does not let the server relabel the user's own
+// secret as sent by someone this device does not know yet either: it would
+// open as a first contact from them. Both paths refuse it.
+func TestOwnKeyDoesNotPassAsNewSender(t *testing.T) {
+	f := newFakeAPI(t, "bob@example.com", "carol@example.com")
+	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	cb := f.client(bob.email)
+	note, err := cb.EncryptText(context.Background(), []string{bob.email}, "bob's note", EncryptOptions{Name: "n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
+	if _, err := cb.EncryptText(context.Background(), []string{bob.email}, "bob's note", EncryptOptions{LocalFile: path}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	f.secrets[note.Secret.ID].senderID = carol.id
+	carol.old = append(carol.old, bob.kp)
+	f.mu.Unlock()
+	if res, err := cb.DecryptSecret(context.Background(), note.Secret.ID, DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "possible relabelling") {
+		t.Fatalf("own secret relabelled as a new sender: %+v, %v, want it refused", res, err)
+	}
+	relabelLocalSender(t, path, carol.email)
+	if res, err := f.openLocal(bob.email, path); err == nil || !strings.Contains(err.Error(), "possible relabelling") {
+		t.Fatalf("own local file relabelled as a new sender: %+v, %v, want it refused", res, err)
+	}
+	if known := knownKeys(t, cb, carol.email); len(known) != 0 {
+		t.Fatalf("carol's known keys %+v, want none", known)
 	}
 }
 
@@ -416,16 +449,16 @@ func TestFirstUseRecordedOnlyAfterSend(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
 	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
 	c := f.client("alice@example.com")
-	if _, err := c.EncryptText([]string{carol.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	if _, err := c.EncryptText(context.Background(), []string{carol.email}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
 	}
 	rotate(t, carol)
 	var changed *KeyChangedError
-	if _, err := c.EncryptText([]string{bob.email, carol.email}, "hello", EncryptOptions{Name: "n2"}); !errors.As(err, &changed) {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email, carol.email}, "hello", EncryptOptions{Name: "n2"}); !errors.As(err, &changed) {
 		t.Fatalf("send: %v, want carol's key refused", err)
 	}
 	path := filepath.Join(t.TempDir(), "note"+LocalFileExt)
-	if _, err := c.EncryptText([]string{bob.email, carol.email}, "hello", EncryptOptions{LocalFile: path}); !errors.As(err, &changed) {
+	if _, err := c.EncryptText(context.Background(), []string{bob.email, carol.email}, "hello", EncryptOptions{LocalFile: path}); !errors.As(err, &changed) {
 		t.Fatalf("local send: %v, want carol's key refused", err)
 	}
 	if known := knownKeys(t, c, bob.email); len(known) != 0 {
@@ -444,7 +477,7 @@ func TestFirstUseRecordedOnlyAfterSend(t *testing.T) {
 	f.mu.Lock()
 	f.refusePart = 0
 	f.mu.Unlock()
-	res, err := c.EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n3"})
+	res, err := c.EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n3"})
 	if err != nil || len(res.FirstUse) != 1 || res.FirstUse[0].Email != bob.email {
 		t.Fatalf("send: %+v, %v", res, err)
 	}
@@ -458,7 +491,7 @@ func TestFirstUseRecordedOnlyAfterSend(t *testing.T) {
 func TestSenderFirstUseRecordedOnlyAfterDecrypt(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
-	res, err := f.client(alice.email).EncryptText([]string{bob.email}, "hello", EncryptOptions{Name: "n"})
+	res, err := f.client(alice.email).EncryptText(context.Background(), []string{bob.email}, "hello", EncryptOptions{Name: "n"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +512,7 @@ func TestSenderFirstUseRecordedOnlyAfterDecrypt(t *testing.T) {
 	}
 
 	cb := f.client(bob.email)
-	if _, err := cb.DecryptSecretFull(res.Secret.ID, DecryptOptions{}); err == nil {
+	if _, err := cb.DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{}); err == nil {
 		t.Fatal("decrypt of a damaged payload succeeded")
 	}
 	if known := knownKeys(t, cb, alice.email); len(known) != 0 {
@@ -489,7 +522,7 @@ func TestSenderFirstUseRecordedOnlyAfterDecrypt(t *testing.T) {
 	if err := os.WriteFile(object, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := cb.DecryptSecretFull(res.Secret.ID, DecryptOptions{})
+	out, err := cb.DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{})
 	if err != nil || !out.SenderFirstUse {
 		t.Fatalf("decrypt: %+v, %v", out, err)
 	}
@@ -524,15 +557,15 @@ func TestKnownKeysArePerServer(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "known_keys.json")
 	f1 := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	c1 := f1.client("alice@example.com")
-	c1.SetKnownKeysFile(file)
-	if _, err := c1.EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"}); err != nil {
+	c1.knownKeysFile = file
+	if _, err := c1.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
 	}
 
 	f2 := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	c2 := f2.client("alice@example.com")
-	c2.SetKnownKeysFile(file)
-	res, err := c2.EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"})
+	c2.knownKeysFile = file
+	res, err := c2.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"})
 	if err != nil || len(res.FirstUse) != 1 {
 		t.Fatalf("send on another server: %+v, %v", res, err)
 	}
@@ -557,7 +590,7 @@ func TestDamagedKnownKeysFileRefusesSends(t *testing.T) {
 		if err := os.WriteFile(f.knownFile("alice@example.com"), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"}); err == nil {
+		if _, err := c.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{Name: "n"}); err == nil {
 			t.Errorf("%s: send accepted", name)
 		}
 	}

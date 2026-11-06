@@ -17,12 +17,12 @@ import (
 	"time"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/archive"
-	"github.com/deepsecret-io/sdk/compress"
 	"github.com/deepsecret-io/sdk/crypto"
-	"github.com/deepsecret-io/sdk/identity"
-	"github.com/deepsecret-io/sdk/payload"
-	"github.com/deepsecret-io/sdk/secrets"
+	"github.com/deepsecret-io/sdk/internal/archive"
+	"github.com/deepsecret-io/sdk/internal/compress"
+	"github.com/deepsecret-io/sdk/internal/payload"
+	"github.com/deepsecret-io/sdk/internal/protocol"
+	"github.com/deepsecret-io/sdk/internal/transport"
 )
 
 // ── Decrypting ───────────────────────────────────────────────────────────────
@@ -40,39 +40,19 @@ import (
 // Every decrypt checks the ciphertext against the signed manifest's digest
 // before releasing any plaintext (protocol v4 §6).
 
-// DecryptSecret downloads and decrypts a secret by its ID, in memory.
-// Returns only the decrypted payload. For manifest metadata, use DecryptSecretFull.
-func (c *Client) DecryptSecret(secretID string) (*payload.Decrypted, error) {
-	result, err := c.DecryptSecretFull(secretID, DecryptOptions{})
-	if err != nil {
-		return nil, err
-	}
-	return result.Decrypted, nil
-}
-
-// DecryptRevision downloads and decrypts a specific revision of a secret,
-// in memory. Returns only the decrypted payload. For manifest metadata, use
-// DecryptRevisionFull.
-func (c *Client) DecryptRevision(secretID, revisionID string) (*payload.Decrypted, error) {
-	result, err := c.DecryptRevisionFull(secretID, DecryptOptions{Revision: revisionID})
-	if err != nil {
-		return nil, err
-	}
-	return result.Decrypted, nil
-}
-
-// DecryptSecretFull downloads and decrypts a secret in memory, returning
+// DecryptSecret downloads and decrypts a secret in memory, returning
 // full metadata. It fetches revisions, checks that the revision was sealed
 // for your key, and includes the verified manifest's metadata
 // (fingerprints, recipients, protocol version, cipher suite, payload
 // digest) in the result. A payload stored larger than
 // DefaultMaxInMemorySize is refused: write it to disk with DecryptToDir.
-func (c *Client) DecryptSecretFull(secretID string, opt DecryptOptions) (*DecryptResult, error) {
+func (c *Client) DecryptSecret(ctx context.Context, secretID string, opt DecryptOptions) (*DecryptResult, error) {
+	c = c.with(ctx)
 	o, err := c.openSecret(secretID, opt, true)
 	if err != nil {
 		return nil, err
 	}
-	defer o.Close()
+	defer func() { _ = o.Close() }()
 	d, err := o.Payload()
 	if err != nil {
 		return nil, err
@@ -82,16 +62,10 @@ func (c *Client) DecryptSecretFull(secretID string, opt DecryptOptions) (*Decryp
 	return &result, nil
 }
 
-// DecryptRevisionFull downloads and decrypts a specific revision in memory,
-// returning full metadata. Set opts.Revision to target a specific revision;
-// empty means latest.
-func (c *Client) DecryptRevisionFull(secretID string, opt DecryptOptions) (*DecryptResult, error) {
-	return c.DecryptSecretFull(secretID, opt)
-}
-
 // DecryptToDir downloads a files secret and writes its files, or extracts
 // its archive, into dir, in constant memory. See OpenedSecret.WriteFiles.
-func (c *Client) DecryptToDir(secretID, dir string, opt DecryptOptions, w WriteOptions) (*DecryptResult, *WriteResult, error) {
+func (c *Client) DecryptToDir(ctx context.Context, secretID, dir string, opt DecryptOptions, w WriteOptions) (*DecryptResult, *WriteResult, error) {
+	c = c.with(ctx)
 	// Check the destination before downloading, as WriteFiles will again
 	// with the payload's own names.
 	before := opt.BeforeDownload
@@ -106,11 +80,11 @@ func (c *Client) DecryptToDir(secretID, dir string, opt DecryptOptions, w WriteO
 		}
 		return nil
 	}
-	o, err := c.OpenSecret(secretID, opt)
+	o, err := c.OpenSecret(c.api.Context(), secretID, opt)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer o.Close()
+	defer func() { _ = o.Close() }()
 	written, err := o.WriteFiles(dir, w)
 	if err != nil {
 		return nil, nil, err
@@ -126,7 +100,7 @@ type OpenedSecret struct {
 	// Result is the verified manifest's metadata. Its Decrypted is nil.
 	Result DecryptResult
 
-	opened     *crypto.Opened
+	opened     *protocol.Opened
 	spool      *spool
 	journal    *downloadJournal // records a kept download's ranges; nil otherwise
 	ctx        context.Context
@@ -187,7 +161,8 @@ const smallPayloadSize = 4 << 20
 // and download the payload into a private temporary file, or into memory
 // when it is at most 4 MiB. The payload's digest is checked against the
 // manifest by every decrypt, before any plaintext is released.
-func (c *Client) OpenSecret(secretID string, opt DecryptOptions) (*OpenedSecret, error) {
+func (c *Client) OpenSecret(ctx context.Context, secretID string, opt DecryptOptions) (*OpenedSecret, error) {
+	c = c.with(ctx)
 	return c.openSecret(secretID, opt, false)
 }
 
@@ -201,21 +176,30 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	log := api.Logger(opt.Logger)
 	secretLog := api.Module(log, "secret")
 
-	secretInfo, err := c.DescribeSecret(secretID)
-	if err != nil {
-		return nil, fmt.Errorf("fetch secret: %w", err)
+	var secretInfo *SecretInfo
+	var revisions []RevisionInfo // nil: resolveRevision fetches them
+	if d := opt.Secret; d != nil {
+		if !strings.EqualFold(d.Secret.ID, secretID) {
+			return nil, fmt.Errorf("the secret given is %s, not the one to open, %s", d.Secret.ID, secretID)
+		}
+		secretInfo, revisions = &d.Secret, d.Revisions
+	} else {
+		var err error
+		if secretInfo, err = c.DescribeSecret(c.api.Context(), secretID); err != nil {
+			return nil, fmt.Errorf("fetch secret: %w", err)
+		}
 	}
 	secretLog.Debug("secret fetched", "secret_id", secretInfo.ID, "name", secretInfo.Name, "latest_revision_id", secretInfo.LatestRevisionID, "sender_id", secretInfo.SenderID)
 
 	// Load recipient identity (explicit fingerprint or server-registered primary)
-	kp, localFP, err := c.loadIdentity(opt.Identity, opt.Password)
+	kp, localFP, err := c.loadIdentity(opt.Identity, opt.unlock())
 	if err != nil {
 		return nil, fmt.Errorf("load identity: %w", err)
 	}
 	logKeyPair(log, localFP, opt.Identity)
 
 	// Resolve target revision and pre-validate fingerprint
-	rev, err := c.resolveRevision(secretID, secretInfo.LatestRevisionID, localFP, opt.Revision)
+	rev, err := c.resolveRevision(secretID, secretInfo.LatestRevisionID, localFP, opt.Revision, revisions)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +211,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	secretLog.Debug("revision chosen", "revision_id", targetRevID, "source", source, "recipients", len(rev.Integrity.Recipients))
 
 	// Fetch the signed manifest and the caller's own wrap.
-	rm, err := secrets.GetManifest(c.api, targetRevID)
+	rm, err := getManifest(c.api, targetRevID)
 	if err != nil {
 		return nil, err
 	}
@@ -235,17 +219,17 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		return nil, fmt.Errorf("your wrap for this revision was made for key %s, not the key in use (%s)",
 			crypto.ShortFingerprint(rm.KeyFingerprint), crypto.ShortFingerprint(localFP))
 	}
-	wrap := &crypto.Wrap{RecipientFingerprint: localFP, Enc: rm.Wrap.Enc, Ciphertext: rm.Wrap.Ct}
+	wrap := &protocol.Wrap{RecipientFingerprint: localFP, Enc: rm.Wrap.Enc, Ciphertext: rm.Wrap.Ct}
 
 	// Resolve the sender's Ed25519 key from the identity service by the
 	// manifest's sender fingerprint, so Open cross-checks the embedded key
 	// against it. The manifest is parsed here for that fingerprint only;
 	// Open verifies it in full.
-	peek, err := crypto.UnmarshalManifest(rm.Manifest)
+	peek, err := protocol.UnmarshalManifest(rm.Manifest)
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
-	senderEmail, err := identity.ResolveActorEmail(c.api, secretInfo.SenderID)
+	senderEmail, err := resolveActorEmail(c.api, secretInfo.SenderID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
@@ -254,7 +238,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	if !plausibleEmail(senderEmail) {
 		return nil, fmt.Errorf("the server gave an invalid sender email %q", senderEmail)
 	}
-	senderED25519, err := identity.ResolveED25519ByEmail(c.api, senderEmail, peek.SenderFingerprint)
+	senderED25519, err := resolveED25519ByEmail(c.api, senderEmail, peek.SenderFingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}
@@ -262,7 +246,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	// The manifest must be signed for this secret's name, so a revision of
 	// another secret from the same sender is refused. The server names the
 	// secret too, so Result carries the signed name to show.
-	opened, err := crypto.Open(rm.Manifest, wrap, kp, crypto.OpenParams{
+	opened, err := protocol.Open(rm.Manifest, wrap, kp, protocol.OpenParams{
 		RevisionID:    targetRevID,
 		SecretName:    secretInfo.Name,
 		SenderED25519: senderED25519,
@@ -331,11 +315,11 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 
 	// Download the ciphertext into the spool, or the ranges a kept
 	// download lacks.
-	dl := api.MultipartDownloadOptions{
+	dl := transport.MultipartDownloadOptions{
 		Threads:              opt.DownloadThreads,
 		OnProgress:           opt.OnDownloadProgress,
 		Logger:               opt.Logger,
-		Status:               opt.DownloadStatus,
+		Status:               opt.DownloadStatus.transport(),
 		PresignExpiryMinutes: opt.PresignExpiryMinutes,
 	}
 	var resumed int64
@@ -346,6 +330,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 	}
 	api.Module(log, "decrypt").Debug("ciphertext storage", sp.logArgs(spoolNeed(m.CiphertextSize-resumed))...)
 	// The download logs its plan and its completion.
+	opt.phase(PhaseDownloading)
 	err = c.api.DownloadToFile(targetRevID, sp, m.CiphertextSize, dl)
 	if journal != nil {
 		journal.halt()
@@ -382,6 +367,7 @@ func (c *Client) openSecret(secretID string, opt DecryptOptions, inMemory bool) 
 		CipherSuite:          m.CipherSuite,
 		PayloadDigest:        hex.EncodeToString(m.PayloadDigest),
 		EncryptedSize:        m.CiphertextSize,
+		PlaintextSize:        m.PlaintextSize,
 		ResumedBytes:         resumed,
 	}
 	return o, nil
@@ -440,7 +426,7 @@ func (o *OpenedSecret) pass(stage DecryptStage, read func(r io.Reader) error) er
 		if err != nil {
 			return fmt.Errorf("decompress (%s): %w", m.Compression, err)
 		}
-		defer zr.Close()
+		defer func() { _ = zr.Close() }()
 		return read(zr)
 	}()
 	_ = pr.CloseWithError(errPassDone) // io.PipeReader.CloseWithError always returns nil.
@@ -488,7 +474,7 @@ const maxSmallPlaintext = 16 << 20
 // DefaultMaxInMemorySize, and decompresses to at most that for files and
 // 16 MiB for messages and data; larger file payloads go to disk with
 // WriteFiles.
-func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
+func (o *OpenedSecret) Payload() (*DecryptedPayload, error) {
 	m := o.opened.Manifest
 	if m.CiphertextSize > DefaultMaxInMemorySize {
 		return nil, fmt.Errorf("the payload is %s, too large to decrypt in memory: write it to disk with DecryptToDir or WriteFiles",
@@ -524,23 +510,30 @@ func (o *OpenedSecret) Payload() (*payload.Decrypted, error) {
 
 	var p payload.Payload
 	if err := payload.Unmarshal(plaintext, &p); err != nil {
-		return &payload.Decrypted{Type: "raw", Raw: plaintext}, nil
+		return &DecryptedPayload{Type: "raw", Raw: plaintext}, nil
 	}
-	decrypted := &payload.Decrypted{Type: p.Type, Raw: plaintext}
+	decrypted := &DecryptedPayload{Type: p.Type, Raw: plaintext}
 	switch p.Type {
 	case "message":
 		decrypted.Message = p.Message
 	case "files":
 		decrypted.Archived = p.Archive && len(p.Files) == 1
 		decrypted.ArchiveCompression = p.ArchiveCompression
+		// The sender names the files: refuse any name that is not a safe
+		// relative path, so a caller writing them out cannot be led out of
+		// its directory. WriteFiles holds them to the same rule.
 		for _, f := range p.Files {
-			decrypted.Files = append(decrypted.Files, payload.DecryptedFile{
-				Name: f.Name, Data: f.Data, Size: f.Size, SHA256: f.SHA256, Mode: f.Mode,
+			name, err := archive.ValidateArchivePath(f.Name)
+			if err != nil {
+				return nil, fmt.Errorf("the payload names an unsafe file: %w", err)
+			}
+			decrypted.Files = append(decrypted.Files, DecryptedFile{
+				Name: name, Data: f.Data, Size: f.Size, SHA256: f.SHA256, Mode: f.Mode,
 			})
 		}
 	case "data":
 		for _, e := range p.Entries {
-			decrypted.Entries = append(decrypted.Entries, payload.KeyValue{Key: e.Key, Value: e.Value})
+			decrypted.Entries = append(decrypted.Entries, KeyValue{Key: e.Key, Value: e.Value})
 		}
 	}
 	return decrypted, nil
@@ -675,7 +668,8 @@ type WrittenFile struct {
 type WriteResult struct {
 	Files     []WrittenFile // the payload's files, when it is not an archive
 	Archived  bool
-	Extracted int // entries extracted from an archive
+	Extracted int   // entries extracted from an archive
+	Size      int64 // the files' own bytes, written or extracted
 }
 
 // WriteFiles writes a files payload into dir, or extracts its archive
@@ -759,7 +753,7 @@ func (o *OpenedSecret) WriteFiles(dir string, w WriteOptions) (*WriteResult, err
 
 	// Pass 2: write.
 	tWrite := time.Now()
-	result := &WriteResult{Archived: info.Archive}
+	result := &WriteResult{Archived: info.Archive, Size: total}
 	err := o.pass(DecryptWriting, func(r io.Reader) error {
 		out, err := payload.DecodeFiles(r, decLim, func(idx int, size int64, data io.Reader) error {
 			if info.Archive {
@@ -825,7 +819,7 @@ func (c *Client) senderRecorder(email, fp string, first bool) func() error {
 // for, in manifest order. Emails are the server's labels for those
 // fingerprints, from the revision listing, and are empty when the server
 // does not name one.
-func signedRecipients(m *crypto.Manifest, rev *RevisionInfo) []Recipient {
+func signedRecipients(m *protocol.Manifest, rev *RevisionInfo) []Recipient {
 	emails := make(map[string]string, len(rev.Integrity.Recipients))
 	for _, r := range rev.Integrity.Recipients {
 		emails[strings.ToLower(r.KeyFingerprint)] = r.Email
@@ -839,11 +833,14 @@ func signedRecipients(m *crypto.Manifest, rev *RevisionInfo) []Recipient {
 
 // resolveRevision finds the target revision and pre-validates, before
 // anything is downloaded, that the server lists the local fingerprint among
-// the revision's recipients. Uses ListRevisions internally.
-func (c *Client) resolveRevision(secretID, latestRevID, localFP, requestedRevID string) (*RevisionInfo, error) {
-	revisions, err := c.ListRevisions(secretID)
-	if err != nil {
-		return nil, err
+// the revision's recipients. It lists the revisions unless the caller gave
+// them.
+func (c *Client) resolveRevision(secretID, latestRevID, localFP, requestedRevID string, revisions []RevisionInfo) (*RevisionInfo, error) {
+	if revisions == nil {
+		var err error
+		if revisions, err = c.ListRevisions(c.api.Context(), secretID); err != nil {
+			return nil, err
+		}
 	}
 	if len(revisions) == 0 {
 		return nil, fmt.Errorf("secret has no revisions")

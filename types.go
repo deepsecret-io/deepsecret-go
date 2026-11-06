@@ -5,13 +5,12 @@ package sdk
 
 import (
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/compress"
-	"github.com/deepsecret-io/sdk/identity"
-	"github.com/deepsecret-io/sdk/payload"
-	"github.com/deepsecret-io/sdk/secrets"
+	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/sdk/internal/transport"
 )
 
 // DefaultMaxPayloadSize is the default client-side preflight cap on the
@@ -25,48 +24,46 @@ const DefaultMaxPayloadSize int64 = 100 << 30
 // plus its encryption overhead.
 const DefaultMaxDownloadSize int64 = 101 << 30
 
-// DefaultMaxInMemorySize is the largest stored payload DecryptSecretFull and
+// DefaultMaxInMemorySize is the largest stored payload DecryptSecret and
 // OpenedSecret.Payload hold in memory. Larger file payloads are written
 // to disk with OpenedSecret.WriteFiles or DecryptToDir.
 const DefaultMaxInMemorySize int64 = 256 << 20
 
 // MaxRecipientsPerSend is the most recipients one send may have. The API
-// enforces the same cap; the protocol itself allows crypto.MaxRecipients.
+// enforces the same cap; the protocol itself allows no more.
 const MaxRecipientsPerSend = 100
 
-// CompressZstd is the Zstandard compression algorithm identifier.
-// Use this with EncryptOptions.Compress.
-const CompressZstd = compress.Zstd
+// Compression is how a payload is compressed before it is encrypted.
+type Compression string
+
+// The compressions a send can ask for.
+const (
+	CompressNone Compression = ""
+	CompressZstd Compression = "zstd"
+)
 
 // ── Re-exported types ────────────────────────────────────────────────────────
 // These allow callers to import only "github.com/deepsecret-io/sdk"
 // without reaching into internal sub-packages.
 
-// ActorInfo holds the authenticated user's details and tier limits.
-type ActorInfo = identity.ActorInfo
-
-// RemoteKey represents an identity key registered on the server.
-type RemoteKey = identity.RemoteKey
-
-// GroupInfo represents an org group with its members.
-type GroupInfo = identity.GroupInfo
-
-// GroupMemberInfo represents a single member of a group.
-type GroupMemberInfo = identity.GroupMemberInfo
-
-// SecretInfo holds detailed metadata about a secret (returned by list/describe).
-type SecretInfo = secrets.SecretInfo
-
-// SecretRecipient is one person with access to a secret.
-type SecretRecipient = secrets.SecretRecipient
-
-// ListOptions configures pagination and filtering for secret listing.
-type ListOptions = secrets.ListOptions
-
 // TransferStatus is the live state of an upload or a download, for a
 // progress display: pass one in the options and read it with Snapshot
 // while the call runs.
-type TransferStatus = api.TransferStatus
+type TransferStatus struct {
+	state transport.TransferStatus
+}
+
+// Snapshot returns the transfer's state now.
+func (s *TransferStatus) Snapshot() TransferSnapshot { return s.transport().Snapshot() }
+
+// transport is the state the transport updates; nil for a nil TransferStatus,
+// which it ignores.
+func (s *TransferStatus) transport() *transport.TransferStatus {
+	if s == nil {
+		return nil
+	}
+	return &s.state
+}
 
 // TransferSnapshot is a TransferStatus at one moment.
 type TransferSnapshot = api.TransferSnapshot
@@ -79,13 +76,36 @@ type ConnectionStatus = api.ConnectionStatus
 const TransferAttempts = api.TransferAttempts
 
 // DecryptedPayload holds the decrypted content of a secret.
-type DecryptedPayload = payload.Decrypted
+type DecryptedPayload struct {
+	Type    string          // "files", "data", "message", or "raw"
+	Message string          // populated for type="message"
+	Files   []DecryptedFile // populated for type="files"
+	Entries []KeyValue      // populated for type="data"
+	Raw     []byte          // raw decrypted bytes (always set)
+
+	// Archived is set when the payload is a single tar archive that the
+	// caller should expand. When true, Files contains exactly one entry
+	// holding the compressed archive bytes (e.g. archive.tar.zst), and
+	// ArchiveCompression names the algorithm. WriteFiles stream-extracts it
+	// to disk, so payloads larger than the in-memory limits still work.
+	Archived           bool
+	ArchiveCompression string
+}
 
 // DecryptedFile holds a single decrypted file from a secret.
-type DecryptedFile = payload.DecryptedFile
+type DecryptedFile struct {
+	Name   string      // relative path inside the secret, already validated
+	Data   []byte      // file content
+	Size   int64       // original size in bytes
+	SHA256 string      // hex-encoded SHA-256 checksum
+	Mode   os.FileMode // original permission bits; zero if the payload omitted it
+}
 
 // KeyValue holds a single key-value pair from a decrypted data secret.
-type KeyValue = payload.KeyValue
+type KeyValue struct {
+	Key   string
+	Value string
+}
 
 // ── Options & Results ────────────────────────────────────────────────────────
 
@@ -94,9 +114,10 @@ type EncryptOptions struct {
 	// Name is the secret's name, without surrounding white space: a send
 	// under a name the sender already has adds a revision to that secret.
 	// The manifest signs it, so recipients can tell which secret a revision
-	// belongs to. Empty means "sdk-" and the Unix time.
+	// belongs to. Empty means the base name of the one path EncryptPaths
+	// was given, or else "sdk-" and the Unix time.
 	Name       string
-	Compress   compress.Algorithm
+	Compress   Compression
 	Archive    bool
 	SkipHidden bool
 	TTL        string // "30m", "24h", "7d"
@@ -133,6 +154,20 @@ type EncryptOptions struct {
 	// equals it; done never passes it. Optional.
 	OnEncryptProgress func(done, total int64)
 
+	// Account, when set, is the sender's account as the caller just
+	// fetched it (WhoAmI), so the send does not fetch it again. The SDK
+	// takes it as given: its ID and email decide whether a recipient is the
+	// sender, and its organization goes into the request, so pass only what
+	// WhoAmI returned. The server still decides who the caller is. Optional.
+	Account *ActorInfo
+
+	// OnPhase is called as the send begins each phase: PhaseEncrypting,
+	// then PhaseUploading, or PhaseEncrypting alone with LocalFile. It
+	// comes after the sender's key pair is unlocked, so a security key's
+	// prompts for a PIN or a touch come before it, and a display can time
+	// each phase on its own. Optional.
+	OnPhase func(Phase)
+
 	// Logger receives the flow's logs, each naming its module (see
 	// api.ModuleKey). Optional: nil logs nothing.
 	Logger *slog.Logger
@@ -142,10 +177,6 @@ type EncryptOptions struct {
 	// files-per-secret limit on what is sent.
 	AutoArchive bool
 
-	// ValidateTier pre-checks tier limits (MaxUploadBytes, policy flags)
-	// before performing encryption. Returns a clear error if limits are exceeded.
-	ValidateTier bool
-
 	// Identity specifies a local key fingerprint (or prefix) to use for signing.
 	// If empty, the server-registered primary identity is used.
 	Identity string
@@ -153,6 +184,15 @@ type EncryptOptions struct {
 	// Password is the password for decrypting password-protected identity keys.
 	// If the primary key is encrypted and this is empty, encryption will fail.
 	Password string
+
+	// SecurityKey unlocks an identity key protected by a security key
+	// (key storage version 5); package fido2 provides one. A password or
+	// unprotected key never uses it.
+	SecurityKey crypto.Authenticator
+
+	// RecoveryCode unlocks a security-key protected identity key without
+	// its security key. When set, SecurityKey is not used.
+	RecoveryCode string
 
 	// UploadThreads fixes the number of parallel part PUTs of a multipart
 	// upload, at most 32. 0 adapts it to the link: the upload starts with
@@ -195,8 +235,8 @@ type Recipient struct {
 // send encrypts the payload once for every recipient, so the sizes are
 // those of the single stored payload.
 type EncryptResult struct {
-	Secret            secrets.Secret // empty for a local file
-	LocalFile         string         // the file written, for EncryptOptions.LocalFile
+	Secret            Secret // empty for a local file
+	LocalFile         string // the file written, for EncryptOptions.LocalFile
 	EncryptedSize     int64
 	SenderFingerprint string
 	Recipients        []Recipient       // everyone the revision was sealed for, in the order given
@@ -238,11 +278,35 @@ type DecryptOptions struct {
 	// the way. Optional.
 	OnDecryptProgress func(stage DecryptStage, done, total int64)
 
+	// Secret, when set, is the secret being opened with its revisions, as
+	// the caller just fetched them (DescribeSecretFull), so the open does
+	// not fetch them again. Its ID must be the secret opened. It comes from
+	// the server either way and is not trusted: it only picks the revision
+	// to open and gives the name the signed manifest must match, and the
+	// manifest is verified as on any open. Optional.
+	Secret *SecretDetail
+
+	// OnPhase is called when the ciphertext starts to arrive:
+	// PhaseDownloading for a secret from the server (OpenSecret,
+	// DecryptSecret, DecryptToDir), PhaseReading for OpenLocalFile. It
+	// comes after the key pair is unlocked, so a security key's prompts for
+	// a PIN or a touch come before it. Optional.
+	OnPhase func(Phase)
+
 	// Logger receives the flow's logs, as for EncryptOptions. Optional.
 	Logger *slog.Logger
 
 	// Password is the password for decrypting password-protected identity keys.
 	Password string
+
+	// SecurityKey unlocks an identity key protected by a security key
+	// (key storage version 5); package fido2 provides one. A password or
+	// unprotected key never uses it.
+	SecurityKey crypto.Authenticator
+
+	// RecoveryCode unlocks a security-key protected identity key without
+	// its security key. When set, SecurityKey is not used.
+	RecoveryCode string
 
 	// DownloadThreads sets the maximum number of parallel Range GETs the SDK
 	// uses for downloading the payload. 0 = SDK default (4). 1 = one range
@@ -269,7 +333,7 @@ type DecryptOptions struct {
 	// after a week unused. ListPendingDownloads and DiscardPendingDownload
 	// manage them. It is created (mode 0700) when missing, and refused when
 	// it is a symlink or, on Unix, another user's or open to other users.
-	// Payloads decrypted in memory (DecryptSecretFull) do not use it.
+	// Payloads decrypted in memory (DecryptSecret) do not use it.
 	ResumeDir string
 
 	// MaxDownloadSize refuses a stored payload larger than this many bytes
@@ -304,7 +368,7 @@ type UpcomingDownload struct {
 // DecryptResult is returned by full decrypt methods with the metadata of
 // the verified manifest.
 type DecryptResult struct {
-	Decrypted            *payload.Decrypted
+	Decrypted            *DecryptedPayload
 	RevisionID           string    // UUID of the revision that was decrypted (resolved if Revision was empty)
 	SecretName           string    // the secret name the sender signed: the server names the secret too, so show it or compare it with the secret you meant to open
 	SignedAt             time.Time // when the sender signed the revision, by their clock
@@ -320,6 +384,7 @@ type DecryptResult struct {
 	CipherSuite          string // from the signed manifest
 	PayloadDigest        string // hex SHA-256 of the stored payload, verified against the signed manifest
 	EncryptedSize        int64
+	PlaintextSize        int64 // the payload as sealed, after compression and before encryption, from the signed manifest
 	ResumedBytes         int64 // bytes of the payload kept from an earlier download (DecryptOptions.ResumeDir), not fetched again
 }
 
@@ -406,4 +471,40 @@ type FileMeta struct {
 	Name   string `json:"name" yaml:"name"`
 	Size   int64  `json:"size" yaml:"size"`
 	SHA256 string `json:"sha256" yaml:"sha256"`
+}
+
+// unlock is what unlocking the sender's key may use.
+func (o EncryptOptions) unlock() crypto.Unlock {
+	return crypto.Unlock{Password: o.Password, SecurityKey: o.SecurityKey, RecoveryCode: o.RecoveryCode}
+}
+
+// unlock is what unlocking the recipient's key may use.
+func (o DecryptOptions) unlock() crypto.Unlock {
+	return crypto.Unlock{Password: o.Password, SecurityKey: o.SecurityKey, RecoveryCode: o.RecoveryCode}
+}
+
+// Phase names a part of a send or an open that a display can show and time
+// on its own: see EncryptOptions.OnPhase and DecryptOptions.OnPhase.
+type Phase string
+
+// The phases: a send's two in order, and an open's one.
+const (
+	PhaseEncrypting  Phase = "encrypting"  // sealing the payload
+	PhaseUploading   Phase = "uploading"   // creating the revision, then uploading its ciphertext
+	PhaseDownloading Phase = "downloading" // downloading the ciphertext
+	PhaseReading     Phase = "reading"     // copying a local file's ciphertext
+)
+
+// phase reports the send's next phase to OnPhase, when set.
+func (o EncryptOptions) phase(p Phase) {
+	if o.OnPhase != nil {
+		o.OnPhase(p)
+	}
+}
+
+// phase reports the open's next phase to OnPhase, when set.
+func (o DecryptOptions) phase(p Phase) {
+	if o.OnPhase != nil {
+		o.OnPhase(p)
+	}
 }

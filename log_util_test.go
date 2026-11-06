@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/archive"
+	"github.com/deepsecret-io/sdk/internal/archive"
 )
 
 // flowLog keeps every record a flow logs, at every level: its module
@@ -101,11 +101,11 @@ func TestFlowLogs(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	const text = "the vault code is 7319-alpha"
 	var sent, opened flowLog
-	res, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: sent.logger()})
+	res, err := f.client("alice@example.com").EncryptText(context.Background(), []string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: sent.logger()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.client("bob@example.com").DecryptSecretFull(res.Secret.ID, DecryptOptions{Logger: opened.logger()}); err != nil {
+	if _, err := f.client("bob@example.com").DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{Logger: opened.logger()}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -123,8 +123,7 @@ func TestFlowLogs(t *testing.T) {
 
 	opened.has(t, slog.LevelDebug, "secret", "revision chosen", "revision_id="+res.Secret.RevisionID, "source=latest")
 	opened.has(t, slog.LevelDebug, "manifest", "manifest verified", "payload_type=message")
-	// Every account's key pair is on this test's one device.
-	opened.has(t, slog.LevelDebug, "verify", "sender key verified", "email=alice@example.com", "trust=own")
+	opened.has(t, slog.LevelDebug, "verify", "sender key verified", "email=alice@example.com", "trust=first_use")
 	opened.has(t, slog.LevelInfo, "download", "download complete")
 	opened.has(t, slog.LevelDebug, "verify", "payload verified")
 	opened.has(t, slog.LevelInfo, "decrypt", "payload decrypted")
@@ -132,7 +131,7 @@ func TestFlowLogs(t *testing.T) {
 	// A send under the same name adds a revision to the secret, and says
 	// so rather than that it created one.
 	var again flowLog
-	res2, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: again.logger()})
+	res2, err := f.client("alice@example.com").EncryptText(context.Background(), []string{"bob@example.com"}, text, EncryptOptions{Name: "vault code", Logger: again.logger()})
 	if err != nil {
 		t.Fatal(err)
 	}

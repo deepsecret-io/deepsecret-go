@@ -4,6 +4,7 @@
 package sdk
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,7 +23,7 @@ func TestDecryptToDirChecksTheDestinationBeforeDownloading(t *testing.T) {
 
 	bob := f.client("bob@example.com")
 	_, presigns := rangeCount(f)
-	_, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{}, WriteOptions{})
+	_, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{}, WriteOptions{})
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("decrypt onto an existing file: %v", err)
 	}
@@ -30,7 +31,7 @@ func TestDecryptToDirChecksTheDestinationBeforeDownloading(t *testing.T) {
 		t.Fatalf("the refused decrypt asked for %d download URLs", now-presigns)
 	}
 
-	if _, _, err := bob.DecryptToDir(secretID, out, DecryptOptions{}, WriteOptions{Overwrite: true}); err != nil {
+	if _, _, err := bob.DecryptToDir(context.Background(), secretID, out, DecryptOptions{}, WriteOptions{Overwrite: true}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
@@ -43,7 +44,7 @@ func TestBeforeDownloadStopsTheDecrypt(t *testing.T) {
 	secretID, _ := sendLarge(t, f)
 	_, presigns := rangeCount(f)
 	var seen UpcomingDownload
-	_, err := f.client("bob@example.com").OpenSecret(secretID, DecryptOptions{
+	_, err := f.client("bob@example.com").OpenSecret(context.Background(), secretID, DecryptOptions{
 		BeforeDownload: func(p UpcomingDownload) error {
 			seen = p
 			return os.ErrPermission

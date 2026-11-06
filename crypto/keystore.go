@@ -35,7 +35,7 @@ const (
 )
 
 // keyPairOnDisk is the on-wire JSON layout of a stored key. Distinct from
-// KeyPair so KeyPair can keep its private fields tagged json:"-" — accidental
+// KeyPair so KeyPair can keep its private fields tagged json:"-": accidental
 // json.Marshal of a KeyPair never leaks private material; the keystore is the
 // only code that opts into writing this richer struct.
 type keyPairOnDisk struct {
@@ -148,8 +148,9 @@ func LoadKeyPair(fingerprint, password string) (*KeyPair, error) {
 }
 
 // LoadKeyPairFrom loads a key pair from <dir>/<fingerprint>.json, where
-// fingerprint may be a prefix of 16 or more characters. Only
-// KeyStorageVersion 4 is accepted; older formats must be regenerated.
+// fingerprint may be a prefix of 16 or more characters. It reads version 4
+// files (password or none); a security-key file (version 5) needs
+// UnlockKeyPair and returns ErrSecurityKeyRequired here.
 func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
 	// The fingerprint can come from the server (the primary key it lists),
 	// and it names the file read.
@@ -157,11 +158,26 @@ func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	disk, err := readKeyFile(dir, resolveFingerprint(dir, fingerprint))
+	f, err := readKeyFile(dir, resolveFingerprint(dir, fingerprint))
 	if err != nil {
 		return nil, err
 	}
+	if f.v5 != nil {
+		return nil, ErrSecurityKeyRequired
+	}
+	return loadV4(f.v4, password)
+}
 
+// Errors of password-protected (version 4) key files. Their text is part
+// of the contract: callers have matched on it.
+var (
+	ErrPasswordRequired = errors.New("key pair is password-encrypted, provide a password")
+	ErrWrongPassword    = errors.New("wrong password or corrupted key file")
+)
+
+// loadV4 reads the private keys of a version 4 key file: in clear, or
+// decrypted with password.
+func loadV4(disk *keyPairOnDisk, password string) (*KeyPair, error) {
 	kp := &KeyPair{
 		StorageVersion: disk.StorageVersion,
 		ED25519Public:  disk.ED25519Public,
@@ -179,7 +195,7 @@ func LoadKeyPairFrom(dir, fingerprint, password string) (*KeyPair, error) {
 
 	if disk.Encrypted {
 		if password == "" {
-			return nil, fmt.Errorf("key pair is password-encrypted, provide a password")
+			return nil, ErrPasswordRequired
 		}
 		if err := decryptOnDisk(kp, password); err != nil {
 			return nil, err
@@ -208,16 +224,12 @@ func LoadPublicKeysFrom(dir, fingerprint string) (*PublicKeys, error) {
 	if len(fingerprint) != FingerprintLen || !validKeyName(fingerprint) {
 		return nil, errors.New("a full key fingerprint is 64 hex characters")
 	}
-	disk, err := readKeyFile(dir, fingerprint)
+	f, err := readKeyFile(dir, fingerprint)
 	if err != nil {
 		return nil, err
 	}
-	pub := &PublicKeys{
-		ED25519:  disk.ED25519Public,
-		X25519:   disk.X25519Public,
-		MLKEM768: disk.MLKEM768PK,
-		MLDSA65:  disk.MLDSA65PK,
-	}
+	keys := f.publicKeys()
+	pub := &keys
 	if pub.Fingerprint, err = FingerprintFromPubs(pub.ED25519, pub.X25519, pub.MLKEM768, pub.MLDSA65); err != nil {
 		return nil, fmt.Errorf("key file %s: %w", ShortFingerprint(fingerprint), err)
 	}
@@ -227,22 +239,58 @@ func LoadPublicKeysFrom(dir, fingerprint string) (*PublicKeys, error) {
 	return pub, nil
 }
 
-// readKeyFile reads <dir>/<name>.json, a key file of the current storage
-// version. name must be hex only, so it cannot change the path.
-func readKeyFile(dir, name string) (*keyPairOnDisk, error) {
+// keyFile is a key file as read: version 4 (password or none) or version 5
+// (security keys), and its bytes.
+type keyFile struct {
+	raw []byte
+	v4  *keyPairOnDisk
+	v5  *securityKeyFile
+}
+
+func (f *keyFile) publicKeys() PublicKeys {
+	if f.v5 != nil {
+		return f.v5.publicKeys()
+	}
+	return PublicKeys{ED25519: f.v4.ED25519Public, X25519: f.v4.X25519Public, MLKEM768: f.v4.MLKEM768PK, MLDSA65: f.v4.MLDSA65PK}
+}
+
+// readKeyFile reads <dir>/<name>.json, a key file of storage version 4 or
+// 5. name must be hex only, so it cannot change the path.
+func readKeyFile(dir, name string) (*keyFile, error) {
 	data, err := os.ReadFile(filepath.Join(dir, name+".json")) // #nosec G304 -- name is hex only: checked with validKeyName, or a file name read from dir.
 	if err != nil {
 		return nil, err
 	}
-	var disk keyPairOnDisk
-	if err := json.Unmarshal(data, &disk); err != nil {
+	// One storage_version only, in any case: encoding/json would read
+	// "Storage_Version" as storage_version and keep the last of several.
+	if err := checkNoDuplicateKeys(data); err != nil {
+		return nil, fmt.Errorf("key file %s: %w", ShortFingerprint(name), err)
+	}
+	var head struct {
+		StorageVersion int `json:"storage_version"`
+	}
+	if err := json.Unmarshal(data, &head); err != nil {
 		return nil, err
 	}
-	if disk.StorageVersion != KeyStorageVersion {
-		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports version %d only); regenerate the key",
-			disk.StorageVersion, KeyStorageVersion)
+	switch v := head.StorageVersion; {
+	case v == KeyStorageVersion:
+		var disk keyPairOnDisk
+		if err := json.Unmarshal(data, &disk); err != nil {
+			return nil, err
+		}
+		return &keyFile{raw: data, v4: &disk}, nil
+	case v == SecurityKeyStorageVersion:
+		f, err := parseSecurityKeyFile(data, name)
+		if err != nil {
+			return nil, err
+		}
+		return &keyFile{raw: data, v5: f}, nil
+	case v > SecurityKeyStorageVersion:
+		return nil, fmt.Errorf("key storage version %d needs a newer version of DeepSecret", v)
+	default:
+		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports versions %d and %d); regenerate the key",
+			v, KeyStorageVersion, SecurityKeyStorageVersion)
 	}
-	return &disk, nil
 }
 
 // ListLocalKeys returns fingerprints of all key pairs stored in the default
@@ -407,7 +455,7 @@ func decryptOnDisk(kp *KeyPair, password string) error {
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, keystoreAAD(fp))
 	if err != nil {
-		return fmt.Errorf("wrong password or corrupted key file")
+		return ErrWrongPassword
 	}
 
 	var priv privateKeysJSON

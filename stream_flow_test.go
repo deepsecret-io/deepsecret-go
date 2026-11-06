@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/deepsecret-io/sdk/payload"
+	"github.com/deepsecret-io/sdk/internal/payload"
 )
 
 func randomBytes(t *testing.T, n int) []byte {
@@ -85,8 +85,7 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	writeFile(t, filepath.Join(src, "empty"), nil, 0o644)
 
 	sendTmp, recvTmp := t.TempDir(), t.TempDir()
-	res, err := f.client("alice@example.com").EncryptPaths([]string{"bob@example.com"}, []string{src},
-		EncryptOptions{Name: "tree", Compress: CompressZstd, TempDir: sendTmp})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Name: "tree", Compress: CompressZstd, TempDir: sendTmp})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +106,7 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	}
 
 	out := filepath.Join(t.TempDir(), "out")
-	result, written, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{TempDir: recvTmp}, WriteOptions{})
+	result, written, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{TempDir: recvTmp}, WriteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,10 +127,10 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	}
 
 	// Decrypting again into the same directory replaces nothing.
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second decrypt: %v", err)
 	}
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{}, WriteOptions{Overwrite: true}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{}, WriteOptions{Overwrite: true}); err != nil {
 		t.Fatalf("decrypt with overwrite: %v", err)
 	}
 }
@@ -148,8 +147,7 @@ func TestStreamArchiveRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := f.client("alice@example.com").EncryptPaths([]string{"bob@example.com"}, []string{src},
-		EncryptOptions{Name: "bundle", Archive: true, Compress: CompressZstd})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Name: "bundle", Archive: true, Compress: CompressZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +156,7 @@ func TestStreamArchiveRoundTrip(t *testing.T) {
 	}
 
 	out := t.TempDir()
-	_, written, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{}, WriteOptions{})
+	_, written, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{}, WriteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +179,7 @@ func TestStreamMultipartRoundTrip(t *testing.T) {
 	data := randomBytes(t, 12<<20)
 	writeFile(t, src, data, 0o600)
 
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{Compress: CompressZstd, UploadThreads: 3})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Compress: CompressZstd, UploadThreads: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +191,7 @@ func TestStreamMultipartRoundTrip(t *testing.T) {
 	}
 
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{DownloadThreads: 4}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{DownloadThreads: 4}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "backup.bin"), data, 0o600)
@@ -212,7 +210,7 @@ func TestSendAndDownloadReportProgress(t *testing.T) {
 	var encDone, encTotal int64
 	backwards := false
 	var upload TransferStatus
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{
 		UploadThreads: 3,
 		UploadStatus:  &upload,
 		OnEncryptProgress: func(done, total int64) {
@@ -234,7 +232,7 @@ func TestSendAndDownloadReportProgress(t *testing.T) {
 
 	var download TransferStatus
 	passes := passRecorder{}
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, t.TempDir(), DecryptOptions{
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, t.TempDir(), DecryptOptions{
 		DownloadThreads: 4, DownloadStatus: &download, OnDecryptProgress: passes.record,
 	}, WriteOptions{}); err != nil {
 		t.Fatal(err)
@@ -248,7 +246,7 @@ func TestSendAndDownloadReportProgress(t *testing.T) {
 	}
 
 	var small TransferStatus
-	res, err = f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{UploadStatus: &small})
+	res, err = f.client("alice@example.com").EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{UploadStatus: &small})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,12 +291,12 @@ func TestDecryptReportsItsPasses(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.client("alice@example.com"), f.client("bob@example.com")
 
-	res, err := alice.EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{})
+	res, err := alice.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	passes := passRecorder{}
-	if _, err := bob.DecryptSecretFull(res.Secret.ID, DecryptOptions{OnDecryptProgress: passes.record}); err != nil {
+	if _, err := bob.DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{OnDecryptProgress: passes.record}); err != nil {
 		t.Fatal(err)
 	}
 	passes.check(t, res.EncryptedSize, DecryptDecrypting)
@@ -306,12 +304,12 @@ func TestDecryptReportsItsPasses(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "a.txt"), []byte("one"), 0o600)
 	writeFile(t, filepath.Join(dir, "b.txt"), []byte("two"), 0o600)
-	res, err = alice.EncryptPaths([]string{"bob@example.com"}, []string{dir}, EncryptOptions{Archive: true})
+	res, err = alice.EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{dir}, EncryptOptions{Archive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	passes = passRecorder{}
-	if _, _, err := bob.DecryptToDir(res.Secret.ID, t.TempDir(), DecryptOptions{OnDecryptProgress: passes.record}, WriteOptions{}); err != nil {
+	if _, _, err := bob.DecryptToDir(context.Background(), res.Secret.ID, t.TempDir(), DecryptOptions{OnDecryptProgress: passes.record}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	passes.check(t, res.EncryptedSize, DecryptChecking, DecryptCheckingArchive, DecryptWriting)
@@ -325,13 +323,13 @@ func TestDownloadRenewsRefusedURL(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "six.bin")
 	data := randomBytes(t, 20<<20)
 	writeFile(t, src, data, 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	out := t.TempDir()
-	if _, _, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, out, DecryptOptions{DownloadThreads: 2}, WriteOptions{}); err != nil {
+	if _, _, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, out, DecryptOptions{DownloadThreads: 2}, WriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(out, "six.bin"), data, 0)
@@ -345,13 +343,26 @@ func TestFilesDecryptInMemory(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	src := filepath.Join(t.TempDir(), "key.pem")
 	writeFile(t, src, []byte("-----BEGIN KEY-----"), 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{Compress: CompressZstd})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Compress: CompressZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := f.client("bob@example.com").DecryptSecret(res.Secret.ID)
-	if err != nil || len(out.Files) != 1 || string(out.Files[0].Data) != "-----BEGIN KEY-----" || out.Files[0].Name != "key.pem" {
+	out, err := f.client("bob@example.com").DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{})
+	if err != nil || len(out.Decrypted.Files) != 1 || string(out.Decrypted.Files[0].Data) != "-----BEGIN KEY-----" || out.Decrypted.Files[0].Name != "key.pem" {
 		t.Fatalf("%+v, %v", out, err)
+	}
+}
+
+// A file name that is not a safe relative path is refused in memory too,
+// so a caller writing the files out cannot be led out of its directory.
+func TestPayloadRefusesUnsafeFileNames(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	bob := f.client("bob@example.com")
+	for _, name := range []string{"../evil", "/etc/evil", "a/../../evil", "a\\b", "."} {
+		id := sendRaw(t, f, payload.Payload{Type: "files", Files: []payload.FileEntry{fileEntry("ok.txt", "fine"), fileEntry(name, "x")}})
+		if out, err := bob.DecryptSecret(context.Background(), id, DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "unsafe file") {
+			t.Errorf("%q: %+v, %v, want it refused", name, out, err)
+		}
 	}
 }
 
@@ -392,7 +403,7 @@ func TestWriteFilesRefusesHostilePayloads(t *testing.T) {
 		id := sendRaw(t, f, payload.Payload{Type: "files", Files: c.files})
 		parent := t.TempDir()
 		out := filepath.Join(parent, "out")
-		if _, _, err := bob.DecryptToDir(id, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, _, err := bob.DecryptToDir(context.Background(), id, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: got %v, want %q", name, err, c.want)
 			continue
 		}
@@ -405,7 +416,7 @@ func TestWriteFilesRefusesHostilePayloads(t *testing.T) {
 	id := sendRaw(t, f, payload.Payload{Type: "files", Files: []payload.FileEntry{fileEntry("a.txt", "new"), fileEntry("b.txt", "new")}})
 	out := t.TempDir()
 	writeFile(t, filepath.Join(out, "b.txt"), []byte("mine"), 0o600)
-	if _, _, err := bob.DecryptToDir(id, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, _, err := bob.DecryptToDir(context.Background(), id, out, DecryptOptions{}, WriteOptions{}); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("existing destination: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "a.txt")); !os.IsNotExist(err) {
@@ -440,11 +451,11 @@ func TestStreamingKeepsMemoryFlat(t *testing.T) {
 		out.Close()
 		want := hex.EncodeToString(h.Sum(nil))
 		return measurePeakHeap(t, func() {
-			res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{Compress: CompressZstd})
+			res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Compress: CompressZstd})
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, written, err := f.client("bob@example.com").DecryptToDir(res.Secret.ID, t.TempDir(), DecryptOptions{}, WriteOptions{})
+			_, written, err := f.client("bob@example.com").DecryptToDir(context.Background(), res.Secret.ID, t.TempDir(), DecryptOptions{}, WriteOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -495,11 +506,11 @@ func measurePeakHeap(t *testing.T, fn func()) uint64 {
 func TestSendFailureRemovesTemporaryFile(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
 	alice := f.client("alice@example.com")
-	if _, err := alice.EncryptText([]string{"bob@example.com", "carol@example.com"}, "v1", EncryptOptions{Name: "db"}); err != nil {
+	if _, err := alice.EncryptText(context.Background(), []string{"bob@example.com", "carol@example.com"}, "v1", EncryptOptions{Name: "db"}); err != nil {
 		t.Fatal(err)
 	}
 	tmp := t.TempDir()
-	if _, err := alice.EncryptText([]string{"bob@example.com"}, "v2", EncryptOptions{Name: "db", TempDir: tmp}); err == nil {
+	if _, err := alice.EncryptText(context.Background(), []string{"bob@example.com"}, "v2", EncryptOptions{Name: "db", TempDir: tmp}); err == nil {
 		t.Fatal("a send leaving out carol was accepted")
 	}
 	assertEmptyDir(t, tmp)
@@ -510,12 +521,12 @@ func TestSendFailureRemovesTemporaryFile(t *testing.T) {
 func TestSmallPayloadsNeedNoTempDir(t *testing.T) {
 	t.Setenv(TempDirEnv, filepath.Join(t.TempDir(), "missing", "dir"))
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	res, err := f.client("alice@example.com").EncryptText([]string{"bob@example.com"}, "hello", EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptText(context.Background(), []string{"bob@example.com"}, "hello", EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := f.client("bob@example.com").DecryptSecret(res.Secret.ID)
-	if err != nil || out.Message != "hello" {
+	out, err := f.client("bob@example.com").DecryptSecret(context.Background(), res.Secret.ID, DecryptOptions{})
+	if err != nil || out.Decrypted.Message != "hello" {
 		t.Fatalf("%+v, %v", out, err)
 	}
 }
@@ -527,7 +538,7 @@ func TestSendRefusesDuplicateNames(t *testing.T) {
 	a, b := filepath.Join(t.TempDir(), "same.txt"), filepath.Join(t.TempDir(), "same.txt")
 	writeFile(t, a, []byte("a"), 0o600)
 	writeFile(t, b, []byte("b"), 0o600)
-	if _, err := f.client("alice@example.com").EncryptFiles([]string{"bob@example.com"}, []string{a, b}, EncryptOptions{}); err == nil || !strings.Contains(err.Error(), "two files are named") {
+	if _, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{a, b}, EncryptOptions{}); err == nil || !strings.Contains(err.Error(), "archive path collision") {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -537,19 +548,18 @@ func TestWriteFilesStopsOnCancel(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	src := filepath.Join(t.TempDir(), "f.bin")
 	writeFile(t, src, randomBytes(t, 1<<20), 0o600)
-	res, err := f.client("alice@example.com").EncryptFile([]string{"bob@example.com"}, src, EncryptOptions{})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	bob := f.client("bob@example.com")
-	opened, err := bob.OpenSecret(res.Secret.ID, DecryptOptions{})
+	opened, err := bob.OpenSecret(context.Background(), res.Secret.ID, DecryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer opened.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	bob.api.SetRootContext(ctx)
 	opened.ctx = ctx
 	out := filepath.Join(t.TempDir(), "out")
 	if _, err := opened.WriteFiles(out, WriteOptions{}); !errors.Is(err, context.Canceled) {
@@ -579,5 +589,51 @@ func TestWriteChecks(t *testing.T) {
 	}
 	if err := checkDestination(dir, "new/dir/f", false); err != nil {
 		t.Fatalf("new path: %v", err)
+	}
+}
+
+// One path names the secret, unless it has no name of its own.
+func TestEncryptPathsNamesTheSecret(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "report.txt")
+	writeFile(t, file, []byte("a"), 0o600)
+	other := filepath.Join(dir, "other.txt")
+	writeFile(t, other, []byte("b"), 0o600)
+	send := func(paths ...string) string {
+		t.Helper()
+		res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, paths, EncryptOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Secret.Name
+	}
+	if got := send(file); got != "report.txt" {
+		t.Errorf("one path: %q", got)
+	}
+	if got := send(file, other); !strings.HasPrefix(got, "sdk-") {
+		t.Errorf("two paths: %q", got)
+	}
+}
+
+// Each call ends with its own context, and only that call: AcceptKey and
+// VerifyKey ask the server too.
+func TestCallsEndWithTheirContext(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	c := f.client("alice@example.com")
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.WhoAmI(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WhoAmI: %v", err)
+	}
+	fp := strings.Repeat("a", 64)
+	if err := c.AcceptKey(cancelled, "bob@example.com", fp); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AcceptKey: %v", err)
+	}
+	if err := c.VerifyKey(cancelled, "bob@example.com", fp); !errors.Is(err, context.Canceled) {
+		t.Fatalf("VerifyKey: %v", err)
+	}
+	if _, err := c.WhoAmI(context.Background()); err != nil {
+		t.Fatalf("a later call on the same client: %v", err)
 	}
 }

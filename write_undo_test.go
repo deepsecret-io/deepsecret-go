@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deepsecret-io/sdk/payload"
+	"github.com/deepsecret-io/sdk/internal/payload"
 )
 
 // stopWhen is a context that reports itself cancelled once stop says so,
@@ -81,7 +81,7 @@ func TestWriteFilesFailureRemovesWhatItCreated(t *testing.T) {
 		if overwrite {
 			writeFile(t, filepath.Join(out, "new", "a.bin"), []byte("old"), 0o644)
 		}
-		opened, err := bob.OpenSecret(id, DecryptOptions{})
+		opened, err := bob.OpenSecret(context.Background(), id, DecryptOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -109,15 +109,14 @@ func TestWriteFilesArchiveFailureRemovesWhatItCreated(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "tree")
 	writeFile(t, filepath.Join(src, "one.bin"), randomBytes(t, size), 0o600)
 	writeFile(t, filepath.Join(src, "two.bin"), randomBytes(t, size), 0o600)
-	res, err := f.client("alice@example.com").EncryptPaths([]string{"bob@example.com"}, []string{src},
-		EncryptOptions{Name: "bundle", Archive: true, Compress: CompressZstd})
+	res, err := f.client("alice@example.com").EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, EncryptOptions{Name: "bundle", Archive: true, Compress: CompressZstd})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	out := t.TempDir()
 	writeFile(t, filepath.Join(out, "keep.txt"), []byte("mine"), 0o644)
-	opened, err := f.client("bob@example.com").OpenSecret(res.Secret.ID, DecryptOptions{})
+	opened, err := f.client("bob@example.com").OpenSecret(context.Background(), res.Secret.ID, DecryptOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

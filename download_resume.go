@@ -20,7 +20,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/deepsecret-io/sdk/api"
-	"github.com/deepsecret-io/sdk/crypto"
+	"github.com/deepsecret-io/sdk/internal/protocol"
+	"github.com/deepsecret-io/sdk/internal/transport"
 )
 
 // ── Resumable downloads ─────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ func (e *DownloadInterruptedError) Unwrap() error { return e.Err }
 // starts one there, locked for this decrypt. The record's Have is what the
 // spool already holds. A kept download that does not agree with m, or that
 // came from another server, starts over.
-func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *crypto.Manifest, log *slog.Logger) (*spool, *PendingDownload, error) {
+func (c *Client) openDownloadSpool(dir string, secret *SecretInfo, m *protocol.Manifest, log *slog.Logger) (*spool, *PendingDownload, error) {
 	if id, err := uuid.Parse(m.RevisionID); err != nil || id.String() != m.RevisionID {
 		return nil, nil, fmt.Errorf("revision ID %q is not a UUID", m.RevisionID)
 	}
@@ -286,7 +287,7 @@ func readDownloadRecord(pdir string) (*PendingDownload, error) {
 	if p.Size <= 0 {
 		return nil, fmt.Errorf("download record %s has no size", pdir)
 	}
-	if p.Have, err = api.MergeRanges(p.Have, p.Size); err != nil {
+	if p.Have, err = transport.MergeRanges(p.Have, p.Size); err != nil {
 		return nil, fmt.Errorf("download record %s: %w", pdir, err)
 	}
 	p.Dir = pdir
@@ -348,7 +349,7 @@ func newDownloadJournal(f *os.File, rec *PendingDownload) *downloadJournal {
 func (j *downloadJournal) add(from, to int64) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if have, err := api.MergeRanges(append(slices.Clip(j.have), [2]int64{from, to}), j.size); err == nil {
+	if have, err := transport.MergeRanges(append(slices.Clip(j.have), [2]int64{from, to}), j.size); err == nil {
 		j.have, j.dirty = have, true
 	}
 }

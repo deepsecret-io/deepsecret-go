@@ -20,19 +20,18 @@ The SDK must be usable standalone without the CLI.
 - CLI, UI, or other clients must not reimplement SDK logic
 
 2. Layering inside SDK
-- sdk/client.go → public entrypoint only
-- sdk/api → HTTP transport layer
-- sdk/crypto → cryptographic primitives
-- sdk/payload → CBOR encoding/decoding
-- sdk/archive → file expansion + tar
-- sdk/compress → compression primitives
-- sdk/secrets → secret workflows
-- sdk/identity → identity/key workflows
+- sdk/ → the public client and its workflows: secrets, accounts, known keys
+- sdk/api → API errors, transfer status, log conventions
+- sdk/crypto → key pairs, key files, fingerprints, safety numbers
+- sdk/fido2 → security keys
+- sdk/internal/transport → HTTP, presigned uploads and downloads
+- sdk/internal/protocol → sealing, opening, the manifest, wraps, the stream
+- sdk/internal/payload → CBOR encoding/decoding
+- sdk/internal/archive → file expansion + tar
+- sdk/internal/compress → compression primitives
 
 3. No cross-layer leakage
-- crypto must not depend on api
-- payload must not depend on api
-- archive/compress must not depend on api
+- crypto, protocol, payload, archive and compress must not depend on transport
 - only top-level SDK layers orchestrate across packages
 
 ---
@@ -46,7 +45,7 @@ The SDK must be usable standalone without the CLI.
 5. SDK methods must be high-level
 Examples:
 - EncryptText
-- EncryptFiles
+- EncryptPaths
 - DecryptSecret
 - DescribeSecretFull
 - UpdatePolicy

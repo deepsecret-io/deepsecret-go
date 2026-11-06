@@ -3,7 +3,11 @@
 
 package crypto
 
-import "testing"
+import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"testing"
+)
 
 func TestGenerateKeyPair(t *testing.T) {
 	kp, err := GenerateKeyPair()
@@ -88,5 +92,27 @@ func TestSignAndVerifyKeyBundle(t *testing.T) {
 	// Wrong ML-DSA-65 key should fail
 	if err := VerifyKeyBundleSignature(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp2.MLDSA65PK, edSig, mldsaSig); err == nil {
 		t.Error("mismatched mldsa65 key should fail verification")
+	}
+}
+
+// A self-signature covers the bundle digest itself, nothing before or
+// after it. Every registered key on the server is signed so, and the API
+// checks the same bytes: changing them is a protocol change.
+func TestKeyBundleSignatureCoversTheDigest(t *testing.T) {
+	kp, _ := GenerateKeyPair()
+	digest, err := keyBundleDigest(kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edPriv, _ := base64.RawStdEncoding.DecodeString(kp.ED25519Private)
+	seed, _ := base64.RawStdEncoding.DecodeString(kp.MLDSA65Seed)
+	mldsaSig, err := SignMLDSA65(seed, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edSig := ed25519.Sign(ed25519.PrivateKey(edPriv), digest)
+	if err := VerifyKeyBundleSignature(kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK,
+		base64.RawStdEncoding.EncodeToString(edSig), base64.RawStdEncoding.EncodeToString(mldsaSig)); err != nil {
+		t.Errorf("a signature over the digest: %v", err)
 	}
 }

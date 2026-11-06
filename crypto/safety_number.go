@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/deepsecret-io/sdk/internal/canon"
 )
 
 // ── Safety numbers ──────────────────────────────────────────────────────────
 //
 // A safety number is a key fingerprint as decimal digits, for two people to
-// read to each other and compare (sdk/PROTOCOL_V4.md §11). A key's number
+// read to each other and compare (PROTOCOL_V4.md §11). A key's number
 // is 30 digits; the number of two keys is both of theirs, the smaller one
 // first, so each of the two people sees the same 60 digits.
 
@@ -44,7 +46,7 @@ var ErrSafetyNumberInput = errors.New("a safety number needs a full key fingerpr
 //	5199 times: h = SHA-512(h || fp32)
 //	six 5-byte big-endian integers from h[0:30], each mod 100000, as 5 digits
 func SafetyNumber(fingerprint string) (string, error) {
-	if !isFingerprint(fingerprint) {
+	if !canon.IsFingerprint(fingerprint) {
 		return "", ErrSafetyNumberInput
 	}
 	fp, err := hex.DecodeString(fingerprint)

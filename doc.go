@@ -13,17 +13,19 @@
 //
 // # Package Structure
 //
-//	sdk/           : high-level orchestration (encrypt, decrypt, revoke)
-//	sdk/api/       : HTTP client, presigned URL upload/download
-//	sdk/identity/  : actor info, key management, resolution
-//	sdk/secrets/   : secret CRUD, creation request types
-//	sdk/payload/   : CBOR payload types (wire format)
-//	sdk/crypto/    : payload stream, HPKE wraps, signed manifest, keystore
-//	sdk/compress/  : streaming zstd compression/decompression
-//	sdk/archive/   : tar creation/extraction, path validation
+//	sdk/        : the client: encrypt, decrypt, revoke, accounts and keys
+//	sdk/api/    : API errors, transfer status and log conventions
+//	sdk/crypto/ : key pairs, key files, fingerprints and safety numbers
+//	sdk/fido2/  : security keys, through libfido2
 //
-// The crypto, compress, and archive packages are standalone with no API
-// dependency. They can be used independently or ported to other languages.
+// The protocol, transport and file handling behind them are internal.
+// PROTOCOL_V4.md specifies the protocol for ports to other languages.
+//
+// # Contexts
+//
+// Every call that can block takes a context first, and ends when it does:
+// requests in flight, a transfer between its parts, and a prompt for a security
+// key.
 //
 // # Recipients
 //
@@ -51,28 +53,28 @@
 // else $DEEPSECRET_TMPDIR, else the system temp directory.
 //
 // Messages and key-value data are small and are handled in memory, as is
-// DecryptSecretFull for payloads up to DefaultMaxInMemorySize.
+// DecryptSecret for payloads up to DefaultMaxInMemorySize.
 //
 // # Quick Start
 //
-//	client, err := sdk.NewClient("https://api.deepsecret.io", "your-api-key")
+//	client, err := sdk.NewClient("https://transport.deepsecret.io", "your-api-key")
 //	if err != nil { log.Fatal(err) }
 //
 //	// Encrypt a message for two recipients in one send
-//	res, _ := client.EncryptText([]string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
+//	res, _ := client.EncryptText(ctx, []string{"alice@example.com", "bob@example.com"}, "sensitive data", sdk.EncryptOptions{})
 //
 //	// Decrypt a secret (as one of its recipients)
-//	result, _ := client.DecryptSecret(res.Secret.ID)
-//	fmt.Println(result.Message)
+//	result, _ := client.DecryptSecret(ctx, res.Secret.ID, sdk.DecryptOptions{})
+//	fmt.Println(result.Decrypted.Message)
 //
 //	// Write a files secret of any size to disk
-//	_, written, _ := client.DecryptToDir(secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
+//	_, written, _ := client.DecryptToDir(ctx, secretID, "./out", sdk.DecryptOptions{}, sdk.WriteOptions{})
 //	fmt.Println(len(written.Files), "files")
 //
 // # Secret Management
 //
-//	secrets, total, _ := client.ListSecrets("received", sdk.ListOptions{Limit: 50})
-//	info, _ := client.DescribeSecret(secretID)
-//	client.RevokeRecipient(secretID, "bob@example.com")
-//	client.DeleteSecret(secretID)
+//	secrets, total, _ := client.ListReceivedSecrets(ctx, sdk.ListOptions{Limit: 50})
+//	info, _ := client.DescribeSecret(ctx, secretID)
+//	client.RevokeRecipient(ctx, secretID, "bob@example.com")
+//	client.DeleteSecret(ctx, secretID)
 package sdk
