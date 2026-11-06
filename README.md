@@ -227,7 +227,23 @@ belongs to:
   send or a key registration. That trusts how this device first learned those keys: a
   server that listed one of them for a contact then could get that contact
   recorded as yours, after which sends to them are refused until you forget
-  it. A secret signed by a key on this device is yours.
+  it.
+- **Secrets signed by your own keys.** The server names a secret's sender,
+  so your key must not make your own secret pass as someone else's. A key
+  recorded for one of your accounts passes for no other, even once it has
+  left this device: a key belongs to one account. Any other key on this
+  device passes for one of your accounts, or for someone this device knows by
+  that very key. For someone this device knows by another key it is refused
+  with a `*KeyChangedError`, and for someone it does not know it is refused
+  as a possible relabelling. One limit remains: a key pair here that is
+  recorded for none of your accounts, and that this device knows for someone
+  else, passes as theirs. This device cannot tell a server that listed such a
+  key for a contact on first contact from another of your accounts it does
+  not know is yours yet, and refusing it would refuse that account's secrets
+  too. A key is recorded once it is registered, or signs a send, from an
+  account recorded here, so this takes a key that only signed elsewhere or
+  for an account not recorded. What can go wrong is who your own secret
+  appears to come from: the server gains no plaintext and chooses no content.
 - **Everyone else's: trust on first use.** The first send to someone, or
   the first secret from them, accepts their key and reports it
   (`EncryptResult.FirstUse`, `DecryptResult.SenderFirstUse`) so you can

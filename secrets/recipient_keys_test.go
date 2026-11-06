@@ -266,6 +266,177 @@ func TestServerCannotClaimAContactPinnedWithYourKey(t *testing.T) {
 	}
 }
 
+// pinKeyFor makes c's device record kp, a key pair it holds, as email's key:
+// a hostile server lists it for them on first contact, and the user sends
+// them a local file, since the fake's create refuses a key that is not theirs.
+func pinKeyFor(t *testing.T, f *fakeAPI, c *deepsecret.Client, kp *keys.Pair, email string) {
+	t.Helper()
+	fp, _ := keys.Fingerprint(kp)
+	edSig, mldsaSig, err := directory.SignKeyBundle(kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.editBundle = func(e string, b map[string]any) {
+		if e == email {
+			b["ed25519"], b["x25519"], b["mlkem768"], b["mldsa65"] = kp.ED25519Public, kp.X25519Public, kp.MLKEM768PK, kp.MLDSA65PK
+			b["fingerprint"], b["signature"], b["signature_mldsa65"] = fp, edSig, mldsaSig
+		}
+	}
+	defer func() { f.editBundle = nil }()
+	if _, err := c.Secrets.EncryptText(context.Background(), []string{email}, "hello", secrets.EncryptOptions{LocalFile: filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)}); err != nil {
+		t.Fatal(err)
+	}
+	if known := knownKeys(t, c, email); len(known) != 1 || known[fp].State != trust.FirstUse {
+		t.Fatalf("%s's known keys %+v, want %s on first use", email, known, fp)
+	}
+}
+
+// ownNotes has c send email, the caller's account, a secret and a local file
+// signed with identity, or the primary key when it is empty, and returns the
+// secret's id and the file's path.
+func ownNotes(t *testing.T, c *deepsecret.Client, email, identity string) (id, path string) {
+	t.Helper()
+	note, err := c.Secrets.EncryptText(context.Background(), []string{email}, "my note", secrets.EncryptOptions{Name: "n", Identity: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+	if _, err := c.Secrets.EncryptText(context.Background(), []string{email}, "my note", secrets.EncryptOptions{LocalFile: path, Identity: identity}); err != nil {
+		t.Fatal(err)
+	}
+	return note.Secret.ID, path
+}
+
+// wantRelabelRefused has the server name sender as the sender of the secret id
+// and of the local file at path, both signed with signer, and list signer for
+// them. Both decrypt paths must refuse them for reader, saying want.
+func wantRelabelRefused(t *testing.T, f *fakeAPI, reader, sender *fakeActor, signer *keys.Pair, id, path, want string) {
+	t.Helper()
+	f.mu.Lock()
+	f.secrets[id].senderID = sender.id
+	sender.old = append(sender.old, signer)
+	f.mu.Unlock()
+	if res, err := f.client(reader.email).Secrets.Decrypt(context.Background(), id, secrets.DecryptOptions{}); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("own secret relabelled as %s's: %+v, %v, want it refused", sender.email, res, err)
+	}
+	relabelLocalSender(t, path, sender.email)
+	if res, err := f.openLocal(reader.email, path); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("own local file relabelled as %s's: %+v, %v, want it refused", sender.email, res, err)
+	}
+}
+
+// A server that lists one of the user's own keys as a contact's on first
+// contact, so this device records it for them, cannot then pass a secret the
+// user signed off as that contact's, on either decrypt path: finding the key
+// among the contact's known keys does not make it theirs.
+func TestOwnSecretDoesNotPassAsContactPinnedWithYourKey(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	c := f.client(alice.email)
+	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	pinKeyFor(t, f, c, alice.kp, bob.email)
+	id, path := ownNotes(t, c, alice.email, "")
+	wantRelabelRefused(t, f, alice, bob, alice.kp, id, path, "your account "+alice.email)
+	if known := knownKeys(t, c, bob.email); len(known) != 1 || known[alice.fp].State != trust.FirstUse {
+		t.Fatalf("bob's known keys %+v, want them unchanged", known)
+	}
+}
+
+// A key recorded for one of the user's accounts stays theirs once its key pair
+// has left this device: what it signed still does not pass as a contact's, or
+// as someone new on first use, which would record the key for them.
+func TestOwnSecretDoesNotPassAsContactOnceItsKeyLeftThisDevice(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	c := f.client(alice.email)
+	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	signer, signerFP := alice.kp, alice.fp
+	pinKeyFor(t, f, c, signer, bob.email)
+	rotate(t, alice)
+	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	id, path := ownNotes(t, c, alice.email, signerFP)
+	if err := os.Remove(filepath.Join(alice.keys, signerFP+".json")); err != nil {
+		t.Fatal(err)
+	}
+	wantRelabelRefused(t, f, alice, bob, signer, id, path, "your account "+alice.email)
+	wantRelabelRefused(t, f, alice, carol, signer, id, path, "your account "+alice.email)
+	if known := knownKeys(t, c, carol.email); len(known) != 0 {
+		t.Fatalf("carol's known keys %+v, want none", known)
+	}
+}
+
+// One device, two of the user's accounts, neither having sent to the other.
+// Alice is recorded first, so bob's first send leaves him unrecorded: the
+// server's claim alone does not make him the user's. His secret is refused,
+// saying what to do, and opens once a key is registered for him here.
+func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	f.sameDevice(alice, bob)
+	device := filepath.Join(t.TempDir(), "known_keys.json")
+	a, b := f.clientOn(alice.email, alice.keys, device), f.clientOn(bob.email, bob.keys, device)
+	if err := a.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "does not know as yours") || !strings.Contains(err.Error(), "sync your identity") {
+		t.Fatalf("read before bob is recorded: %+v, %v, want it refused", out, err)
+	}
+	if err := b.Identity.Sync(context.Background(), bob.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	out, err := a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
+	if err != nil {
+		t.Fatalf("read once bob is recorded: %v", err)
+	}
+	if out.SenderEmail != bob.email || out.SenderFirstUse {
+		t.Fatalf("read as %s, first use %v", out.SenderEmail, out.SenderFirstUse)
+	}
+}
+
+// A server can get a contact recorded as the user's own: it lists a spare key
+// pair on this device for them on first contact, then says the caller is them
+// (RecordOwnAccount says what that trusts). That still does not pass a secret
+// signed with another account's key off as theirs, on either decrypt path: a
+// key belongs to one account.
+func TestOwnSecretDoesNotPassAsContactRecordedAsYours(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	c := f.client(alice.email)
+	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+		t.Fatal(err)
+	}
+	spare, err := keys.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spareFP, _ := keys.Fingerprint(spare)
+	if err := keystore.Save(alice.keys, spareFP, spare, ""); err != nil {
+		t.Fatal(err)
+	}
+	pinKeyFor(t, f, c, spare, bob.email)
+	id, path := ownNotes(t, c, alice.email, "")
+
+	f.whoAmI = bob.email
+	if err := c.Identity.Sync(context.Background(), spare, false); err != nil {
+		t.Fatal(err)
+	}
+	f.whoAmI = ""
+	if known := knownKeys(t, c, bob.email); len(known) != 1 || known[spareFP].State != trust.Own {
+		t.Fatalf("bob's known keys %+v, want the spare key as the user's own", known)
+	}
+	wantRelabelRefused(t, f, alice, bob, alice.kp, id, path, "your account "+alice.email)
+}
+
 // One device, two of the user's accounts, sharing its known keys file.
 // Signed in as alice, a send to bob records his key, a key pair on this
 // device, on first use. Signed in as bob, the server rightly says the
@@ -381,6 +552,35 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 			t.Fatalf("send as bob: %v", err)
 		}
 		wantOwn(t, b, map[string]string{alice.fp: alice.email, first: bob.email, bob.fp: bob.email})
+	})
+
+	// Bob signed on another device that holds his key too, and this device
+	// has not recorded him as the user's yet. Alice sent to him, so this
+	// device knows him by that key, and his secret opens for her without
+	// accepting or recording anything. This device cannot tell that from a
+	// server that listed a spare key of the user's for a contact: the limit
+	// the README's Recipient Keys section and CheckSenderKey describe.
+	t.Run("secret from an account not recorded yet", func(t *testing.T) {
+		f, alice, bob, signIn := setup(t)
+		other := filepath.Join(t.TempDir(), "keys")
+		if err := keystore.Save(other, bob.fp, bob.kp, ""); err != nil {
+			t.Fatal(err)
+		}
+		res, err := f.clientOn(bob.email, other, filepath.Join(t.TempDir(), "known_keys.json")).Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "from bob"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := signIn(alice.email)
+		out, err := a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
+		if err != nil {
+			t.Fatalf("read before bob is recorded: %v", err)
+		}
+		if out.SenderEmail != bob.email || out.SenderFirstUse {
+			t.Fatalf("read as %s, first use %v", out.SenderEmail, out.SenderFirstUse)
+		}
+		if known := knownKeys(t, a, bob.email); len(known) != 1 || known[bob.fp].State != trust.FirstUse {
+			t.Fatalf("bob's known keys %+v, want his on first use still", known)
+		}
 	})
 
 	// Both accounts are recorded as the user's own. Signed in as alice, a

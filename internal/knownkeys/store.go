@@ -373,12 +373,25 @@ func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 }
 
 // CheckSenderKey checks fp, the key whose signatures on a secret from email
-// just verified, and logs why it is trusted. A key on this device is the
-// user's own and passes only for one of the user's own accounts recorded
-// here: the server names the sender, so a local key must not make the
-// user's own secret pass as someone else's, known or new. Anyone else's key
-// must pass CheckKey. It changes nothing: a key new to this device is
-// reported as first, for RecordFirstUse once the decrypt succeeds.
+// just verified, and logs why it is trusted. The server names the sender, so
+// the user's key must not make the user's own secret pass as someone else's,
+// known or new. A key recorded for one of the user's accounts passes for no
+// other email, on this device or not: a key belongs to one account, whatever
+// the server listed for email. Any other key on this device passes for one of
+// the user's accounts recorded here, or for someone this device knows by that
+// very key.
+//
+// One limit remains. A key on this device recorded for none of the user's
+// accounts, that this device knows for email, passes as theirs. This device
+// cannot tell a server that listed such a key for a contact on first contact
+// from another of the user's accounts it does not know is theirs yet (see
+// RecordOwnAccount), and refusing it would refuse that account's secrets too.
+// A key is recorded once it is registered, or signs a send, from an account
+// recorded here, so this takes a key that only signed elsewhere or for an
+// account not recorded.
+//
+// Anyone else's key must pass CheckKey. It changes nothing: a key new to this
+// device is reported as first, for RecordFirstUse once the decrypt succeeds.
 func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (bool, error) {
 	verified := func(own, first bool) {
 		logattr.Module(log, "verify").Debug("sender key verified", "email", email, "fingerprint", fp, "trust", KeyTrust(own, first))
@@ -389,26 +402,24 @@ func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (bool, error)
 	}
 	people := disk.Servers[s.server]
 	lower := strings.ToLower(email)
-	if s.isLocalKey(fp) {
-		entries := people[lower]
-		switch {
-		case OwnAccount(entries):
-		case len(entries) == 0:
-			return false, fmt.Errorf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sync your identity for it first)",
-				keys.ShortFingerprint(fp), email, email)
-		default:
-			if err := keyCheck(lower, fp, true, entries); err != nil {
-				return false, err
-			}
+	entries := people[lower]
+	local := s.isLocalKey(fp)
+	first := false
+	if !local || (len(entries) > 0 && !OwnAccount(entries)) {
+		if first, err = CheckKey(people, lower, fp, true); err != nil {
+			return false, err
 		}
-		verified(true, false)
-		return false, nil
 	}
-	first, err := CheckKey(people, lower, fp, true)
-	if err == nil {
-		verified(false, first)
+	if other := ownerOf(people, fp, lower); other != "" {
+		return false, fmt.Errorf("this secret is signed with %s, your account %s's key, but the server names %s as its sender: refusing it (possible relabelling by the server)",
+			keys.ShortFingerprint(fp), other, email)
 	}
-	return first, err
+	if local && len(entries) == 0 {
+		return false, fmt.Errorf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sync your identity for it first)",
+			keys.ShortFingerprint(fp), email, email)
+	}
+	verified(local, first)
+	return first, nil
 }
 
 // CheckNewest refuses m, the revision the server gives as its secret's
