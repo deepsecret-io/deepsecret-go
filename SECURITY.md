@@ -38,7 +38,7 @@ The SDK is before version 1.0, so security fixes go into the latest release only
 ## Scope
 
 - **This repository:** all of the SDK's code and the specification.
-- **[The CLI](https://github.com/deepsecret-io/cli):** report problems in its own code in that repository. If you are not sure which of the two a problem belongs to, report it in either.
-- **The hosted service** (`api.deepsecret.io`, `app.deepsecret.io` and `deepsecret.io`): use the same channel, here or in the CLI's repository.
+- **The CLI:** its repository is not public yet, so report problems in its code here too.
+- **The hosted service** (`api.deepsecret.io`, `app.deepsecret.io` and `deepsecret.io`): use the same channel.
 
 This policy does not give permission to test the hosted service. The [Terms of Service](https://deepsecret.io/terms.html) forbid probing it without written authorization, so report what you noticed and ask before testing further. Never access or change anyone else's account or data.

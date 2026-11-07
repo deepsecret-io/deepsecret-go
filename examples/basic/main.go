@@ -67,9 +67,9 @@ func main() {
 
 	// ── Encrypt key-value data ──
 	kvSecret, err := client.Secrets.EncryptData(context.Background(), recipients, map[string]string{
-		"DB_HOST":     "db.internal:5432",
-		"DB_PASSWORD": "super-secret-password",
-		"API_KEY":     "ak_live_xyz123",
+		"DB_HOST":     "db.example.com:5432",
+		"DB_PASSWORD": "example-password",
+		"API_KEY":     "example-api-key",
 	}, secrets.EncryptOptions{
 		Name:     "sdk-basic-data",
 		Compress: secrets.CompressZstd,

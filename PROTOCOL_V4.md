@@ -138,7 +138,7 @@ On the wire, with `manifest`, `enc` and `ct` in base64:
 
 ## 11. Safety numbers
 
-A safety number shows a key fingerprint as decimal digits, for two people to read to each other and compare, as Signal and WhatsApp do (numbers only). It is a display of the fingerprint: nothing in the protocol signs or sends it. `crypto/safety_number.go` is the Go implementation (`SafetyNumber`, `PairSafetyNumber`, `GroupDigits`); a client that cannot use the Go SDK, such as the web app, repeats it and must give the same digits for the vectors below.
+A safety number shows a key fingerprint as decimal digits, for two people to read to each other and compare, as Signal and WhatsApp do (numbers only). It is a display of the fingerprint: nothing in the protocol signs or sends it. `keys/safety_number.go` is the Go implementation (`SafetyNumber`, `PairSafetyNumber`, `GroupDigits`); a client that cannot use the Go SDK, such as the web app, repeats it and must give the same digits for the vectors below.
 
 - **Input:** a full identity key fingerprint (`keys.Fingerprint`): exactly 64 lower-case hex characters, the SHA-256 of the key bundle. Anything else is refused, upper-case hex included, since fingerprints are lower case everywhere. `fp32` is its 32 bytes.
 - **One key:** `h = SHA-512("DeepSecret safety number v1" || 0x00 || fp32)`, then 5199 more times `h = SHA-512(h || fp32)`: 5200 hashes in all, so finding a key with a matching number costs that much per try. `h[0:30]` is read as six 5-byte big-endian unsigned integers, each taken mod 100000 and written as 5 digits with leading zeros. The 30 digits are the key's number.
