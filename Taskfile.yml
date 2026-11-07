@@ -64,8 +64,14 @@ tasks:
 
   security:
     desc: 'Release gate: known vulnerabilities, gosec, disallowed licenses and secrets in git history (reports in reports/)'
-    # The four scans run in parallel; each one finishes and keeps its report
+    # The scans run in parallel; each one finishes and keeps its report
     # even when another fails, and the task fails if any of them did.
+    # gitleaks takes its rules from .gitleaks.toml and its exceptions from
+    # .gitleaksignore in the folder it scans, and obeys gitleaks:allow comments,
+    # so a commit could switch off its own scan. The files are refused and the
+    # comments ignored. --text and -m stop .gitattributes, NUL bytes and merge
+    # commits hiding a change from git log. This catches accidents and stray
+    # settings, not someone who can edit this file.
     deps:
       - task: scan
         vars: {NAME: govulncheck, CMD: 'go run {{.GOVULNCHECK}} ./...'}
@@ -74,7 +80,9 @@ tasks:
       - task: scan
         vars: {NAME: licenses, CMD: 'go run {{.OSV_SCANNER}} scan source --config=licenses.toml --licenses={{.LICENSES}} .'}
       - task: scan
-        vars: {NAME: gitleaks, CMD: 'go run {{.GITLEAKS}} git --no-banner --no-color --redact --verbose --log-opts=--all .'}
+        vars: {NAME: gitleaks-config, CMD: '{ test ! -e .gitleaks.toml && test ! -e .gitleaksignore || { echo "gitleaks would take its rules or exceptions from these files, so a commit could hide a leak. Remove .gitleaks.toml and .gitleaksignore."; false; }; }'}
+      - task: scan
+        vars: {NAME: gitleaks, CMD: 'go run {{.GITLEAKS}} git --ignore-gitleaks-allow --no-banner --no-color --redact --verbose --log-opts="--all --text -m" .'}
 
   scan:
     internal: true
