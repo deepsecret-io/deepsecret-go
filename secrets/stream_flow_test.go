@@ -66,7 +66,9 @@ func assertFile(t *testing.T, path string, want []byte, mode os.FileMode) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("%s: content differs (%d bytes, want %d)", path, len(got), len(want))
 	}
-	if mode != 0 {
+	// Windows has no such modes; what it writes is private to the user
+	// instead (internal/disk).
+	if mode != 0 && runtime.GOOS != "windows" {
 		info, _ := os.Stat(path)
 		if info.Mode().Perm() != mode {
 			t.Fatalf("%s: mode %o, want %o", path, info.Mode().Perm(), mode)
@@ -74,8 +76,9 @@ func assertFile(t *testing.T, path string, want []byte, mode os.FileMode) {
 	}
 }
 
-// Files stream from the sender's disk to the recipient's: names, contents
-// and permissions arrive, files_meta lists each file, and neither side
+// Files stream from the sender's disk to the recipient's: names and
+// contents arrive, each file private to the recipient with only its
+// owner's execute bit kept, files_meta lists each file, and neither side
 // leaves its temporary ciphertext behind.
 func TestStreamFilesRoundTrip(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
@@ -83,7 +86,7 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	big := randomBytes(t, 3<<20)
 	writeFile(t, filepath.Join(src, "a.txt"), []byte(strings.Repeat("compress me ", 1000)), 0o640)
 	writeFile(t, filepath.Join(src, "sub", "b.bin"), big, 0o600)
-	writeFile(t, filepath.Join(src, "empty"), nil, 0o644)
+	writeFile(t, filepath.Join(src, "empty"), nil, 0o755)
 
 	sendTmp, recvTmp := t.TempDir(), t.TempDir()
 	res, err := f.client("alice@example.com").Secrets.EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{src}, secrets.EncryptOptions{Name: "tree", Compress: secrets.CompressZstd, TempDir: sendTmp})
@@ -115,9 +118,9 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	if result.PayloadType != "files" || written.Archived || len(written.Files) != 3 {
 		t.Fatalf("result %+v, written %+v", result, written)
 	}
-	assertFile(t, filepath.Join(out, root, "a.txt"), []byte(strings.Repeat("compress me ", 1000)), 0o640)
+	assertFile(t, filepath.Join(out, root, "a.txt"), []byte(strings.Repeat("compress me ", 1000)), 0o600)
 	assertFile(t, filepath.Join(out, root, "sub", "b.bin"), big, 0o600)
-	assertFile(t, filepath.Join(out, root, "empty"), nil, 0o644)
+	assertFile(t, filepath.Join(out, root, "empty"), nil, 0o700)
 	// The directories made to hold decrypted files are private.
 	if runtime.GOOS != "windows" {
 		for _, dir := range []string{out, filepath.Join(out, root), filepath.Join(out, root, "sub")} {
@@ -166,6 +169,13 @@ func TestStreamArchiveRoundTrip(t *testing.T) {
 	}
 	root := filepath.Join(out, filepath.Base(src))
 	assertFile(t, filepath.Join(root, "dir", "data.bin"), data, 0o600)
+	// The archive's 0644 file and 0755 directory arrive private.
+	assertFile(t, filepath.Join(root, "notes.md"), []byte("# notes"), 0o600)
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(filepath.Join(root, "dir")); err != nil || info.Mode().Perm() != 0o700 {
+			t.Fatalf("dir: %v, %v; want a private directory", info, err)
+		}
+	}
 	if target, err := os.Readlink(filepath.Join(root, "link")); err != nil || target != "notes.md" {
 		t.Fatalf("symlink: %q, %v", target, err)
 	}

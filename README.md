@@ -213,7 +213,9 @@ proves the bundle is whole, not whose it is, so the SDK also checks who it
 belongs to:
 
 - **Your own keys.** Any account this device registers a key for
-  (`Identity.Sync`), and the one it first sends from on a server, is
+  (`Identity.Sync`), or records with a key pair here that is registered for
+  it from another device (`Identity.RecordOwnAccount`, the same record
+  without the upload), and the one it first sends from on a server, is
   recorded as yours, so what the server later says about who you are cannot
   change it. For one of your accounts only key pairs on this device pass: a
   send to it must use one, and a secret from it must be signed by one. If
@@ -235,7 +237,11 @@ belongs to:
   device passes for one of your accounts, or for someone this device knows by
   that very key. For someone this device knows by another key it is refused
   with a `*KeyChangedError`, and for someone it does not know it is refused
-  as a possible relabelling. One limit remains: a key pair here that is
+  as a possible relabelling, with a `*UnrecordedSenderError`: if that
+  account is yours, `Identity.RecordOwnAccount` with the key that signed it,
+  signed in as that account, records it and the secret opens. A send from
+  it records it only when it is the first account recorded on the server.
+  One limit remains: a key pair here that is
   recorded for none of your accounts, and that this device knows for someone
   else, passes as theirs. This device cannot tell a server that listed such a
   key for a contact on first contact from another of your accounts it does
@@ -244,6 +250,10 @@ belongs to:
   account recorded here, so this takes a key that only signed elsewhere or
   for an account not recorded. What can go wrong is who your own secret
   appears to come from: the server gains no plaintext and chooses no content.
+  So a decrypt says when this happens: `DecryptResult.SenderOwnKey` is set
+  for a secret signed with a key pair on this device, and
+  `SenderOwnAccount` when the sender is recorded as one of your accounts.
+  Own key without own account is this case: tell the user they signed it.
 - **Everyone else's: trust on first use.** The first send to someone, or
   the first secret from them, accepts their key and reports it
   (`EncryptResult.FirstUse`, `DecryptResult.SenderFirstUse`) so you can
@@ -283,8 +293,10 @@ accepting any key again.
 |---|---|
 | `WhoAmI`, `ResolveActorID` | The caller's account |
 | `ListKeys`, `Sync`, `SetPrimaryKey`, `DeleteKey`, `SetKeySecurityKey` | Keys registered on the server |
+| `RecordOwnAccount(ctx, fingerprint)` | Record the account as yours on this device, with a key pair here registered from another device |
 | `LoadPrimary(ctx, unlock)`, `PrimaryFingerprint` | The primary key pair on this device |
-| `ListGroups` | An org's groups and their members |
+| `ListGroups` | An org's groups and their members, for its owner and admins |
+| `ListMyGroups` | The groups the caller belongs to and their members, for any member |
 
 ### `secrets`: `client.Secrets`
 
@@ -303,7 +315,7 @@ accepting any key again.
 |---|---|
 | `List`, `Accept`, `Verify`, `Forget` | The keys this device knows |
 | `ServerListedKeys` | What the server lists for someone: only its claim, to compare and never to decide whom to trust |
-| `KeyChangedError`, `StaleRevisionError` | What a send or a decrypt refuses with |
+| `KeyChangedError`, `StaleRevisionError`, `UnrecordedSenderError` | What a send or a decrypt refuses with |
 
 ### `keys` and `keystore`: Keys
 

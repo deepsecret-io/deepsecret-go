@@ -9,11 +9,13 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
 
+	deepsecret "github.com/deepsecret-io/deepsecret-go"
 	"github.com/deepsecret-io/deepsecret-go/internal/protocol"
 	"github.com/deepsecret-io/deepsecret-go/secrets"
 )
@@ -21,7 +23,12 @@ import (
 // openLocal opens path as email and decrypts it in memory.
 func (f *fakeAPI) openLocal(email, path string) (*secrets.DecryptResult, error) {
 	f.t.Helper()
-	o, err := f.client(email).Secrets.OpenLocalFile(context.Background(), path, secrets.DecryptOptions{})
+	return openLocalWith(f.client(email), path)
+}
+
+// openLocalWith opens path with c and decrypts it in memory.
+func openLocalWith(c *deepsecret.Client, path string) (*secrets.DecryptResult, error) {
+	o, err := c.Secrets.OpenLocalFile(context.Background(), path, secrets.DecryptOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +61,7 @@ func TestLocalFileRoundTrip(t *testing.T) {
 	if err != nil || !bytes.HasPrefix(raw, secrets.LocalMagicItem) {
 		t.Fatalf("file does not start with the magic: %v", err)
 	}
-	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+	if info, _ := os.Stat(path); runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 { // Windows has no such modes
 		t.Errorf("file mode %v, want 0600", info.Mode().Perm())
 	}
 

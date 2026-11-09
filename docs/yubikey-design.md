@@ -423,11 +423,11 @@ time instead:
   returns `keystore.ErrNoSecurityKeySupport`.
 - On Linux, purego makes the binary depend on glibc's loader. So the CLI ships
   two Linux archives:
-  - `secret-linux-<arch>.tar.gz` stays fully static (`nofido2`) and runs
+  - `secret_linux_<arch>.tar.gz` stays fully static (`nofido2`) and runs
     anywhere, Alpine included.
-  - `secret-linux-<arch>-fido2.tar.gz` adds security keys.
+  - `secret_linux_<arch>_fido2.tar.gz` adds security keys.
 
-  `install.sh` picks the `-fido2` one only when `getconf GNU_LIBC_VERSION`
+  `install.sh` picks the `_fido2` one only when `getconf GNU_LIBC_VERSION`
   shows glibc.
 - macOS binaries always link libSystem, so they need no second archive.
 

@@ -346,7 +346,7 @@ func (c *Client) OpenLocalFile(ctx context.Context, path string, opt DecryptOpti
 	}
 	m := opened.Manifest
 	logManifestVerified(log, m, len(hdr.Manifest))
-	senderFirst, err := c.store.CheckSenderKey(hdr.SenderEmail, m.SenderFingerprint, log)
+	sender, err := c.store.CheckSenderKey(hdr.SenderEmail, m.SenderFingerprint, log)
 	if err != nil {
 		opened.Close()
 		return nil, fmt.Errorf("check sender %s: %w", hdr.SenderEmail, err)
@@ -376,7 +376,7 @@ func (c *Client) OpenLocalFile(ctx context.Context, path string, opt DecryptOpti
 	// under the checks.
 	logattr.Module(log, "decrypt").Debug("ciphertext storage", sp.logArgs(m.CiphertextSize)...)
 	o := &OpenedSecret{opened: opened, spool: sp, log: log, onProgress: opt.OnDecryptProgress,
-		recordSender: c.senderRecorder(hdr.SenderEmail, m.SenderFingerprint, senderFirst)}
+		recordSender: c.senderRecorder(hdr.SenderEmail, m.SenderFingerprint, sender.First)}
 	var src io.Reader = io.NewSectionReader(f, localPrefixLen, payloadSize)
 	if opt.OnDownloadProgress != nil {
 		src = &copyProgress{r: src, total: payloadSize, onProgress: opt.OnDownloadProgress}
@@ -416,7 +416,9 @@ func (c *Client) OpenLocalFile(ctx context.Context, path string, opt DecryptOpti
 		SignedAt:             time.Unix(m.Timestamp, 0),
 		SenderFingerprint:    m.SenderFingerprint,
 		SenderEmail:          hdr.SenderEmail,
-		SenderFirstUse:       senderFirst,
+		SenderFirstUse:       sender.First,
+		SenderOwnKey:         sender.Local,
+		SenderOwnAccount:     sender.OwnAccount,
 		RecipientFingerprint: localFP,
 		Recipients:           recipients,
 		Compressed:           m.Compressed,

@@ -8,9 +8,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/deepsecret-io/deepsecret-go/internal/disk/disktest"
 	"github.com/deepsecret-io/deepsecret-go/secrets"
 )
 
@@ -19,9 +21,7 @@ import (
 func interruptedSend(t *testing.T, f *fakeAPI, dir string) ([]byte, *secrets.UploadInterruptedError) {
 	t.Helper()
 	// The SDK keeps ciphertext only in a folder private to this user.
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	disktest.MakePrivate(t, dir)
 	f.multipartAt, f.partSize, f.refusePart = 5<<20, 5<<20, 2
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	data := randomBytes(t, 12<<20)
@@ -36,7 +36,7 @@ func interruptedSend(t *testing.T, f *fakeAPI, dir string) ([]byte, *secrets.Upl
 
 func TestInterruptedSendResumes(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	dir := t.TempDir()
+	dir := privateDir(t)
 	data, interrupted := interruptedSend(t, f, dir)
 	rev := interrupted.Upload.RevisionID
 
@@ -44,12 +44,16 @@ func TestInterruptedSendResumes(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].RevisionID != rev || pending[0].Name != "backup.bin" {
 		t.Fatalf("pending: %+v, %v", pending, err)
 	}
+	// On Windows the folder is private, and what is in it inherits that.
+	if runtime.GOOS == "windows" {
+		disktest.AssertPrivate(t, pending[0].Dir)
+	}
 	for path, mode := range map[string]os.FileMode{
 		pending[0].Dir:                               0o700 | os.ModeDir,
 		filepath.Join(pending[0].Dir, "payload"):     0o600,
 		filepath.Join(pending[0].Dir, "upload.json"): 0o600,
 	} {
-		if info, err := os.Stat(path); err != nil || info.Mode() != mode {
+		if info, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && info.Mode() != mode) {
 			t.Fatalf("%s: %v, %v", path, info.Mode(), err)
 		}
 	}
@@ -85,10 +89,7 @@ func TestInterruptedSendResumes(t *testing.T) {
 // client, sending only the parts storage lacks.
 func TestCancelledSendResumes(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	dir := privateDir(t)
 	f.multipartAt, f.partSize = 5<<20, 5<<20
 	src := filepath.Join(t.TempDir(), "backup.bin")
 	data := randomBytes(t, 12<<20)
@@ -138,7 +139,7 @@ func TestCancelledSendResumes(t *testing.T) {
 
 func TestDiscardPendingUpload(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	dir := t.TempDir()
+	dir := privateDir(t)
 	_, interrupted := interruptedSend(t, f, dir)
 	rev := interrupted.Upload.RevisionID
 	alice := f.client("alice@example.com")

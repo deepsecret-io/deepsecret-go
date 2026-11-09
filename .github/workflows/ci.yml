@@ -34,6 +34,35 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
+  # The CLI ships Windows binaries, so the tests run on Windows too, built
+  # as the CLI release builds (CGO_ENABLED=0): the owner-only ACLs that
+  # internal/disk gives key files, resume folders and extracted files exist
+  # only there, and only these runs check them. The race detector needs
+  # cgo, so it runs in the Linux job alone.
+  test-windows:
+    name: test (windows)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      # Check out the files as committed, with LF line endings.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      # Test files in t.TempDir() inherit this folder's ACL, and the checks
+      # refuse any file someone other than this user, SYSTEM and
+      # Administrators may open: the ACL is here to explain such a failure.
+      - name: Show the temporary folder's ACL
+        run: icacls $env:TEMP
+      - run: go vet ./...
+      - run: go test ./...
+
   lint:
     name: lint
     runs-on: ubuntu-24.04

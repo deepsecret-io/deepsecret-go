@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/directory"
 	"github.com/deepsecret-io/deepsecret-go/internal/knownkeys"
@@ -65,6 +67,36 @@ func (c *Client) Sync(ctx context.Context, kp *keys.Pair, securityKey bool) erro
 	return syncIdentity(ctx, c.api, kp, securityKey)
 }
 
+// RecordOwnAccount records the account on this device as the user's own, used
+// with fingerprint, a key pair on this device that is already registered for
+// it (as from another device): what Sync records, without unlocking the key
+// pair or uploading anything. Signed in as the sender of a secret refused with
+// trust.UnrecordedSenderError, with the key that signed it, it lets that secret
+// open. It refuses what Sync refuses: an account this device knows as someone
+// else, and a key recorded for another of the user's accounts. The server must
+// list fingerprint among the account's keys; that only catches a mistaken key,
+// since the server says which account the caller is either way.
+func (c *Client) RecordOwnAccount(ctx context.Context, fingerprint string) error {
+	fp := strings.ToLower(fingerprint)
+	short := keys.ShortFingerprint(fp)
+	if _, err := keystore.LoadPublic(c.keysDir, fp); err != nil {
+		return fmt.Errorf("read key pair %s on this device: %w", short, err)
+	}
+	registered, err := listRemoteKeys(ctx, c.api)
+	if err != nil {
+		return fmt.Errorf("fetch registered keys: %w", err)
+	}
+	if !slices.ContainsFunc(registered, func(k Key) bool { return strings.EqualFold(k.Fingerprint, fp) }) {
+		return fmt.Errorf("key %s is not registered for this account: register it with Sync", short)
+	}
+	me, err := whoAmI(ctx, c.api)
+	if err != nil {
+		return fmt.Errorf("fetch your account: %w", err)
+	}
+	_, err = c.store.RecordOwnAccount(me.Email, fp, true)
+	return err
+}
+
 // SetKeySecurityKey sets whether the registered key identityID (from ListKeys)
 // is labelled as protected by a security key: what a client reports after
 // protecting a key pair, or taking the protection off. The label is shown only
@@ -89,9 +121,18 @@ func (c *Client) DeleteKey(ctx context.Context, identityID string) error {
 	return deleteKey(ctx, c.api, identityID)
 }
 
-// ListGroups returns all groups in the given org with their members.
+// ListGroups returns all groups in the given org with their members. Only
+// the org's owner and admins may list them; WhoAmI reports this as the
+// "groups" permission.
 func (c *Client) ListGroups(ctx context.Context, orgID string) ([]Group, error) {
-	return listGroups(ctx, c.api, orgID)
+	return listGroups(ctx, c.api, "/groups", orgID)
+}
+
+// ListMyGroups returns the groups of the given org that the caller belongs
+// to, with their members, to send to. Any active member may call it. A
+// member's Role is always empty here.
+func (c *Client) ListMyGroups(ctx context.Context, orgID string) ([]Group, error) {
+	return listGroups(ctx, c.api, "/my-groups", orgID)
 }
 
 // Membership is the single org membership pulled from /api/me. An actor
@@ -343,6 +384,7 @@ func resolveActorID(ctx context.Context, c *transport.Client) (string, error) {
 }
 
 // GroupMember holds the email and identifying details of a group member.
+// Role is set by ListGroups only.
 type GroupMember struct {
 	ID        string `json:"id"`
 	Email     string `json:"email"`
@@ -359,10 +401,10 @@ type Group struct {
 	Members []GroupMember `json:"members"`
 }
 
-// listGroups returns all groups in the given org with their members.
-// Caller must be a member of the org with can_send_secrets permission.
-func listGroups(ctx context.Context, c *transport.Client, orgID string) ([]Group, error) {
-	resp, err := c.Get(ctx, "/api/v1/orgs/"+transport.PathSegment(orgID)+"/groups")
+// listGroups returns the groups an org's list endpoint, "/groups" or
+// "/my-groups", gives the caller, with their members.
+func listGroups(ctx context.Context, c *transport.Client, endpoint, orgID string) ([]Group, error) {
+	resp, err := c.Get(ctx, "/api/v1/orgs/"+transport.PathSegment(orgID)+endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("list groups: %w", err)
 	}

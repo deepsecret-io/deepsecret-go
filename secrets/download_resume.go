@@ -119,7 +119,7 @@ func (c *Client) openDownloadSpool(dir string, secret *Info, m *protocol.Manifes
 	if id, err := uuid.Parse(m.RevisionID); err != nil || id.String() != m.RevisionID {
 		return nil, nil, fmt.Errorf("revision ID %q is not a UUID", m.RevisionID)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := disk.MkdirPrivate(dir); err != nil {
 		return nil, nil, fmt.Errorf("create download folder: %w", err)
 	}
 	if err := disk.CheckPrivateDir(dir); err != nil {
@@ -151,7 +151,7 @@ func (c *Client) openDownloadSpool(dir string, secret *Info, m *protocol.Manifes
 // describes want's payload, and otherwise empties the payload and records
 // want, holding nothing. log is the "resume" module.
 func openKeptDownload(pdir string, want *PendingDownload, log *slog.Logger) (*os.File, *PendingDownload, error) {
-	if err := os.Mkdir(pdir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+	if err := disk.Mkdir(pdir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, nil, fmt.Errorf("create download folder: %w", err)
 	}
 	if err := disk.CheckPrivateDir(pdir); err != nil {

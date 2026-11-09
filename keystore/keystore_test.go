@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/deepsecret-io/deepsecret-go/internal/disk/disktest"
 	"github.com/deepsecret-io/deepsecret-go/keys"
 )
 
@@ -178,13 +179,10 @@ func TestKeyFileNameMustBeAFingerprint(t *testing.T) {
 	}
 }
 
-// Saving a key makes its file private even when an older one was not, and
-// replaces a link at its path instead of writing the private keys through
-// it.
+// Saving a key makes its file private (0600, or an owner-only ACL on
+// Windows) even when an older one was not, and replaces a link at its path
+// instead of writing the private keys through it.
 func TestSaveKeyPairFileIsPrivate(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("file modes and links differ on Windows")
-	}
 	kp, _ := keys.Generate()
 	fp, _ := keys.Fingerprint(kp)
 	dir := t.TempDir()
@@ -198,9 +196,7 @@ func TestSaveKeyPairFileIsPrivate(t *testing.T) {
 	if err := Save(dir, fp, kp, ""); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("key file: %v, %v; want mode 0600", info, err)
-	}
+	disktest.AssertPrivate(t, path)
 
 	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
 	if err := os.WriteFile(elsewhere, []byte("untouched"), 0o644); err != nil {
@@ -210,6 +206,9 @@ func TestSaveKeyPairFileIsPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(elsewhere, path); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a symlink needs a privilege this account lacks: %v", err)
+		}
 		t.Fatal(err)
 	}
 	if err := Save(dir, fp, kp, ""); err != nil {
@@ -218,9 +217,10 @@ func TestSaveKeyPairFileIsPrivate(t *testing.T) {
 	if data, err := os.ReadFile(elsewhere); err != nil || string(data) != "untouched" {
 		t.Errorf("the private keys were written through the link: %q, %v", data, err)
 	}
-	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		t.Errorf("key file: %v, %v; want a private regular file", info, err)
+	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("key file: %v, %v; want a regular file", info, err)
 	}
+	disktest.AssertPrivate(t, path)
 	if _, err := Load(dir, fp, ""); err != nil {
 		t.Errorf("load: %v", err)
 	}

@@ -16,8 +16,9 @@
 // The user's own accounts are recorded too, so the server cannot pass off
 // another key as theirs by lying about who the caller is: only key pairs on
 // this device pass for them. One is recorded when a key is registered for
-// it, or by this device's first send on the server; a later send adds only
-// the key it used to an account already recorded. An account the server
+// it, when the user records it with a key pair here registered for it
+// elsewhere, or by this device's first send on the server; a later send
+// adds only the key it used to an account already recorded. An account the server
 // claims for the caller that this device knows as someone else, by a key
 // that is not on this device or is recorded for another of the user's
 // accounts, is refused, never recorded; so is recording, for one of them, a

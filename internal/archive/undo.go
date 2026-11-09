@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/deepsecret-io/deepsecret-go/internal/disk"
 )
 
 // Undo records the files, links and directories a write creates, and the
@@ -26,8 +28,9 @@ func (u *Undo) add(path string) {
 	}
 }
 
-// MkdirAll creates path and its missing parents with perm, as os.MkdirAll
-// does, and records each directory it creates.
+// MkdirAll creates path and its missing parents with perm (private to this
+// user on Windows, see disk.Mkdir), as os.MkdirAll does, and records each
+// directory it creates.
 func (u *Undo) MkdirAll(path string, perm os.FileMode) error {
 	if info, err := os.Stat(path); err == nil {
 		if !info.IsDir() {
@@ -40,7 +43,7 @@ func (u *Undo) MkdirAll(path string, perm os.FileMode) error {
 			return err
 		}
 	}
-	if err := os.Mkdir(path, perm); err != nil {
+	if err := disk.Mkdir(path, perm); err != nil {
 		// Made by someone else in the meantime: not ours to remove.
 		if info, lerr := os.Lstat(path); lerr == nil && info.IsDir() {
 			return nil

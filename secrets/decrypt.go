@@ -255,7 +255,7 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 	}
 	m := opened.Manifest
 	logManifestVerified(log, m, len(rm.Manifest))
-	senderFirst, err := c.store.CheckSenderKey(senderEmail, m.SenderFingerprint, log)
+	sender, err := c.store.CheckSenderKey(senderEmail, m.SenderFingerprint, log)
 	if err != nil {
 		opened.Close()
 		return nil, fmt.Errorf("check sender %s: %w", senderEmail, err)
@@ -309,7 +309,7 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 		}
 	}
 	o := &OpenedSecret{opened: opened, spool: sp, log: log, onProgress: opt.OnDecryptProgress,
-		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, senderFirst),
+		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, sender.First),
 		recordNewest: c.store.NewestRecorder(senderEmail, m)}
 
 	// Download the ciphertext into the spool, or the ranges a kept
@@ -356,7 +356,9 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 		SignedAt:             time.Unix(m.Timestamp, 0),
 		SenderFingerprint:    m.SenderFingerprint,
 		SenderEmail:          senderEmail,
-		SenderFirstUse:       senderFirst,
+		SenderFirstUse:       sender.First,
+		SenderOwnKey:         sender.Local,
+		SenderOwnAccount:     sender.OwnAccount,
 		RecipientFingerprint: localFP,
 		Recipients:           signedRecipients(m, rev),
 		Compressed:           m.Compressed,

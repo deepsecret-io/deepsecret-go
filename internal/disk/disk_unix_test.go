@@ -40,3 +40,28 @@ func TestCheckPrivateDir(t *testing.T) {
 		t.Fatal("a symlink to a private folder was accepted")
 	}
 }
+
+// A key file someone else may read is refused, as it is on Windows: the
+// key in it is no longer private, and someone else may have put it there.
+// The refusal names the command that fixes it.
+func TestReadPrivateRefusesAnExposedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key.json")
+	if err := os.WriteFile(path, []byte(`{"k":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadPrivate(path); err != nil || string(got) != `{"k":1}` {
+		t.Fatalf("a private file: %q, %v", got, err)
+	}
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o644} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		_, err := ReadPrivate(path)
+		if err == nil || !strings.Contains(err.Error(), "is open to other users") || !strings.Contains(err.Error(), "chmod 600 "+path) {
+			t.Errorf("mode %o: %v, want a refusal naming chmod 600", mode, err)
+		}
+	}
+	if _, err := ReadPrivate(filepath.Join(t.TempDir(), "missing.json")); !os.IsNotExist(err) {
+		t.Errorf("a missing file: %v, want not exist", err)
+	}
+}

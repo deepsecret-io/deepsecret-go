@@ -45,6 +45,15 @@ type KeyChangedError = knownkeys.KeyChangedError
 // explicitly opens it anyway.
 type StaleRevisionError = knownkeys.StaleRevisionError
 
+// UnrecordedSenderError refuses a secret signed with a key pair on this device
+// whose sender the server names as someone this device knows neither as one of
+// the user's accounts nor by any key: an account of the user's not recorded
+// here yet, or the server relabelling the user's own secret. Its fields are
+// Email (the sender named) and Fingerprint (the key that signed it). If Email
+// is the user's, Identity.RecordOwnAccount with Fingerprint, signed in as
+// Email, records it and the secret opens.
+type UnrecordedSenderError = knownkeys.UnrecordedSenderError
+
 // Client reaches the keys this device knows. Get one from deepsecret.NewClient,
 // as its Trust field.
 type Client struct {

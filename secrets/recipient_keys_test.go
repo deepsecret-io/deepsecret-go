@@ -371,10 +371,13 @@ func TestOwnSecretDoesNotPassAsContactOnceItsKeyLeftThisDevice(t *testing.T) {
 	}
 }
 
-// One device, two of the user's accounts, neither having sent to the other.
-// Alice is recorded first, so bob's first send leaves him unrecorded: the
-// server's claim alone does not make him the user's. His secret is refused,
-// saying what to do, and opens once a key is registered for him here.
+// One device, two of the user's accounts, neither having sent to the other,
+// and bob's key registered for him already. Alice is recorded first, so bob's
+// sends leave him unrecorded: the server's claim alone does not make him the
+// user's, so sending again would not help. His secret and local file are
+// refused with an UnrecordedSenderError naming the key that signed them, and
+// open once, signed in as bob, the user records the account as theirs with
+// that key, which uploads nothing.
 func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
@@ -388,18 +391,45 @@ func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{}); err == nil || !strings.Contains(err.Error(), "does not know as yours") || !strings.Contains(err.Error(), "sync your identity") {
-		t.Fatalf("read before bob is recorded: %+v, %v, want it refused", out, err)
-	}
-	if err := b.Identity.Sync(context.Background(), bob.kp, false); err != nil {
+	path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+	if _, err := b.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{LocalFile: path}); err != nil {
 		t.Fatal(err)
 	}
-	out, err := a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
-	if err != nil {
-		t.Fatalf("read once bob is recorded: %v", err)
+	if known := knownKeys(t, a, bob.email); len(known) != 0 {
+		t.Fatalf("bob's known keys after his sends %+v, want none", known)
 	}
-	if out.SenderEmail != bob.email || out.SenderFirstUse {
-		t.Fatalf("read as %s, first use %v", out.SenderEmail, out.SenderFirstUse)
+	opens := map[string]func() (*secrets.DecryptResult, error){
+		"secret": func() (*secrets.DecryptResult, error) {
+			return a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
+		},
+		"local file": func() (*secrets.DecryptResult, error) { return openLocalWith(a, path) },
+	}
+	for name, open := range opens {
+		out, err := open()
+		var unrecorded *trust.UnrecordedSenderError
+		if !errors.As(err, &unrecorded) || unrecorded.Email != bob.email || unrecorded.Fingerprint != bob.fp || !strings.Contains(err.Error(), "does not know as yours") {
+			t.Fatalf("%s before bob is recorded: %+v, %v, want an UnrecordedSenderError for bob's key", name, out, err)
+		}
+	}
+
+	registrations := f.registrations
+	if err := b.Identity.RecordOwnAccount(context.Background(), bob.fp); err != nil {
+		t.Fatalf("record bob as the user's: %v", err)
+	}
+	if n := f.registrations - registrations; n != 0 {
+		t.Fatalf("recording bob uploaded %d keys", n)
+	}
+	for name, open := range opens {
+		out, err := open()
+		if err != nil {
+			t.Fatalf("%s once bob is recorded: %v", name, err)
+		}
+		if out.SenderEmail != bob.email || out.SenderFirstUse || !out.SenderOwnKey || !out.SenderOwnAccount {
+			t.Fatalf("%s read as %s, first use %v, own key %v, own account %v", name, out.SenderEmail, out.SenderFirstUse, out.SenderOwnKey, out.SenderOwnAccount)
+		}
+	}
+	if known := knownKeys(t, a, bob.email); len(known) != 1 || known[bob.fp].State != trust.Own {
+		t.Fatalf("bob's known keys %+v, want his key as the user's own", known)
 	}
 }
 
@@ -556,18 +586,27 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 
 	// Bob signed on another device that holds his key too, and this device
 	// has not recorded him as the user's yet. Alice sent to him, so this
-	// device knows him by that key, and his secret opens for her without
-	// accepting or recording anything. This device cannot tell that from a
-	// server that listed a spare key of the user's for a contact: the limit
-	// the README's Recipient Keys section and CheckSenderKey describe.
+	// device knows him by that key, and his secret and local file open for
+	// her without accepting or recording anything. This device cannot tell
+	// that from a server that listed a spare key of the user's for a
+	// contact: the limit the README's Recipient Keys section and
+	// CheckSenderKey describe. Both say the key is on this device and bob is
+	// not recorded as the user's, so the user can be told. Signed in as bob
+	// here, the user records the account as theirs with that key, and both
+	// then open as from one of their accounts.
 	t.Run("secret from an account not recorded yet", func(t *testing.T) {
 		f, alice, bob, signIn := setup(t)
 		other := filepath.Join(t.TempDir(), "keys")
 		if err := keystore.Save(other, bob.fp, bob.kp, ""); err != nil {
 			t.Fatal(err)
 		}
-		res, err := f.clientOn(bob.email, other, filepath.Join(t.TempDir(), "known_keys.json")).Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "from bob"})
+		elsewhere := f.clientOn(bob.email, other, filepath.Join(t.TempDir(), "known_keys.json"))
+		res, err := elsewhere.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "from bob"})
 		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+		if _, err := elsewhere.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{LocalFile: path}); err != nil {
 			t.Fatal(err)
 		}
 		a := signIn(alice.email)
@@ -575,12 +614,29 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read before bob is recorded: %v", err)
 		}
-		if out.SenderEmail != bob.email || out.SenderFirstUse {
-			t.Fatalf("read as %s, first use %v", out.SenderEmail, out.SenderFirstUse)
+		if out.SenderEmail != bob.email || out.SenderFirstUse || !out.SenderOwnKey || out.SenderOwnAccount {
+			t.Fatalf("read as %s, first use %v, own key %v, own account %v, want own key only", out.SenderEmail, out.SenderFirstUse, out.SenderOwnKey, out.SenderOwnAccount)
+		}
+		if out, err = openLocalWith(a, path); err != nil {
+			t.Fatalf("open the local file before bob is recorded: %v", err)
+		}
+		if out.SenderEmail != bob.email || out.SenderFirstUse || !out.SenderOwnKey || out.SenderOwnAccount {
+			t.Fatalf("local file read as %s, first use %v, own key %v, own account %v, want own key only", out.SenderEmail, out.SenderFirstUse, out.SenderOwnKey, out.SenderOwnAccount)
 		}
 		if known := knownKeys(t, a, bob.email); len(known) != 1 || known[bob.fp].State != trust.FirstUse {
 			t.Fatalf("bob's known keys %+v, want his on first use still", known)
 		}
+
+		if err := signIn(bob.email).Identity.RecordOwnAccount(context.Background(), bob.fp); err != nil {
+			t.Fatalf("record bob as the user's: %v", err)
+		}
+		if out, err = a.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{}); err != nil || !out.SenderOwnKey || !out.SenderOwnAccount {
+			t.Fatalf("read once bob is recorded: %+v, %v, want own key and own account", out, err)
+		}
+		if out, err = openLocalWith(a, path); err != nil || !out.SenderOwnKey || !out.SenderOwnAccount {
+			t.Fatalf("open the local file once bob is recorded: %+v, %v, want own key and own account", out, err)
+		}
+		wantOwn(t, a, map[string]string{alice.fp: alice.email, bob.fp: bob.email})
 	})
 
 	// Both accounts are recorded as the user's own. Signed in as alice, a

@@ -40,6 +40,7 @@ import (
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/deepsecret-io/deepsecret-go/internal/canon"
+	"github.com/deepsecret-io/deepsecret-go/internal/disk"
 	"github.com/deepsecret-io/deepsecret-go/keys"
 	"github.com/fxamacker/cbor/v2"
 )
@@ -1288,7 +1289,7 @@ func (e *SlotEditor) unchanged() error {
 }
 
 func (e *SlotEditor) write(data []byte) error {
-	if err := os.MkdirAll(e.dir, 0o700); err != nil {
+	if err := disk.MkdirPrivate(e.dir); err != nil {
 		return err
 	}
 	if err := e.unchanged(); err != nil {

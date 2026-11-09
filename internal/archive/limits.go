@@ -33,8 +33,8 @@ type Limits struct {
 	MaxNameBytes int64
 
 	// KeepSpecialModes keeps setuid, setgid and sticky bits. By default
-	// modes are masked to the nine permission bits, so an archive cannot
-	// plant a setuid file.
+	// they are dropped, so an archive cannot plant a setuid file. The
+	// permission bits are private either way (privatePerm).
 	KeepSpecialModes bool
 
 	// KeepOwnership restores each entry's owner and group from the
@@ -60,14 +60,29 @@ func DefaultLimits() *Limits {
 	}
 }
 
-// entryMode is an archive entry's mode as extraction applies it: the nine
-// permission bits, plus setuid, setgid and sticky with KeepSpecialModes.
-func (l *Limits) entryMode(hdrMode int64) os.FileMode {
-	mode := unixModeToGo(hdrMode & modeBits)
-	if !l.KeepSpecialModes {
-		mode &= os.ModePerm
+// privatePerm is the permission extraction gives what it creates, whatever
+// the archive or payload asks for: 0700 for a directory, and for a file
+// 0600, or 0700 when perm has the owner's execute bit. The sender does not
+// choose who else may read, change or list a decrypted secret, and cannot
+// lock its owner out of it either. The umask still applies on top, as
+// open(2) and mkdir(2) apply it.
+func privatePerm(perm os.FileMode, dir bool) os.FileMode {
+	if dir || perm&0o100 != 0 {
+		return 0o700
 	}
-	return mode
+	return 0o600
+}
+
+// entryMode is an archive entry's mode as extraction applies it: the
+// private permission bits (privatePerm), plus the entry's setuid, setgid
+// and sticky bits with KeepSpecialModes.
+func (l *Limits) entryMode(hdrMode int64, dir bool) os.FileMode {
+	mode := unixModeToGo(hdrMode & modeBits)
+	perm := privatePerm(mode.Perm(), dir)
+	if l.KeepSpecialModes {
+		return perm | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
+	}
+	return perm
 }
 
 // resolve returns the effective limits, filling zero values with defaults.

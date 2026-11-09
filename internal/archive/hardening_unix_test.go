@@ -17,33 +17,123 @@ import (
 	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 )
 
-// Extraction applies the umask to the archive's modes, as open(2) and
-// mkdir(2) do, instead of setting the sender's modes exactly: a user with
-// umask 077 keeps decrypted files private whatever the archive says.
-func TestExtractTarAppliesUmask(t *testing.T) {
-	old := syscall.Umask(0o077)
+// assertModes fails unless each path has exactly the mode it maps to:
+// permission bits and setuid, setgid and sticky.
+func assertModes(t *testing.T, want map[string]os.FileMode) {
+	t.Helper()
+	for path, mode := range want {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mask := os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+		if got := info.Mode() & mask; got != mode {
+			t.Errorf("%s: mode %v, want %v", path, got, mode)
+		}
+	}
+}
+
+// Everything extraction creates is private to the user who extracts it,
+// whatever modes the archive asks for: a sender does not choose who else
+// may read, change or list a decrypted secret, nor lock its owner out of
+// it. Only the owner's execute bit is kept. The umask is cleared, so the
+// modes cannot come from it.
+func TestExtractTarCreatesPrivateEntries(t *testing.T) {
+	old := syscall.Umask(0)
 	defer syscall.Umask(old)
 
 	out := t.TempDir()
 	data := buildTar(t,
 		tarTestEntry{typ: tar.TypeDir, name: "shared/", mode: 0o777},
+		tarTestEntry{typ: tar.TypeDir, name: "sticky/", mode: 0o1777},
+		tarTestEntry{typ: tar.TypeDir, name: "locked/", mode: 0o500},
+		tarTestEntry{typ: tar.TypeDir, name: "zero/", mode: 0},
+		tarTestEntry{typ: tar.TypeReg, name: "locked/inside.txt", mode: 0o644, data: []byte("i")},
 		tarTestEntry{typ: tar.TypeReg, name: "shared/secret.txt", mode: 0o666, data: []byte("s")},
+		tarTestEntry{typ: tar.TypeReg, name: "shared/run.sh", mode: 0o777, data: []byte("r")},
+		tarTestEntry{typ: tar.TypeLink, name: "shared/run-link.sh", link: "shared/run.sh"},
+		tarTestEntry{typ: tar.TypeReg, name: "shared/others-exec", mode: 0o011, data: []byte("o")},
+		tarTestEntry{typ: tar.TypeReg, name: "shared/write-only", mode: 0o200, data: []byte("w")},
+		tarTestEntry{typ: tar.TypeReg, name: "shared/zero", mode: 0, data: []byte("z")},
+		tarTestEntry{typ: tar.TypeReg, name: "shared/setuid", mode: 0o4777, data: []byte("u")},
 	)
 	if _, err := ExtractTar(data, out, compress.None, nil); err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]os.FileMode{
-		filepath.Join(out, "shared"):               0o700,
-		filepath.Join(out, "shared", "secret.txt"): 0o600,
-	} {
-		info, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := info.Mode().Perm(); got != want {
-			t.Errorf("%s: mode %o, want %o", path, got, want)
-		}
+	assertModes(t, map[string]os.FileMode{
+		filepath.Join(out, "shared"):                0o700,
+		filepath.Join(out, "sticky"):                0o700,
+		filepath.Join(out, "locked"):                0o700,
+		filepath.Join(out, "zero"):                  0o700,
+		filepath.Join(out, "locked", "inside.txt"):  0o600,
+		filepath.Join(out, "shared", "secret.txt"):  0o600,
+		filepath.Join(out, "shared", "run.sh"):      0o700,
+		filepath.Join(out, "shared", "run-link.sh"): 0o700,
+		filepath.Join(out, "shared", "others-exec"): 0o600,
+		filepath.Join(out, "shared", "write-only"):  0o600,
+		filepath.Join(out, "shared", "zero"):        0o600,
+		filepath.Join(out, "shared", "setuid"):      0o700,
+	})
+}
+
+// KeepSpecialModes adds an entry's special bits to the private permission
+// bits, and never widens them.
+func TestExtractTarKeepSpecialModesStaysPrivate(t *testing.T) {
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	out := t.TempDir()
+	data := buildTar(t,
+		tarTestEntry{typ: tar.TypeDir, name: "sticky/", mode: 0o1777},
+		tarTestEntry{typ: tar.TypeReg, name: "sticky/data", mode: 0o1666, data: []byte("d")},
+	)
+	if _, err := ExtractTar(data, out, compress.None, &Limits{KeepSpecialModes: true}); err != nil {
+		t.Fatal(err)
 	}
+	assertModes(t, map[string]os.FileMode{
+		filepath.Join(out, "sticky"): 0o700 | os.ModeSticky,
+	})
+	// A regular file's sticky bit is refused by some systems (EFTYPE on
+	// macOS for non-root), so only its permission bits are checked.
+	if info, err := os.Stat(filepath.Join(out, "sticky", "data")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("sticky/data: %v, %v; want 0600 permission bits", info, err)
+	}
+}
+
+// WriteFile, which writes a payload's single files, follows the same
+// rule: the file is private, executable only when mode has the owner's
+// execute bit, also when it replaces an old file.
+func TestWriteFileCreatesPrivateFiles(t *testing.T) {
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	out := t.TempDir()
+	want := map[string]os.FileMode{}
+	for name, tc := range map[string]struct {
+		mode os.FileMode
+		want os.FileMode
+	}{
+		"shared.txt":  {0o666, 0o600},
+		"run.sh":      {0o755, 0o700},
+		"zero":        {0, 0o600},
+		"write-only":  {0o200, 0o600},
+		"setuid":      {0o777 | os.ModeSetuid, 0o700},
+		"sub/dir-bit": {0o644 | os.ModeDir, 0o600},
+	} {
+		path, _, err := WriteFile(out, name, tc.mode, strings.NewReader("x"), 1, false, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want[path] = tc.want
+	}
+	if err := os.Chmod(filepath.Join(out, "shared.txt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := WriteFile(out, "shared.txt", 0o666, strings.NewReader("y"), 1, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	want[filepath.Join(out, "sub")] = 0o700
+	assertModes(t, want)
 }
 
 // Directories extraction creates without an entry of their own, the

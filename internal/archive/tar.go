@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/compress"
+	"github.com/deepsecret-io/deepsecret-go/internal/disk"
 )
 
 // TarEntry represents an in-memory file for archive creation or extraction.
@@ -499,12 +500,15 @@ func WriteTarStream(w io.Writer, entries []TarStreamEntry, algo compress.Algorit
 // All security guarantees from [ExtractTar] apply: path validation, duplicate
 // rejection, type rejection, size limits, symlink escape checks, atomic writes.
 //
-// outputDir is created if it does not exist. Directories extraction creates
-// without an entry of their own, outputDir among them, are private (0700).
-// Entries get their archive modes with the umask applied, and directories
-// that already exist keep their mode, owner, attributes and times. With
-// AllowOverwrite, a file is replaced by a new one renamed over it, so it
-// gets the entry's mode, not the old file's.
+// outputDir is created if it does not exist. Everything extraction creates
+// is private to its owner, whatever modes the archive asks for:
+// directories, outputDir among them, are 0700, and files 0600, or 0700
+// when the entry has its owner's execute bit, with the umask applied (on
+// Windows, private to this user). The owner is the user who extracts it,
+// or with KeepOwnership when extracting as root, the archive's owner.
+// Directories that already exist keep their mode, owner, attributes and
+// times. With AllowOverwrite, a file is replaced by a new one renamed over
+// it, so it gets the private mode, not the old file's.
 //
 // When extraction fails, everything it created is removed, files it
 // overwrote among them; what was there before stays. The error names
@@ -732,12 +736,10 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 				return count, fmt.Errorf("mkdir for %q: %w", cleanName, err)
 			}
-			mode := lim.entryMode(hdr.Mode)
-			if mode.Perm() == 0 {
-				mode |= 0o755
-			}
-			// Mkdir applies the umask to the entry's permission bits.
-			if err := os.Mkdir(target, mode.Perm()); err != nil {
+			mode := lim.entryMode(hdr.Mode, true)
+			// Mkdir applies the umask to the private permission bits; on
+			// Windows the folder is private to this user.
+			if err := disk.Mkdir(target, mode.Perm()); err != nil {
 				return count, fmt.Errorf("mkdir %q: %w", cleanName, err)
 			}
 			undo.add(target)
@@ -836,12 +838,9 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			return count, fmt.Errorf("symlink escape (post-mkdir) for %q: %w", cleanName, err)
 		}
 
-		mode := lim.entryMode(hdr.Mode)
-		if mode.Perm() == 0 {
-			mode |= 0o644
-		}
+		mode := lim.entryMode(hdr.Mode, false)
 
-		// open(2) applies the umask to the entry's permission bits, for a
+		// open(2) applies the umask to the private permission bits, for a
 		// new file and for one replacing an old file alike. setuid/setgid/
 		// sticky are added by keepSpecialBits after the write completes.
 		written, err := writeFileAtomicBounded(target, targetDir, mode.Perm(), tr, lim.MaxEntrySize, lim.AllowOverwrite)
@@ -925,10 +924,12 @@ func ExtractTar(data []byte, outputDir string, algo compress.Algorithm, limits *
 // outputDir after symlinks resolve, missing parents are created, and the
 // file is created without following a symlink at its leaf and, unless
 // allowOverwrite, without replacing anything. Missing parents are private
-// (0700), and the file gets mode with the umask applied, also when it
-// replaces an old file. It writes at most maxSize bytes from r and returns
-// the file's path and the bytes written. It records the directories and
-// the file it creates or overwrites in undo, which may be nil.
+// (0700), and so is the file whatever mode asks for: 0600, or 0700 when
+// mode has the owner's execute bit (privatePerm), with the umask applied,
+// also when it replaces an old file. It writes at most maxSize bytes from
+// r and returns the file's path and the bytes written. It records the
+// directories and the file it creates or overwrites in undo, which may be
+// nil.
 func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool, undo *Undo) (string, int64, error) {
 	cleanName, err := ValidateArchivePath(name)
 	if err != nil {
@@ -949,7 +950,7 @@ func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize in
 	if err := ensureInsideDir(outputDir, target); err != nil {
 		return "", 0, fmt.Errorf("symlink escape (post-mkdir) for %q: %w", cleanName, err)
 	}
-	written, err := writeFileAtomicBounded(target, targetDir, mode.Perm(), r, maxSize, allowOverwrite)
+	written, err := writeFileAtomicBounded(target, targetDir, privatePerm(mode, false), r, maxSize, allowOverwrite)
 	if err != nil {
 		return "", 0, fmt.Errorf("write %q: %w", cleanName, err)
 	}
@@ -1028,12 +1029,12 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // dir and returns how many it wrote. Without allowOverwrite it creates
 // target, refusing one that exists. With it, it writes a new file beside
 // target and renames it over target once complete, so target gets mode
-// (with the umask applied) instead of keeping an old file's, a link at
-// target is replaced rather than written through, and a reader never sees
-// half a file. Either way the file is created with O_EXCL and, on Unix,
-// O_NOFOLLOW (see safeCreate), so an attacker cannot redirect the write
-// through a symlink even if they win the TOCTOU race against
-// ensureInsideDir.
+// (with the umask applied; private to this user on Windows) instead of
+// keeping an old file's, a link at target is replaced rather than written
+// through, and a reader never sees half a file. Either way the file is
+// created new and never through a link at its path (see safeCreate), so an
+// attacker cannot redirect the write through a symlink even if they win
+// the TOCTOU race against ensureInsideDir.
 func writeFileAtomicBounded(target, dir string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool) (int64, error) {
 	path := target
 	if allowOverwrite {

@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
+	"github.com/deepsecret-io/deepsecret-go/internal/disk"
 	"github.com/deepsecret-io/deepsecret-go/keys"
 )
 
@@ -81,11 +82,11 @@ func Save(dir, fingerprint string, kp *keys.Pair, password string) error {
 	if !validKeyName(fingerprint) {
 		return errInvalidKeyName
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := disk.MkdirPrivate(dir); err != nil {
 		return err
 	}
 
-	disk := keyPairOnDisk{
+	onDisk := keyPairOnDisk{
 		StorageVersion: keyStorageVersion,
 		ED25519Public:  kp.ED25519Public,
 		X25519Public:   kp.X25519Public,
@@ -94,30 +95,30 @@ func Save(dir, fingerprint string, kp *keys.Pair, password string) error {
 	}
 
 	if password != "" {
-		if err := encryptOnDisk(&disk, kp, password); err != nil {
+		if err := encryptOnDisk(&onDisk, kp, password); err != nil {
 			return fmt.Errorf("encrypt private keys: %w", err)
 		}
 	} else {
-		disk.ED25519Private = kp.ED25519Private
-		disk.X25519Private = kp.X25519Private
-		disk.MLKEM768SK = kp.MLKEM768SK
-		disk.MLDSA65Seed = kp.MLDSA65Seed
+		onDisk.ED25519Private = kp.ED25519Private
+		onDisk.X25519Private = kp.X25519Private
+		onDisk.MLKEM768SK = kp.MLKEM768SK
+		onDisk.MLDSA65Seed = kp.MLDSA65Seed
 	}
 
-	data, err := json.MarshalIndent(disk, "", "  ")
+	data, err := json.MarshalIndent(onDisk, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal key pair: %w", err)
 	}
 	return writePrivateFile(filepath.Join(dir, fingerprint+".json"), data)
 }
 
-// writePrivateFile replaces path with data through a new 0600 file in the
-// same directory, synced and renamed over it. The key file is then private
-// even when an older one was not, a link at path is replaced rather than
-// written through, and a crash leaves the old file or the new one, never
-// half of either.
+// writePrivateFile replaces path with data through a new file in the same
+// directory, private to this user (disk.CreateTemp), synced and renamed
+// over it. The key file is then private even when an older one was not, a
+// link at path is replaced rather than written through, and a crash leaves
+// the old file or the new one, never half of either.
 func writePrivateFile(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	tmp, err := disk.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return err
 	}
@@ -232,9 +233,10 @@ func (f *keyFile) publicKeys() keys.PublicKeys {
 }
 
 // readKeyFile reads <dir>/<name>.json, a key file of storage version 4 or
-// 5. name must be hex only, so it cannot change the path.
+// 5, and refuses one that someone else may open (disk.ReadPrivate). name
+// must be hex only, so it cannot change the path.
 func readKeyFile(dir, name string) (*keyFile, error) {
-	data, err := os.ReadFile(filepath.Join(dir, name+".json")) // #nosec G304 -- name is hex only: checked with validKeyName, or a file name read from dir.
+	data, err := disk.ReadPrivate(filepath.Join(dir, name+".json"))
 	if err != nil {
 		return nil, err
 	}
@@ -251,11 +253,11 @@ func readKeyFile(dir, name string) (*keyFile, error) {
 	}
 	switch v := head.StorageVersion; {
 	case v == keyStorageVersion:
-		var disk keyPairOnDisk
-		if err := json.Unmarshal(data, &disk); err != nil {
+		var v4 keyPairOnDisk
+		if err := json.Unmarshal(data, &v4); err != nil {
 			return nil, err
 		}
-		return &keyFile{raw: data, v4: &disk}, nil
+		return &keyFile{raw: data, v4: &v4}, nil
 	case v == securityKeyStorageVersion:
 		f, err := parseSecurityKeyFile(data, name)
 		if err != nil {

@@ -28,16 +28,30 @@ func FreeBytes(dir string) (int64, bool) {
 }
 
 // CheckPrivateDir refuses dir unless it is a real directory, not a
-// symlink or junction. Access is left to the folder's ACL.
+// symlink or junction, that only this user, SYSTEM and Administrators own
+// and may open (see private_windows.go), so no other user can read,
+// replace or redirect what is kept in it. It reads the folder through one
+// handle that does not follow a link.
 func CheckPrivateDir(dir string) error {
-	info, err := os.Lstat(dir)
+	p, err := windows.UTF16PtrFromString(dir)
 	if err != nil {
-		return err
+		return &os.PathError{Op: "open", Path: dir, Err: err}
 	}
-	if !info.IsDir() || info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+	h, err := windows.CreateFile(p, windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: dir, Err: err}
+	}
+	defer func() { _ = windows.CloseHandle(h) }() // read only.
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return &os.PathError{Op: "stat", Path: dir, Err: err}
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return fmt.Errorf("%s is not a directory", dir)
 	}
-	return nil
+	return checkPrivate(h, dir, true)
 }
 
 // Lock takes an exclusive lock on f without waiting, and returns

@@ -46,6 +46,7 @@ func TestIDsCannotReachAnotherEndpoint(t *testing.T) {
 		call       func(id string)
 	}{
 		{"ListGroups", "/api/v1/orgs/%s/groups", func(id string) { _, _ = c.ListGroups(ctx, id) }},
+		{"ListMyGroups", "/api/v1/orgs/%s/my-groups", func(id string) { _, _ = c.ListMyGroups(ctx, id) }},
 		{"SetPrimaryKey", "/api/v1/identities/%s/primary", func(id string) { _ = c.SetPrimaryKey(ctx, id) }},
 		{"DeleteKey", "/api/v1/identities/%s", func(id string) { _ = c.DeleteKey(ctx, id) }},
 	}

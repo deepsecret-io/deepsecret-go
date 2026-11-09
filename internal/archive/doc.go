@@ -61,6 +61,12 @@
 //   - Dangerous entry types (devices, FIFOs and sockets are rejected;
 //     symlinks and hard links are created only at the leaf)
 //   - Duplicate entry names (rejected on both creation and extraction)
+//   - Sender-chosen permissions: everything extraction creates is private
+//     to its owner, the user who extracts it (or the archive's owner with
+//     KeepOwnership as root): 0700 directories, 0600 files, 0700 for a
+//     file the archive marks executable by its owner; the archive's group
+//     and other bits are never applied, and setuid, setgid and sticky only
+//     with KeepSpecialModes
 //
 // # Determinism
 //

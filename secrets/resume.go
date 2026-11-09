@@ -85,7 +85,7 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 	if opt.ResumeDir == "" {
 		return newSpool(opt.TempDir, need)
 	}
-	if err := os.MkdirAll(opt.ResumeDir, 0o700); err != nil {
+	if err := disk.MkdirPrivate(opt.ResumeDir); err != nil {
 		return nil, fmt.Errorf("create upload folder: %w", err)
 	}
 	if err := disk.CheckPrivateDir(opt.ResumeDir); err != nil {
@@ -96,7 +96,7 @@ func newSendSpool(opt EncryptOptions, revisionID string, need int64) (*spool, er
 		return nil, err
 	}
 	dir := filepath.Join(opt.ResumeDir, revisionID)
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	if err := disk.Mkdir(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create upload folder: %w", err)
 	}
 	// #nosec G304 -- revisionID is a UUID this client generated, in the caller's ResumeDir, which checkPrivateDir accepted.

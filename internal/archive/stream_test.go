@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -64,7 +65,13 @@ func TestValidateTarReaderAcceptsWriteTar(t *testing.T) {
 			t.Fatalf("%q: %v", algo, err)
 		}
 		// Every entry but the two directories creates a file or a link.
-		if len(names) != len(files)-2 || total != 5+70000 {
+		// Without inode numbers, Windows archives the hard link as a copy
+		// of a.txt.
+		want := int64(5 + 70000)
+		if runtime.GOOS == "windows" {
+			want += 5
+		}
+		if len(names) != len(files)-2 || total != want {
 			t.Fatalf("%q: %d names for %d entries, %d bytes: %v", algo, len(names), len(files), total, names)
 		}
 	}

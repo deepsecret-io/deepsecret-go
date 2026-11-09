@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -424,7 +425,8 @@ func TestExtractTar_PreservesAbsoluteSymlinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readlink: %v", err)
 	}
-	if got != "/Users/me/.cache/foo" {
+	// os.Symlink on Windows writes the target with its separators.
+	if got != filepath.FromSlash("/Users/me/.cache/foo") {
 		t.Errorf("got target %q, want absolute target preserved", got)
 	}
 }
@@ -805,7 +807,7 @@ func TestExtractTar_OverwritesWithAllowOverwrite(t *testing.T) {
 
 // ── Zero mode semantics ─────────────────────────────────────────────────────
 
-func TestExtractTar_ZeroModeDefaultsTo0644(t *testing.T) {
+func TestExtractTar_ZeroModeDefaultsTo0600(t *testing.T) {
 	entries := []TarEntry{{Name: "zero.txt", Data: []byte("x"), Mode: 0}}
 	data, _ := CreateTarFromBytes(entries, compress.None)
 
@@ -819,9 +821,11 @@ func TestExtractTar_ZeroModeDefaultsTo0644(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Should default to 0644 (not 0000)
-	if info.Mode().Perm() != 0644 {
-		t.Errorf("mode = %o, want 0644", info.Mode().Perm())
+	// Should default to 0600 (not 0000), private like every extracted
+	// file. Windows has no such modes: the file is private to the user
+	// there (hardening_windows_test.go).
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 0600", info.Mode().Perm())
 	}
 }
 
@@ -880,6 +884,9 @@ func TestExpandPaths_PropagatesWalkErrors(t *testing.T) {
 	sub := filepath.Join(tmpDir, "unreadable")
 	mkdirOrFatal(t, sub)
 	writeOrFatal(t, filepath.Join(sub, "file.txt"), []byte("x"))
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ignores chmod 0000: the folder stays readable")
+	}
 	// Make directory unreadable
 	os.Chmod(sub, 0000)
 	defer os.Chmod(sub, 0755) // restore for cleanup
@@ -1055,8 +1062,8 @@ func TestExtractTar_NormalizesZeroMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if extracted[0].Mode != 0644 {
-		t.Errorf("mode = %o, want 0644 (normalized from 0)", extracted[0].Mode)
+	if runtime.GOOS != "windows" && extracted[0].Mode != 0o600 { // Windows has no such modes
+		t.Errorf("mode = %o, want 0600 (normalized from 0)", extracted[0].Mode)
 	}
 }
 
@@ -1433,7 +1440,7 @@ func TestExtractTar_RestoresMTime(t *testing.T) {
 }
 
 func TestExtractTar_RoundTripsXattrs(t *testing.T) {
-	if runtimeOS := os.Getenv("GOOS"); runtimeOS == "windows" {
+	if runtime.GOOS == "windows" {
 		t.Skip("xattrs are not supported on Windows")
 	}
 	tmpSrc := t.TempDir()
@@ -1504,15 +1511,16 @@ func TestExtractTar_RoundTripsSetuidBit(t *testing.T) {
 	if info.Mode()&os.ModeSetuid != 0 {
 		t.Errorf("setuid bit kept by default: mode = %s", info.Mode())
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Errorf("perm bits = %o, want 0755", info.Mode().Perm())
+	// 0755 keeps only the owner's bits: the file stays executable.
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("perm bits = %o, want 0700", info.Mode().Perm())
 	}
 
 	kept := t.TempDir()
 	if _, err := ExtractTar(buf.Bytes(), kept, compress.None, &Limits{KeepSpecialModes: true}); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(filepath.Join(kept, "setuid.bin")); err != nil || info.Mode()&os.ModeSetuid == 0 {
-		t.Errorf("setuid bit not kept with KeepSpecialModes: %v, %v", info, err)
+	if info, err := os.Stat(filepath.Join(kept, "setuid.bin")); err != nil || info.Mode()&os.ModeSetuid == 0 || info.Mode().Perm() != 0o700 {
+		t.Errorf("want setuid kept with KeepSpecialModes on private 0700 bits: %v, %v", info, err)
 	}
 }

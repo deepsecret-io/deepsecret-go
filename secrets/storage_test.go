@@ -36,7 +36,7 @@ func storageServer(t *testing.T, status int, body string) (*Client, *string) {
 // ListStorages reads each storage's usage and cap, a missing cap as nil.
 func TestListStorages(t *testing.T) {
 	c, asked := storageServer(t, http.StatusOK, `{"success":true,"data":[
-		{"id":"s1","name":"Managed","provider_name":"DeepSecret Cloud Storage","is_primary":true,"is_managed":true,"is_verified":true,"quota_bytes":21474836480,"total_size":1073741824,"secrets_count":12,"bucket_name":""},
+		{"id":"s1","name":"Managed","provider_name":"DeepSecret Managed Storage","is_primary":true,"is_managed":true,"is_verified":true,"quota_bytes":21474836480,"total_size":1073741824,"secrets_count":12,"bucket_name":""},
 		{"id":"s2","name":"Our bucket","provider_name":"S3","is_primary":false,"is_managed":false,"is_verified":true,"quota_bytes":null,"total_size":5,"secrets_count":1}
 	]}`)
 	got, err := c.ListStorages(context.Background(), "org-1")
@@ -50,7 +50,7 @@ func TestListStorages(t *testing.T) {
 		t.Fatalf("got %d storages, want 2", len(got))
 	}
 	m := got[0]
-	if !m.Primary || !m.Managed || !m.Verified || m.UsedBytes != 1<<30 || m.QuotaBytes == nil || *m.QuotaBytes != 20<<30 || m.SecretsCount != 12 || m.Provider != "DeepSecret Cloud Storage" {
+	if !m.Primary || !m.Managed || !m.Verified || m.UsedBytes != 1<<30 || m.QuotaBytes == nil || *m.QuotaBytes != 20<<30 || m.SecretsCount != 12 || m.Provider != "DeepSecret Managed Storage" {
 		t.Errorf("managed storage %+v", m)
 	}
 	if own := got[1]; own.Primary || own.QuotaBytes != nil || own.UsedBytes != 5 {

@@ -373,8 +373,10 @@ type DecryptResult struct {
 	SecretName           string    // the secret name the sender signed: the server names the secret too, so show it or compare it with the secret you meant to open
 	SignedAt             time.Time // when the sender signed the revision, by their clock
 	SenderFingerprint    string
-	SenderEmail          string      // the sender, whose registered key signed the manifest
+	SenderEmail          string      // the sender the server (or a local file) names: their registered key signed the manifest, or with SenderOwnKey the user's own key did
 	SenderFirstUse       bool        // the sender's key was new to this device, accepted on first use: worth comparing with them
+	SenderOwnKey         bool        // the manifest is signed with a key pair on this device: the user signed it, whoever SenderEmail is; never set with SenderFirstUse
+	SenderOwnAccount     bool        // SenderEmail is recorded on this device as one of the user's own accounts; implies SenderOwnKey. SenderOwnKey without it is the limit the README's Recipient Keys section describes: worth telling the user
 	RecipientFingerprint string      // the caller's own key, which the wrap was made for
 	Recipients           []Recipient // every recipient the sender signed for; Email is the server's label for each fingerprint, or for a local file the file's label when that account registered the key
 	Compressed           bool

@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 DeepSecret
 
-// Package disk holds the file system checks the SDK relies on: free space,
-// folders private to this user, and file locks.
+// Package disk holds the file system calls the SDK relies on: free space,
+// files and folders private to this user, and file locks.
+//
+// Private means the user's own: mode 0600 for a file and 0700 for a folder
+// on Unix, and on Windows, which ignores those modes, a security descriptor
+// that makes this user the owner and grants nobody else any access
+// (private_windows.go). CreateTemp and MkdirPrivate always create private
+// files and folders. CreateNew and Mkdir take a mode, which Unix applies
+// and Windows replaces with that descriptor. ReadPrivate and
+// CheckPrivateDir refuse what someone else may open.
 package disk
 
 import (

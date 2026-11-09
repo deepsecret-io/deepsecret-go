@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,17 +21,19 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/disk"
+	"github.com/deepsecret-io/deepsecret-go/internal/disk/disktest"
 	"github.com/deepsecret-io/deepsecret-go/secrets"
 )
 
 const mib = 1 << 20
 
 // privateDir is a ResumeDir: the SDK keeps ciphertext only in a folder
-// private to this user.
+// private to this user (0700, or an owner-only ACL on Windows, which
+// ignores chmod).
 func privateDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
+	dir := filepath.Join(t.TempDir(), "resume")
+	if err := disk.MkdirPrivate(dir); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -115,12 +118,16 @@ func TestInterruptedDownloadResumes(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].RevisionID != interrupted.Download.RevisionID || pending[0].Downloaded() != 8*mib {
 		t.Fatalf("pending: %+v, %v", pending, err)
 	}
+	// On Windows the folder is private, and what is in it inherits that.
+	if runtime.GOOS == "windows" {
+		disktest.AssertPrivate(t, pending[0].Dir)
+	}
 	for path, mode := range map[string]os.FileMode{
 		pending[0].Dir:                                 0o700 | os.ModeDir,
 		filepath.Join(pending[0].Dir, "payload"):       0o600,
 		filepath.Join(pending[0].Dir, "download.json"): 0o600,
 	} {
-		if info, err := os.Stat(path); err != nil || info.Mode() != mode {
+		if info, err := os.Stat(path); err != nil || (runtime.GOOS != "windows" && info.Mode() != mode) {
 			t.Fatalf("%s: %v, %v", path, info.Mode(), err)
 		}
 	}

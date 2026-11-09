@@ -81,6 +81,7 @@ func TestFirstSendAcceptsRecipientKey(t *testing.T) {
 	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
 	// The default file, under the user's home, alice's device.
 	t.Setenv("HOME", filepath.Dir(filepath.Dir(alice.keys)))
+	t.Setenv("USERPROFILE", filepath.Dir(filepath.Dir(alice.keys))) // the home directory on Windows
 	c, err := deepsecret.NewClient(f.srv.URL, alice.email)
 	if err != nil {
 		t.Fatal(err)
@@ -278,13 +279,13 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.SenderFirstUse || res.SenderEmail != alice.email || res.SenderFingerprint != alice.fp {
+	if !res.SenderFirstUse || res.SenderEmail != alice.email || res.SenderFingerprint != alice.fp || res.SenderOwnKey || res.SenderOwnAccount {
 		t.Fatalf("first decrypt %+v", res)
 	}
-	if res, err = cb.Secrets.Decrypt(context.Background(), firstID, secrets.DecryptOptions{}); err != nil || res.SenderFirstUse {
+	if res, err = cb.Secrets.Decrypt(context.Background(), firstID, secrets.DecryptOptions{}); err != nil || res.SenderFirstUse || res.SenderOwnKey || res.SenderOwnAccount {
 		t.Fatalf("second decrypt %+v, %v", res, err)
 	}
-	if res, err = f.openLocal(bob.email, path); err != nil || res.SenderFirstUse {
+	if res, err = f.openLocal(bob.email, path); err != nil || res.SenderFirstUse || res.SenderOwnKey || res.SenderOwnAccount {
 		t.Fatalf("local file %+v, %v", res, err)
 	}
 
@@ -325,19 +326,20 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 	}
 }
 
-// A secret you sent yourself is signed with a key on this device: yours.
-// Nothing is accepted for it.
+// A secret you sent yourself is signed with a key on this device: yours,
+// from one of your accounts, on both decrypt paths. Nothing is accepted for
+// it.
 func TestDecryptOwnSecret(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	alice := f.actors["alice@example.com"]
 	c := f.client(alice.email)
-	res, err := c.Secrets.EncryptText(context.Background(), []string{alice.email}, "for me", secrets.EncryptOptions{Name: "n"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := c.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
-	if err != nil || out.SenderFirstUse {
+	id, path := ownNotes(t, c, alice.email, "")
+	out, err := c.Secrets.Decrypt(context.Background(), id, secrets.DecryptOptions{})
+	if err != nil || out.SenderFirstUse || !out.SenderOwnKey || !out.SenderOwnAccount {
 		t.Fatalf("decrypt %+v, %v", out, err)
+	}
+	if out, err = f.openLocal(alice.email, path); err != nil || out.SenderFirstUse || !out.SenderOwnKey || !out.SenderOwnAccount {
+		t.Fatalf("local file %+v, %v", out, err)
 	}
 	if known := knownKeys(t, c, ""); len(known) != 1 || known[alice.fp].State != trust.Own {
 		t.Fatalf("known keys %+v, want only alice's own", known)

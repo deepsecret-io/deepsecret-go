@@ -124,6 +124,22 @@ func (e *StaleRevisionError) Error() string {
 		e.RevisionID, e.SignedAt.UTC().Format(time.RFC3339), e.SecretName, e.SenderEmail, e.NewestSeen.UTC().Format(time.RFC3339))
 }
 
+// UnrecordedSenderError refuses a secret signed with Fingerprint, a key pair
+// on this device, whose sender the server names as Email, an account this
+// device knows neither as the user's nor by any key: one of the user's
+// accounts not recorded here yet, or the server relabelling the user's own
+// secret. If Email is the user's, recording it as theirs with that key,
+// signed in as Email, opens the secret.
+type UnrecordedSenderError struct {
+	Email       string
+	Fingerprint string
+}
+
+func (e *UnrecordedSenderError) Error() string {
+	return fmt.Sprintf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sign in as it and record it as yours with key %s on this device first)",
+		keys.ShortFingerprint(e.Fingerprint), e.Email, e.Email, keys.ShortFingerprint(e.Fingerprint))
+}
+
 // List returns the keys this device accepted for email on the store's server,
 // or for everyone when email is empty, sorted by email, with the keys it
 // used with the user's own accounts.
@@ -257,7 +273,8 @@ func (s *Store) Trust(email, fingerprint string, state State) error {
 // the user forgets it. The same server could instead have listed a key of
 // its own for them on that first contact and read what was sent to them,
 // the trade-off trust on first use accepts. Otherwise email is recorded
-// when registering (a key is being registered for it), when it is already
+// when registering (a key is being registered for it, or the user records
+// it with a key pair here that is registered for it), when it is already
 // recorded (fp is added), or when it is the first account recorded on the
 // server. A send on a device with other accounts recorded leaves a new one
 // unrecorded: the server's claim alone does not make it the user's.
@@ -392,13 +409,15 @@ func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 //
 // Anyone else's key must pass CheckKey. It changes nothing: a key new to this
 // device is reported as first, for RecordFirstUse once the decrypt succeeds.
-func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (bool, error) {
+// The result says which case passed, so callers can show the limit above:
+// Local without OwnAccount.
+func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (SenderKey, error) {
 	verified := func(own, first bool) {
 		logattr.Module(log, "verify").Debug("sender key verified", "email", email, "fingerprint", fp, "trust", KeyTrust(own, first))
 	}
 	disk, err := s.file.read()
 	if err != nil {
-		return false, err
+		return SenderKey{}, err
 	}
 	people := disk.Servers[s.server]
 	lower := strings.ToLower(email)
@@ -407,19 +426,32 @@ func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (bool, error)
 	first := false
 	if !local || (len(entries) > 0 && !OwnAccount(entries)) {
 		if first, err = CheckKey(people, lower, fp, true); err != nil {
-			return false, err
+			return SenderKey{}, err
 		}
 	}
 	if other := ownerOf(people, fp, lower); other != "" {
-		return false, fmt.Errorf("this secret is signed with %s, your account %s's key, but the server names %s as its sender: refusing it (possible relabelling by the server)",
+		return SenderKey{}, fmt.Errorf("this secret is signed with %s, your account %s's key, but the server names %s as its sender: refusing it (possible relabelling by the server)",
 			keys.ShortFingerprint(fp), other, email)
 	}
 	if local && len(entries) == 0 {
-		return false, fmt.Errorf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sync your identity for it first)",
-			keys.ShortFingerprint(fp), email, email)
+		return SenderKey{}, &UnrecordedSenderError{Email: email, Fingerprint: fp}
 	}
 	verified(local, first)
-	return first, nil
+	return SenderKey{First: first, Local: local, OwnAccount: OwnAccount(entries)}, nil
+}
+
+// SenderKey is what CheckSenderKey found for a sender key it passed.
+// OwnAccount implies Local, since only key pairs on this device pass for one
+// of the user's accounts, and Local implies not First.
+type SenderKey struct {
+	// First is set for a key new to this device, accepted on first use once
+	// the decrypt succeeds.
+	First bool
+	// Local is set for a key pair on this device.
+	Local bool
+	// OwnAccount is set when the sender's email is recorded on this device
+	// as one of the user's own accounts.
+	OwnAccount bool
 }
 
 // CheckNewest refuses m, the revision the server gives as its secret's

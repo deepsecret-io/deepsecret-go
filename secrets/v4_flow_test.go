@@ -81,6 +81,8 @@ type fakeAPI struct {
 	// secretGets, revisionLists and accountGets count the reads of a
 	// secret, of its revisions and of the caller's account.
 	secretGets, revisionLists, accountGets int
+	// registrations counts key uploads.
+	registrations int
 
 	// editBundle, when set, edits the primary key bundle listed for an
 	// email before it is served, as a hostile server would.
@@ -156,6 +158,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // the home directory on Windows
 	f := &fakeAPI{t: t, actors: map[string]*fakeActor{}, secrets: map[string]*fakeSecret{},
 		revs: map[string]*fakeRevision{}, objects: t.TempDir(), multipartAt: 1 << 62,
 		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}, known: t.TempDir()}
@@ -180,7 +183,12 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("GET /api/v1/actors/email/{email}", f.actorByEmail)
 	mux.HandleFunc("GET /api/v1/actors/{id}", f.actorByID)
 	mux.HandleFunc("GET /api/v1/identities", f.ownKeys)
-	mux.HandleFunc("POST /api/v1/identities", func(w http.ResponseWriter, _ *http.Request) { ok(w, map[string]string{}) })
+	mux.HandleFunc("POST /api/v1/identities", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		f.registrations++
+		f.mu.Unlock()
+		ok(w, map[string]string{})
+	})
 	mux.HandleFunc("GET /api/v1/identities/actor/{email}", f.publicKeys)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/secrets", f.create)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
