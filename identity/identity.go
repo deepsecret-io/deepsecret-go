@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -51,7 +52,8 @@ func (c *Client) ListKeys(ctx context.Context) ([]Key, error) {
 // trust). Then it uploads kp's public keys to the server, labelled as protected
 // by a security key when securityKey is set (a label for the user's own key
 // lists, see SetKeySecurityKey). Nothing is uploaded when the server says the
-// account is someone this device knows as another person.
+// account is someone this device knows as another person, or when the key
+// file on this device is protected by KMS keys bound to another account.
 func (c *Client) Sync(ctx context.Context, kp *keys.Pair, securityKey bool) error {
 	fp, err := keys.Fingerprint(kp)
 	if err != nil {
@@ -60,6 +62,9 @@ func (c *Client) Sync(ctx context.Context, kp *keys.Pair, securityKey bool) erro
 	me, err := whoAmI(ctx, c.api)
 	if err != nil {
 		return fmt.Errorf("fetch your account: %w", err)
+	}
+	if err := checkKMSAccount(c.keysDir, fp, me.ID); err != nil {
+		return err
 	}
 	if _, err := c.store.RecordOwnAccount(me.Email, fp, true); err != nil {
 		return err
@@ -289,6 +294,33 @@ func listRemoteKeys(ctx context.Context, c *transport.Client) ([]Key, error) {
 	return list.Keys, nil
 }
 
+// ErrKMSAccountMismatch refuses to register a key pair whose KMS slots are
+// bound to another DeepSecret account than the one signed in.
+var ErrKMSAccountMismatch = errors.New("the key pair's AWS KMS protection is bound to another DeepSecret account")
+
+// checkKMSAccount refuses a key pair whose key file here is protected by KMS
+// keys bound to an account other than actorID: its encryption context names
+// that account, so the key policies written for it would not match.
+func checkKMSAccount(dir, fp, actorID string) error {
+	info, err := keystore.ReadInfo(dir, fp)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil // no key file here to bind anything
+	case err != nil:
+		// A key file that does not read cannot be checked: refuse rather
+		// than register a key pair whose binding is unknown.
+		return fmt.Errorf("key file %s: %w", keys.ShortFingerprint(fp), err)
+	case info.Protection != keystore.ProtectionKMS:
+		return nil
+	}
+	for _, s := range info.Slots {
+		if s.Account != "" && s.Account != actorID {
+			return fmt.Errorf("%w: key pair %s is bound to account %s, and you are signed in as %s", ErrKMSAccountMismatch, keys.ShortFingerprint(fp), s.Account, actorID)
+		}
+	}
+	return nil
+}
+
 // syncIdentity uploads a key pair's public keys to the server, labelled
 // as protected by a security key on this device when securityKey is set.
 func syncIdentity(ctx context.Context, c *transport.Client, kp *keys.Pair, securityKey bool) error {
@@ -347,7 +379,8 @@ func primaryFingerprint(ctx context.Context, c *transport.Client) (string, error
 
 // LoadPrimary loads the key pair on this device of the primary key registered
 // on the server, unlocking it once with u: a password, a security key (package
-// fido2) or a recovery code. It returns the pair and its full fingerprint.
+// fido2), an AWS KMS key (package awskms) or a recovery code. It returns the
+// pair and its full fingerprint.
 func (c *Client) LoadPrimary(ctx context.Context, u keystore.Unlock) (*keys.Pair, string, error) {
 	dir := c.keysDir
 	primaryFP, err := primaryFingerprint(ctx, c.api)
@@ -356,7 +389,8 @@ func (c *Client) LoadPrimary(ctx context.Context, u keystore.Unlock) (*keys.Pair
 	}
 	kp, err := keystore.Open(ctx, dir, primaryFP, u)
 	if err != nil {
-		if info, ierr := keystore.ReadInfo(dir, primaryFP); ierr == nil && info.Protection == keystore.ProtectionSecurityKey {
+		// A file that reads but does not unlock is not a missing file.
+		if _, ierr := keystore.ReadInfo(dir, primaryFP); ierr == nil {
 			return nil, "", fmt.Errorf("primary key (%s): %w", keys.ShortFingerprint(primaryFP), err)
 		}
 		return nil, "", fmt.Errorf("primary key (%s) not found locally: %w", keys.ShortFingerprint(primaryFP), err)

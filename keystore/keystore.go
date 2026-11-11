@@ -141,8 +141,9 @@ func writePrivateFile(path string, data []byte) error {
 
 // Load loads a key pair from <dir>/<fingerprint>.json, where
 // fingerprint may be a prefix of 16 or more characters. It reads version 4
-// files (password or none); a security-key file (version 5) needs
-// Open and returns ErrSecurityKeyRequired here.
+// files (password or none); a security-key file (version 5) or a KMS file
+// (version 6) needs Open, and returns ErrSecurityKeyRequired or
+// ErrKMSRequired here.
 func Load(dir, fingerprint, password string) (*keys.Pair, error) {
 	// The fingerprint can come from the server (the primary key it lists),
 	// and it names the file read.
@@ -154,8 +155,14 @@ func Load(dir, fingerprint, password string) (*keys.Pair, error) {
 	if err != nil {
 		return nil, err
 	}
-	if f.v5 != nil {
+	p, err := f.protection()
+	switch {
+	case err != nil:
+		return nil, err
+	case p == ProtectionSecurityKey:
 		return nil, ErrSecurityKeyRequired
+	case p == ProtectionKMS:
+		return nil, ErrKMSRequired
 	}
 	return loadV4(f.v4, password)
 }
@@ -217,29 +224,59 @@ func LoadPublic(dir, fingerprint string) (*keys.PublicKeys, error) {
 	return pub, nil
 }
 
-// keyFile is a key file as read: version 4 (password or none) or version 5
-// (security keys), and its bytes.
+// keyFile is a key file as read, and its bytes: exactly one of v4
+// (version 4: password or none) and slots (version 5: security keys, or
+// version 6: KMS keys) is set. Every reader switches over both and refuses
+// a keyFile with neither.
 type keyFile struct {
-	raw []byte
-	v4  *keyPairOnDisk
-	v5  *securityKeyFile
+	raw   []byte
+	v4    *keyPairOnDisk
+	slots *slotFile
 }
+
+// errNoKeyFile is a keyFile that holds no key file: a bug, never a user's
+// file.
+var errNoKeyFile = errors.New("key file was not read")
 
 func (f *keyFile) publicKeys() keys.PublicKeys {
-	if f.v5 != nil {
-		return f.v5.publicKeys()
+	switch {
+	case f.v4 != nil:
+		return keys.PublicKeys{ED25519: f.v4.ED25519Public, X25519: f.v4.X25519Public, MLKEM768: f.v4.MLKEM768PK, MLDSA65: f.v4.MLDSA65PK}
+	case f.slots != nil:
+		return f.slots.publicKeys()
 	}
-	return keys.PublicKeys{ED25519: f.v4.ED25519Public, X25519: f.v4.X25519Public, MLKEM768: f.v4.MLKEM768PK, MLDSA65: f.v4.MLDSA65PK}
+	return keys.PublicKeys{}
 }
 
-// readKeyFile reads <dir>/<name>.json, a key file of storage version 4 or
-// 5, and refuses one that someone else may open (disk.ReadPrivate). name
+// protection is how the file keeps its private keys.
+func (f *keyFile) protection() (Protection, error) {
+	switch {
+	case f.v4 != nil && f.v4.Encrypted:
+		return ProtectionPassword, nil
+	case f.v4 != nil:
+		return ProtectionNone, nil
+	case f.slots != nil && f.slots.StorageVersion == securityKeyStorageVersion:
+		return ProtectionSecurityKey, nil
+	case f.slots != nil && f.slots.StorageVersion == kmsStorageVersion:
+		return ProtectionKMS, nil
+	}
+	return "", errNoKeyFile
+}
+
+// readKeyFile reads <dir>/<name>.json, a key file of storage version 4, 5
+// or 6, and refuses one that someone else may open (disk.ReadPrivate). name
 // must be hex only, so it cannot change the path.
 func readKeyFile(dir, name string) (*keyFile, error) {
 	data, err := disk.ReadPrivate(filepath.Join(dir, name+".json"))
 	if err != nil {
 		return nil, err
 	}
+	return parseKeyFile(data, name)
+}
+
+// parseKeyFile reads data as the key file named name: version 4, or a
+// slot file (version 5 or 6), read strictly.
+func parseKeyFile(data []byte, name string) (*keyFile, error) {
 	// One storage_version only, in any case: encoding/json would read
 	// "Storage_Version" as storage_version and keep the last of several.
 	if err := checkNoDuplicateKeys(data); err != nil {
@@ -258,17 +295,17 @@ func readKeyFile(dir, name string) (*keyFile, error) {
 			return nil, err
 		}
 		return &keyFile{raw: data, v4: &v4}, nil
-	case v == securityKeyStorageVersion:
-		f, err := parseSecurityKeyFile(data, name)
+	case v == securityKeyStorageVersion || v == kmsStorageVersion:
+		f, err := parseSlotFile(data, name)
 		if err != nil {
 			return nil, err
 		}
-		return &keyFile{raw: data, v5: f}, nil
-	case v > securityKeyStorageVersion:
+		return &keyFile{raw: data, slots: f}, nil
+	case v > kmsStorageVersion:
 		return nil, fmt.Errorf("key storage version %d needs a newer version of DeepSecret", v)
 	default:
-		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports versions %d and %d); regenerate the key",
-			v, keyStorageVersion, securityKeyStorageVersion)
+		return nil, fmt.Errorf("unsupported key storage version %d (this SDK supports versions %d, %d and %d); regenerate the key",
+			v, keyStorageVersion, securityKeyStorageVersion, kmsStorageVersion)
 	}
 }
 

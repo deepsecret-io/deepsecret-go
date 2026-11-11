@@ -77,7 +77,7 @@ func TestSecurityKeyProtectedSender(t *testing.T) {
 		t.Fatalf("send without the security key: %v", err)
 	}
 
-	res, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello bob", secrets.EncryptOptions{Name: "greeting", SecurityKey: key})
+	res, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello bob", secrets.EncryptOptions{Name: "greeting", Unlock: keystore.Unlock{SecurityKey: key}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,11 +92,11 @@ func TestSecurityKeyProtectedSender(t *testing.T) {
 	// A send to herself checks her own key on this device without
 	// unlocking it, then she opens it with the security key.
 	key.derives = 0
-	res, err = c.Secrets.EncryptText(context.Background(), []string{alice.email}, "note to self", secrets.EncryptOptions{Name: "self", SecurityKey: key})
+	res, err = c.Secrets.EncryptText(context.Background(), []string{alice.email}, "note to self", secrets.EncryptOptions{Name: "self", Unlock: keystore.Unlock{SecurityKey: key}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mine, err := c.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{SecurityKey: key})
+	mine, err := c.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{Unlock: keystore.Unlock{SecurityKey: key}})
 	if err != nil || mine.Decrypted.Message != "note to self" {
 		t.Fatalf("self decrypt: %+v, %v", mine, err)
 	}
@@ -105,7 +105,7 @@ func TestSecurityKeyProtectedSender(t *testing.T) {
 	}
 
 	// The recovery code works in place of the security key.
-	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "via code", secrets.EncryptOptions{Name: "code", RecoveryCode: code}); err != nil {
+	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "via code", secrets.EncryptOptions{Name: "code", Unlock: keystore.Unlock{RecoveryCode: code}}); err != nil {
 		t.Fatalf("send with the recovery code: %v", err)
 	}
 	if _, _, err := c.Identity.LoadPrimary(context.Background(), keystore.Unlock{SecurityKey: key}); err != nil {

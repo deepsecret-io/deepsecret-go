@@ -108,7 +108,7 @@ func TestPhasesBeginAfterTheUnlock(t *testing.T) {
 	c := f.client(alice.email)
 
 	sent := phaseRecorder{key: key}
-	res, err := c.Secrets.EncryptText(context.Background(), []string{alice.email}, "note to self", secrets.EncryptOptions{SecurityKey: key, OnPhase: sent.record})
+	res, err := c.Secrets.EncryptText(context.Background(), []string{alice.email}, "note to self", secrets.EncryptOptions{Unlock: keystore.Unlock{SecurityKey: key}, OnPhase: sent.record})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestPhasesBeginAfterTheUnlock(t *testing.T) {
 
 	key.derives = 0
 	opened := phaseRecorder{key: key}
-	if _, err := c.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{SecurityKey: key, OnPhase: opened.record}); err != nil {
+	if _, err := c.Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{Unlock: keystore.Unlock{SecurityKey: key}, OnPhase: opened.record}); err != nil {
 		t.Fatal(err)
 	}
 	opened.check(t, "open", transfer.PhaseDownloading)

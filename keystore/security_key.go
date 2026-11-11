@@ -3,16 +3,20 @@
 
 package keystore
 
-// Security key protection: key storage version 5 (docs/yubikey-design.md).
+// Slot files: key storage versions 5 (security keys, docs/yubikey-design.md)
+// and 6 (AWS KMS, kms.go).
 //
-// A version 5 key file keeps the four private keys sealed with AES-256-GCM
-// under a random file key. Each slot wraps that file key under one way in:
-// a FIDO2 security key (its hmac-secret output, the WebAuthn PRF value,
-// given only after the device's PIN and a touch) or a printed recovery
-// code. Opening any one slot opens the file. The private block's AAD binds
-// the whole slot list, so a slot copied in from another copy of the file
-// does not open it. Password-protected and unprotected key files stay at
-// version 4 and never touch this code.
+// A slot file keeps the four private keys sealed with AES-256-GCM under a
+// random file key. Each slot wraps that file key under one way in: a FIDO2
+// security key (its hmac-secret output, the WebAuthn PRF value, given only
+// after the device's PIN and a touch), an AWS KMS key (a slot secret only
+// KMS can decrypt), or a printed recovery code. Opening any one slot opens
+// the file. The private block's AAD binds the whole slot list, so a slot
+// copied in from another copy of the file does not open it. Version 5 holds
+// security keys and version 6 KMS keys, never both: a file is as weak as its
+// weakest way in. Every label the AADs and key derivations use names the
+// version, so nothing from one version opens in the other. Password-protected
+// and unprotected key files stay at version 4 and never touch this code.
 
 import (
 	"bytes"
@@ -80,15 +84,20 @@ const (
 	// ProtectionSecurityKey is a version 5 file opened by a security key
 	// or its recovery code.
 	ProtectionSecurityKey Protection = "security_key"
+	// ProtectionKMS is a version 6 file opened by an AWS KMS key or its
+	// recovery code.
+	ProtectionKMS Protection = "aws_kms"
 )
 
-// SlotType names a way into a version 5 key file.
+// SlotType names a way into a slot file (version 5 or 6).
 type SlotType string
 
 const (
-	// SlotSecurityKey is a FIDO2 security key credential.
+	// SlotSecurityKey is a FIDO2 security key credential (version 5).
 	SlotSecurityKey SlotType = "fido2"
-	// SlotRecoveryCode is a printed recovery code.
+	// SlotAWSKMS is an AWS KMS key (version 6).
+	SlotAWSKMS SlotType = "aws_kms"
+	// SlotRecoveryCode is a printed recovery code (versions 5 and 6).
 	SlotRecoveryCode SlotType = "recovery_code"
 )
 
@@ -100,6 +109,10 @@ type SlotInfo struct {
 	CreatedAt time.Time
 	// AAGUID names the security key model in hex, when the device gave one.
 	AAGUID string
+	// KMSKeyARN is the AWS KMS key of a KMS slot.
+	KMSKeyARN string
+	// Account is the DeepSecret account (actor id) a KMS slot is bound to.
+	Account string
 }
 
 // KeyFileInfo describes a stored key pair without unlocking it.
@@ -218,23 +231,25 @@ func PRFSalt(input []byte) [32]byte {
 
 // Unlock is what unlocking a key file may need. Password opens a version 4
 // password-protected file. A version 5 file is opened with RecoveryCode
-// when it is set, and otherwise with SecurityKey.
+// when it is set, and otherwise with SecurityKey. A version 6 file is
+// opened with RecoveryCode when it is set, and otherwise with KMS.
 type Unlock struct {
 	Password     string
 	SecurityKey  Authenticator
 	RecoveryCode string
+	KMS          KMS
 }
 
-// ── On-disk layout (version 5) ───────────────────────────────────────────────
+// ── On-disk layout (versions 5 and 6) ────────────────────────────────────────
 
-type securityKeyFile struct {
-	StorageVersion int      `json:"storage_version"`
-	ED25519Public  string   `json:"ed25519_public"`
-	X25519Public   string   `json:"x25519_public"`
-	MLKEM768PK     string   `json:"mlkem768_pk"`
-	MLDSA65PK      string   `json:"mldsa65_pk"`
-	Private        sealedV5 `json:"private"`
-	Slots          []slotV5 `json:"slots"`
+type slotFile struct {
+	StorageVersion int        `json:"storage_version"`
+	ED25519Public  string     `json:"ed25519_public"`
+	X25519Public   string     `json:"x25519_public"`
+	MLKEM768PK     string     `json:"mlkem768_pk"`
+	MLDSA65PK      string     `json:"mldsa65_pk"`
+	Private        sealedV5   `json:"private"`
+	Slots          []fileSlot `json:"slots"`
 }
 
 type sealedV5 struct {
@@ -242,13 +257,14 @@ type sealedV5 struct {
 	Ciphertext string `json:"ciphertext"`
 }
 
-type slotV5 struct {
+type fileSlot struct {
 	ID           string          `json:"id"`
 	Type         SlotType        `json:"type"`
 	Label        string          `json:"label"`
 	CreatedAt    string          `json:"created_at"`
 	FIDO2        *fido2SlotV5    `json:"fido2,omitempty"`
 	RecoveryCode *recoverySlotV5 `json:"recovery_code,omitempty"`
+	AWSKMS       *kmsSlotV6      `json:"aws_kms,omitempty"`
 	Wrap         wrapV5          `json:"wrap"`
 }
 
@@ -279,7 +295,8 @@ type privateKeysV5 struct {
 	MLDSA65Seed    []byte
 }
 
-// slotFields is what a slot's AAD covers: every field but the wrap.
+// slotFields is what a version 5 slot's AAD covers: every field but the
+// wrap.
 type slotFields struct {
 	_            struct{} `cbor:",toarray"`
 	Type         string
@@ -295,7 +312,21 @@ type slotFields struct {
 	RecoverySalt string
 }
 
-// slotListEntry is one slot as the private block's AAD covers it.
+// slotFieldsV6 is what a version 6 slot's AAD covers: every field but the
+// wrap.
+type slotFieldsV6 struct {
+	_            struct{} `cbor:",toarray"`
+	Type         string
+	ID           string
+	Label        string
+	CreatedAt    string
+	KeyARN       string
+	Account      string
+	Ciphertext   string
+	RecoverySalt string
+}
+
+// slotListEntry is one version 5 slot as the private block's AAD covers it.
 type slotListEntry struct {
 	_          struct{} `cbor:",toarray"`
 	Fields     slotFields
@@ -303,9 +334,18 @@ type slotListEntry struct {
 	WrappedKey string
 }
 
+// slotListEntryV6 is one version 6 slot as the private block's AAD covers
+// it.
+type slotListEntryV6 struct {
+	_          struct{} `cbor:",toarray"`
+	Fields     slotFieldsV6
+	Nonce      string
+	WrappedKey string
+}
+
 var b64 = base64.RawStdEncoding.Strict()
 
-func (s *slotV5) fields() slotFields {
+func (s *fileSlot) fields() slotFields {
 	f := slotFields{Type: string(s.Type), ID: s.ID, Label: s.Label, CreatedAt: s.CreatedAt}
 	if s.FIDO2 != nil {
 		f.RPID, f.CredentialID, f.AAGUID = s.FIDO2.RPID, s.FIDO2.CredentialID, s.FIDO2.AAGUID
@@ -317,37 +357,83 @@ func (s *slotV5) fields() slotFields {
 	return f
 }
 
-// slotAAD binds a slot's wrap to the key pair and to every field of the
-// slot.
-func slotAAD(fp string, s *slotV5) ([]byte, error) {
-	enc, err := canon.Marshal(s.fields())
-	if err != nil {
-		return nil, err
+func (s *fileSlot) fieldsV6() slotFieldsV6 {
+	f := slotFieldsV6{Type: string(s.Type), ID: s.ID, Label: s.Label, CreatedAt: s.CreatedAt}
+	if s.AWSKMS != nil {
+		f.KeyARN, f.Account, f.Ciphertext = s.AWSKMS.KeyARN, s.AWSKMS.Account, s.AWSKMS.Ciphertext
 	}
-	return append([]byte("deepsecret/keystore/v5/slot/"+fp+"\x00"), enc...), nil
+	if s.RecoveryCode != nil {
+		f.RecoverySalt = s.RecoveryCode.Salt
+	}
+	return f
 }
 
-// privateAAD binds the private block to the key pair and to the whole slot
-// list as written, wraps included.
-func privateAAD(fp string, slots []slotV5) ([]byte, error) {
-	list := make([]slotListEntry, len(slots))
-	for i := range slots {
-		list[i] = slotListEntry{Fields: slots[i].fields(), Nonce: slots[i].Wrap.Nonce, WrappedKey: slots[i].Wrap.WrappedKey}
+// errSlotVersion refuses a storage version that is not a slot file's.
+var errSlotVersion = errors.New("not a slot file version")
+
+// slotAAD binds a slot's wrap to the key pair, the file's version and every
+// field of the slot.
+func slotAAD(version int, fp string, s *fileSlot) ([]byte, error) {
+	switch version {
+	case securityKeyStorageVersion:
+		enc, err := canon.Marshal(s.fields())
+		if err != nil {
+			return nil, err
+		}
+		return append([]byte("deepsecret/keystore/v5/slot/"+fp+"\x00"), enc...), nil
+	case kmsStorageVersion:
+		enc, err := canon.Marshal(s.fieldsV6())
+		if err != nil {
+			return nil, err
+		}
+		return append([]byte("deepsecret/keystore/v6/slot/"+fp+"\x00"), enc...), nil
 	}
-	enc, err := canon.Marshal(list)
+	return nil, errSlotVersion
+}
+
+// privateAAD binds the private block to the key pair, the file's version and
+// the whole slot list as written, wraps included.
+func privateAAD(version int, fp string, slots []fileSlot) ([]byte, error) {
+	var enc []byte
+	var err error
+	var label string
+	switch version {
+	case securityKeyStorageVersion:
+		list := make([]slotListEntry, len(slots))
+		for i := range slots {
+			list[i] = slotListEntry{Fields: slots[i].fields(), Nonce: slots[i].Wrap.Nonce, WrappedKey: slots[i].Wrap.WrappedKey}
+		}
+		enc, err = canon.Marshal(list)
+		label = "deepsecret/keystore/v5/private/"
+	case kmsStorageVersion:
+		list := make([]slotListEntryV6, len(slots))
+		for i := range slots {
+			list[i] = slotListEntryV6{Fields: slots[i].fieldsV6(), Nonce: slots[i].Wrap.Nonce, WrappedKey: slots[i].Wrap.WrappedKey}
+		}
+		enc, err = canon.Marshal(list)
+		label = "deepsecret/keystore/v6/private/"
+	default:
+		return nil, errSlotVersion
+	}
 	if err != nil {
 		return nil, err
 	}
 	sum := sha256.Sum256(enc)
-	return append([]byte("deepsecret/keystore/v5/private/"+fp+"\x00"), sum[:]...), nil
+	return append([]byte(label+fp+"\x00"), sum[:]...), nil
 }
 
 func securityKeyKEK(output []byte, fp, slotID string) ([]byte, error) {
 	return hkdf.Key(sha256.New, output, nil, "deepsecret/keystore/v5/fido2/"+fp+"/"+slotID, fileKeySize)
 }
 
-func recoveryKEK(code, salt []byte, fp, slotID string) ([]byte, error) {
-	return hkdf.Key(sha256.New, code, salt, "deepsecret/keystore/v5/recovery/"+fp+"/"+slotID, fileKeySize)
+func recoveryKEK(version int, code, salt []byte, fp, slotID string) ([]byte, error) {
+	switch version {
+	case securityKeyStorageVersion:
+		return hkdf.Key(sha256.New, code, salt, "deepsecret/keystore/v5/recovery/"+fp+"/"+slotID, fileKeySize)
+	case kmsStorageVersion:
+		return hkdf.Key(sha256.New, code, salt, "deepsecret/keystore/v6/recovery/"+fp+"/"+slotID, fileKeySize)
+	}
+	return nil, errSlotVersion
 }
 
 func gcmSeal(key, plaintext, aad []byte) (nonce, ciphertext []byte, err error) {
@@ -388,16 +474,17 @@ func freshBytes(n int) ([]byte, error) {
 
 // ── Reading and checking ─────────────────────────────────────────────────────
 
-// parseSecurityKeyFile decodes a version 5 key file named name strictly:
-// unknown or repeated fields, a wrong size, a value out of range or public
-// keys that do not hash to name all refuse it.
-func parseSecurityKeyFile(data []byte, name string) (*securityKeyFile, error) {
+// parseSlotFile decodes a slot file (version 5 or 6) named name strictly:
+// unknown or repeated fields, a wrong size, a value out of range, a slot
+// that does not belong in the version, or public keys that do not hash to
+// name all refuse it.
+func parseSlotFile(data []byte, name string) (*slotFile, error) {
 	if err := checkNoDuplicateKeys(data); err != nil {
 		return nil, fmt.Errorf("key file %s: %w", keys.ShortFingerprint(name), err)
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	var f securityKeyFile
+	var f slotFile
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("key file %s: %w", keys.ShortFingerprint(name), err)
 	}
@@ -410,12 +497,12 @@ func parseSecurityKeyFile(data []byte, name string) (*securityKeyFile, error) {
 	return &f, nil
 }
 
-// check refuses a version 5 file that is not exactly what this SDK writes.
-// It does not ask for two ways in: a user may have waived the backup when
-// the file was written, and that file must still open.
-func (f *securityKeyFile) check(name string) error {
-	if f.StorageVersion != securityKeyStorageVersion {
-		return fmt.Errorf("storage version %d is not %d", f.StorageVersion, securityKeyStorageVersion)
+// check refuses a slot file that is not exactly what this SDK writes. It
+// does not ask for two ways in: a user may have waived the backup when the
+// file was written, and that file must still open.
+func (f *slotFile) check(name string) error {
+	if f.StorageVersion != securityKeyStorageVersion && f.StorageVersion != kmsStorageVersion {
+		return fmt.Errorf("storage version %d is not %d or %d", f.StorageVersion, securityKeyStorageVersion, kmsStorageVersion)
 	}
 	fp, err := keys.FingerprintFromPubs(f.ED25519Public, f.X25519Public, f.MLKEM768PK, f.MLDSA65PK)
 	if err != nil {
@@ -430,9 +517,11 @@ func (f *securityKeyFile) check(name string) error {
 	if err := checkB64(f.Private.Ciphertext, 17, 1<<16); err != nil {
 		return fmt.Errorf("private block: %w", err)
 	}
-	var secKeys, codes int
+	var secKeys, kmsKeys, codes int
 	ids := map[string]bool{}
 	creds := map[string]bool{}
+	kmsARNs := map[string]bool{}
+	account := ""
 	for i := range f.Slots {
 		s := &f.Slots[i]
 		if !validSlotID(s.ID) || ids[s.ID] {
@@ -451,10 +540,10 @@ func (f *securityKeyFile) check(name string) error {
 		if err := checkB64(s.Wrap.WrappedKey, wrappedKeySize, wrappedKeySize); err != nil {
 			return fmt.Errorf("slot %s: wrapped key: %w", s.ID, err)
 		}
-		switch s.Type {
-		case SlotSecurityKey:
+		switch {
+		case s.Type == SlotSecurityKey && f.StorageVersion == securityKeyStorageVersion:
 			secKeys++
-			if s.FIDO2 == nil || s.RecoveryCode != nil {
+			if s.FIDO2 == nil || s.RecoveryCode != nil || s.AWSKMS != nil {
 				return fmt.Errorf("slot %s: a security key slot holds fido2 data only", s.ID)
 			}
 			k := s.FIDO2
@@ -479,17 +568,43 @@ func (f *securityKeyFile) check(name string) error {
 					return fmt.Errorf("slot %s: aaguid is not 32 lower-case hex characters", s.ID)
 				}
 			}
-		case SlotRecoveryCode:
+		case s.Type == SlotAWSKMS && f.StorageVersion == kmsStorageVersion:
+			kmsKeys++
+			if s.AWSKMS == nil || s.FIDO2 != nil || s.RecoveryCode != nil {
+				return fmt.Errorf("slot %s: a KMS slot holds aws_kms data only", s.ID)
+			}
+			if err := s.AWSKMS.check(); err != nil {
+				return fmt.Errorf("slot %s: %w", s.ID, err)
+			}
+			if kmsARNs[s.AWSKMS.KeyARN] {
+				return fmt.Errorf("slot %s: repeated KMS key", s.ID)
+			}
+			kmsARNs[s.AWSKMS.KeyARN] = true
+			if account != "" && s.AWSKMS.Account != account {
+				return fmt.Errorf("slot %s: the KMS slots name different accounts", s.ID)
+			}
+			account = s.AWSKMS.Account
+		case s.Type == SlotRecoveryCode:
 			codes++
-			if s.RecoveryCode == nil || s.FIDO2 != nil {
+			if s.RecoveryCode == nil || s.FIDO2 != nil || s.AWSKMS != nil {
 				return fmt.Errorf("slot %s: a recovery code slot holds recovery data only", s.ID)
 			}
 			if err := checkB64(s.RecoveryCode.Salt, saltSize, saltSize); err != nil {
 				return fmt.Errorf("slot %s: salt: %w", s.ID, err)
 			}
+		case f.StorageVersion == kmsStorageVersion && s.Type == SlotSecurityKey:
+			return fmt.Errorf("slot %s: a KMS key file holds no security key", s.ID)
+		case f.StorageVersion == kmsStorageVersion:
+			return fmt.Errorf("slot %s: slot type %q needs a newer version of DeepSecret", s.ID, s.Type)
 		default:
 			return fmt.Errorf("slot %s: unknown type %q", s.ID, s.Type)
 		}
+	}
+	if f.StorageVersion == kmsStorageVersion {
+		if kmsKeys < 1 || kmsKeys > maxKMSSlots || codes > 1 {
+			return fmt.Errorf("%d KMS keys and %d recovery codes: allowed are 1 to %d and at most 1", kmsKeys, codes, maxKMSSlots)
+		}
+		return nil
 	}
 	if secKeys < 1 || secKeys > maxSecurityKeySlots || codes > 1 {
 		return fmt.Errorf("%d security keys and %d recovery codes: allowed are 1 to %d and at most 1", secKeys, codes, maxSecurityKeySlots)
@@ -522,6 +637,10 @@ func validSlotID(id string) bool {
 	}
 	return true
 }
+
+// ValidateSlotLabel checks a slot label as the editor will, so a caller can
+// refuse a bad one before it unlocks anything or calls a device or KMS.
+func ValidateSlotLabel(label string) error { return validateLabel(label) }
 
 // validateLabel accepts 1 to 64 characters of valid UTF-8 without control
 // or layout characters, so a label cannot reorder or hide terminal text.
@@ -617,11 +736,11 @@ func checkNoDuplicateKeys(data []byte) error {
 	}
 }
 
-func (f *securityKeyFile) publicKeys() keys.PublicKeys {
+func (f *slotFile) publicKeys() keys.PublicKeys {
 	return keys.PublicKeys{ED25519: f.ED25519Public, X25519: f.X25519Public, MLKEM768: f.MLKEM768PK, MLDSA65: f.MLDSA65PK}
 }
 
-func (f *securityKeyFile) slotInfo() []SlotInfo {
+func (f *slotFile) slotInfo() []SlotInfo {
 	out := make([]SlotInfo, len(f.Slots))
 	for i, s := range f.Slots {
 		out[i] = s.info()
@@ -629,18 +748,21 @@ func (f *securityKeyFile) slotInfo() []SlotInfo {
 	return out
 }
 
-func (s *slotV5) info() SlotInfo {
+func (s *fileSlot) info() SlotInfo {
 	created, _ := time.Parse(time.RFC3339, s.CreatedAt)
 	info := SlotInfo{ID: s.ID, Type: s.Type, Label: s.Label, CreatedAt: created}
 	if s.FIDO2 != nil {
 		info.AAGUID = s.FIDO2.AAGUID
+	}
+	if s.AWSKMS != nil {
+		info.KMSKeyARN, info.Account = s.AWSKMS.KeyARN, s.AWSKMS.Account
 	}
 	return info
 }
 
 // ReadInfo reads what the key file <dir>/<fingerprint>.json shows
 // without unlocking it: the full fingerprint, the protection, the public
-// keys and, for a security-key file, its slots. fingerprint may be a
+// keys and, for a slot file (security keys or KMS), its slots. fingerprint may be a
 // prefix of 16 or more characters. The public keys must hash to the file's
 // name.
 func ReadInfo(dir, fingerprint string) (*KeyFileInfo, error) {
@@ -662,13 +784,11 @@ func ReadInfo(dir, fingerprint string) (*KeyFileInfo, error) {
 		return nil, fmt.Errorf("key file %s holds the keys of %s", keys.ShortFingerprint(name), keys.ShortFingerprint(fp))
 	}
 	info.Fingerprint, info.Public.Fingerprint = fp, fp
-	switch {
-	case f.v5 != nil:
-		info.Protection, info.Slots = ProtectionSecurityKey, f.v5.slotInfo()
-	case f.v4.Encrypted:
-		info.Protection = ProtectionPassword
-	default:
-		info.Protection = ProtectionNone
+	if info.Protection, err = f.protection(); err != nil {
+		return nil, err
+	}
+	if f.slots != nil {
+		info.Slots = f.slots.slotInfo()
 	}
 	return info, nil
 }
@@ -679,8 +799,9 @@ func ReadInfo(dir, fingerprint string) (*KeyFileInfo, error) {
 // where fingerprint may be a prefix of 16 or more characters. A version 4
 // file is read exactly as Load reads it, with u.Password. A
 // version 5 file is opened with u.RecoveryCode when it is set, and
-// otherwise with u.SecurityKey; the private keys must match the public
-// keys.
+// otherwise with u.SecurityKey; a version 6 file with u.RecoveryCode when
+// it is set, and otherwise with u.KMS. The private keys must match the
+// public keys.
 func Open(ctx context.Context, dir, fingerprint string, u Unlock) (*keys.Pair, error) {
 	fingerprint = strings.ToLower(fingerprint)
 	if !validKeyName(fingerprint) {
@@ -691,26 +812,35 @@ func Open(ctx context.Context, dir, fingerprint string, u Unlock) (*keys.Pair, e
 	if err != nil {
 		return nil, err
 	}
-	if f.v5 == nil {
+	switch {
+	case f.v4 != nil:
 		return loadV4(f.v4, u.Password)
+	case f.slots != nil:
+		kp, fk, err := f.slots.unlock(ctx, name, u)
+		clear(fk)
+		return kp, err
 	}
-	kp, fk, err := f.v5.unlock(ctx, name, u)
-	clear(fk)
-	return kp, err
+	return nil, errNoKeyFile
 }
 
 // unlock opens one slot and then the private block. It returns the file
 // key too, for an editor; the caller clears it.
-func (f *securityKeyFile) unlock(ctx context.Context, fp string, u Unlock) (*keys.Pair, []byte, error) {
+func (f *slotFile) unlock(ctx context.Context, fp string, u Unlock) (*keys.Pair, []byte, error) {
 	var fk []byte
 	var err error
 	switch {
 	case u.RecoveryCode != "":
 		fk, err = f.openRecoveryCode(fp, u.RecoveryCode)
-	case u.SecurityKey != nil:
+	case f.StorageVersion == securityKeyStorageVersion && u.SecurityKey != nil:
 		fk, err = f.openSecurityKey(ctx, fp, u.SecurityKey)
-	default:
+	case f.StorageVersion == securityKeyStorageVersion:
 		return nil, nil, ErrSecurityKeyRequired
+	case f.StorageVersion == kmsStorageVersion && u.KMS != nil:
+		fk, err = f.openKMS(ctx, fp, u.KMS)
+	case f.StorageVersion == kmsStorageVersion:
+		return nil, nil, ErrKMSRequired
+	default:
+		return nil, nil, errSlotVersion
 	}
 	if err != nil {
 		return nil, nil, err
@@ -723,8 +853,8 @@ func (f *securityKeyFile) unlock(ctx context.Context, fp string, u Unlock) (*key
 	return kp, fk, nil
 }
 
-func (f *securityKeyFile) openRecoveryCode(fp, typed string) ([]byte, error) {
-	var slot *slotV5
+func (f *slotFile) openRecoveryCode(fp, typed string) ([]byte, error) {
+	var slot *fileSlot
 	for i := range f.Slots {
 		if f.Slots[i].Type == SlotRecoveryCode {
 			slot = &f.Slots[i]
@@ -739,19 +869,19 @@ func (f *securityKeyFile) openRecoveryCode(fp, typed string) ([]byte, error) {
 	}
 	defer clear(code)
 	salt, _ := b64.DecodeString(slot.RecoveryCode.Salt)
-	kek, err := recoveryKEK(code, salt, fp, slot.ID)
+	kek, err := recoveryKEK(f.StorageVersion, code, salt, fp, slot.ID)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(kek)
-	fk, err := openWrap(fp, slot, kek)
+	fk, err := openWrap(f.StorageVersion, fp, slot, kek)
 	if err != nil {
 		return nil, ErrWrongRecoveryCode
 	}
 	return fk, nil
 }
 
-func (f *securityKeyFile) openSecurityKey(ctx context.Context, fp string, a Authenticator) ([]byte, error) {
+func (f *slotFile) openSecurityKey(ctx context.Context, fp string, a Authenticator) ([]byte, error) {
 	req := DeriveRequest{RPID: SecurityKeyRPID, Fingerprint: fp}
 	for i := range f.Slots {
 		if s := &f.Slots[i]; s.Type == SlotSecurityKey {
@@ -768,7 +898,7 @@ func (f *securityKeyFile) openSecurityKey(ctx context.Context, fp string, a Auth
 		return nil, ErrSecurityKeyMismatch
 	}
 	defer clear(res.Output)
-	var slot *slotV5
+	var slot *fileSlot
 	for i := range f.Slots {
 		if s := &f.Slots[i]; s.Type == SlotSecurityKey {
 			if id, _ := b64.DecodeString(s.FIDO2.CredentialID); bytes.Equal(id, res.CredentialID) {
@@ -784,15 +914,15 @@ func (f *securityKeyFile) openSecurityKey(ctx context.Context, fp string, a Auth
 		return nil, err
 	}
 	defer clear(kek)
-	fk, err := openWrap(fp, slot, kek)
+	fk, err := openWrap(f.StorageVersion, fp, slot, kek)
 	if err != nil {
 		return nil, ErrSecurityKeyMismatch
 	}
 	return fk, nil
 }
 
-func openWrap(fp string, s *slotV5, kek []byte) ([]byte, error) {
-	aad, err := slotAAD(fp, s)
+func openWrap(version int, fp string, s *fileSlot, kek []byte) ([]byte, error) {
+	aad, err := slotAAD(version, fp, s)
 	if err != nil {
 		return nil, err
 	}
@@ -807,8 +937,8 @@ func openWrap(fp string, s *slotV5, kek []byte) ([]byte, error) {
 
 // openPrivate opens the private block with the file key and checks that
 // each private key gives its public key.
-func (f *securityKeyFile) openPrivate(fp string, fk []byte) (*keys.Pair, error) {
-	aad, err := privateAAD(fp, f.Slots)
+func (f *slotFile) openPrivate(fp string, fk []byte) (*keys.Pair, error) {
+	aad, err := privateAAD(f.StorageVersion, fp, f.Slots)
 	if err != nil {
 		return nil, err
 	}
@@ -879,18 +1009,37 @@ func checkPrivateMatchesPublic(kp *keys.Pair) error {
 // ── Editing slots ────────────────────────────────────────────────────────────
 
 // SlotEditor changes the ways into a key file: it protects a version 4
-// file or a new key pair with security keys, adds or removes a security
-// key, and creates or replaces the recovery code. Nothing is written until
+// file or a new key pair with security keys or KMS keys, adds or removes
+// one, and creates or replaces the recovery code. Nothing is written until
 // Commit or CommitPassword, which refuse to write when the file changed
 // on disk since the editor read it. Close clears the key material it holds.
+//
+// The editor writes one slot file version: 5 (security keys) or 6 (KMS
+// keys). It is the version of the file it read or the new file it makes;
+// an editor of a version 4 file takes it from the first key added, and
+// refuses the other kind from then on.
 type SlotEditor struct {
 	dir, fp  string
 	original []byte // the file as read, nil for a new key pair
+	version  int    // the slot file version written; 0 until a key is added to a version 4 file
 	kp       *keys.Pair
 	fk       []byte
-	slots    []slotV5
+	slots    []fileSlot
 	added    map[string][]byte // key-encryption keys of slots added here, by slot id
 	done     bool
+}
+
+// errMixedSlots refuses a security key in a KMS file or a KMS key in a
+// security-key file.
+var errMixedSlots = fmt.Errorf("%w: a key file holds security keys or KMS keys, never both", ErrSlotRules)
+
+// kind fixes the editor's version to want, when it has none yet, and
+// refuses any other.
+func (e *SlotEditor) kind(want int) error {
+	if e.version != 0 && e.version != want {
+		return errMixedSlots
+	}
+	return nil
 }
 
 // Edit unlocks the key file <dir>/<fingerprint>.json with u and
@@ -908,13 +1057,15 @@ func Edit(ctx context.Context, dir, fingerprint string, u Unlock) (*SlotEditor, 
 		return nil, err
 	}
 	e := &SlotEditor{dir: dir, original: f.raw, added: map[string][]byte{}}
-	if f.v5 != nil {
-		kp, fk, err := f.v5.unlock(ctx, name, u)
+	switch {
+	case f.slots != nil:
+		kp, fk, err := f.slots.unlock(ctx, name, u)
 		if err != nil {
 			return nil, err
 		}
-		e.kp, e.fk, e.slots = kp, fk, append([]slotV5(nil), f.v5.Slots...)
-	} else {
+		e.kp, e.fk, e.slots = kp, fk, append([]fileSlot(nil), f.slots.Slots...)
+		e.version = f.slots.StorageVersion
+	case f.v4 != nil:
 		kp, err := loadV4(f.v4, u.Password)
 		if err != nil {
 			return nil, err
@@ -926,6 +1077,8 @@ func Edit(ctx context.Context, dir, fingerprint string, u Unlock) (*SlotEditor, 
 			return nil, err
 		}
 		e.kp = kp
+	default:
+		return nil, errNoKeyFile
 	}
 	if e.fp, err = keys.Fingerprint(e.kp); err != nil {
 		e.Close()
@@ -942,6 +1095,12 @@ func Edit(ctx context.Context, dir, fingerprint string, u Unlock) (*SlotEditor, 
 // new key pair is written straight to a version 5 file and never sits on
 // disk unprotected. Commit refuses to write over an existing file.
 func NewSecurityKeyFile(dir string, kp *keys.Pair) (*SlotEditor, error) {
+	return newSlotFileEditor(dir, kp, securityKeyStorageVersion)
+}
+
+// newSlotFileEditor returns an editor that writes the new key pair kp as a
+// slot file of version.
+func newSlotFileEditor(dir string, kp *keys.Pair, version int) (*SlotEditor, error) {
 	if err := checkPrivateMatchesPublic(kp); err != nil {
 		return nil, err
 	}
@@ -956,7 +1115,7 @@ func NewSecurityKeyFile(dir string, kp *keys.Pair) (*SlotEditor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SlotEditor{dir: dir, fp: fp, kp: kp, fk: fk, added: map[string][]byte{}}, nil
+	return &SlotEditor{dir: dir, fp: fp, version: version, kp: kp, fk: fk, added: map[string][]byte{}}, nil
 }
 
 // Fingerprint is the full fingerprint of the key pair being edited.
@@ -992,9 +1151,10 @@ func newSlotID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// seal wraps the file key for s under kek and records the wrap in s.
-func (e *SlotEditor) seal(s *slotV5, kek []byte) error {
-	aad, err := slotAAD(e.fp, s)
+// seal wraps the file key for s under kek, as a slot of a version file,
+// and records the wrap in s.
+func (e *SlotEditor) seal(version int, s *fileSlot, kek []byte) error {
+	aad, err := slotAAD(version, e.fp, s)
 	if err != nil {
 		return err
 	}
@@ -1011,6 +1171,9 @@ func (e *SlotEditor) seal(s *slotV5, kek []byte) error {
 func (e *SlotEditor) AddSecurityKey(ctx context.Context, a Authenticator, label string) (SlotInfo, error) {
 	if e.done {
 		return SlotInfo{}, errors.New("editor is closed")
+	}
+	if err := e.kind(securityKeyStorageVersion); err != nil {
+		return SlotInfo{}, err
 	}
 	if e.count(SlotSecurityKey) >= maxSecurityKeySlots {
 		return SlotInfo{}, fmt.Errorf("%w: a key file holds at most %d security keys", ErrSlotRules, maxSecurityKeySlots)
@@ -1068,7 +1231,7 @@ func (e *SlotEditor) AddSecurityKey(ctx context.Context, a Authenticator, label 
 	if len(res.AAGUID) == 16 && !bytes.Equal(res.AAGUID, make([]byte, 16)) {
 		aaguid = hex.EncodeToString(res.AAGUID)
 	}
-	s := slotV5{
+	s := fileSlot{
 		ID: id, Type: SlotSecurityKey, Label: label, CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		FIDO2: &fido2SlotV5{
 			RPID: SecurityKeyRPID, CredentialID: b64.EncodeToString(res.CredentialID), AAGUID: aaguid,
@@ -1079,12 +1242,13 @@ func (e *SlotEditor) AddSecurityKey(ctx context.Context, a Authenticator, label 
 	if err != nil {
 		return SlotInfo{}, err
 	}
-	if err := e.seal(&s, kek); err != nil {
+	if err := e.seal(securityKeyStorageVersion, &s, kek); err != nil {
 		clear(kek)
 		return SlotInfo{}, err
 	}
 	e.slots = append(e.slots, s)
 	e.added[id] = kek
+	e.version = securityKeyStorageVersion
 	return s.info(), nil
 }
 
@@ -1094,6 +1258,9 @@ func (e *SlotEditor) AddSecurityKey(ctx context.Context, a Authenticator, label 
 func (e *SlotEditor) SetRecoveryCode() (string, error) {
 	if e.done {
 		return "", errors.New("editor is closed")
+	}
+	if e.version == 0 {
+		return "", fmt.Errorf("%w: add a security key or a KMS key before the recovery code", ErrSlotRules)
 	}
 	code, text, err := newRecoveryCode()
 	if err != nil {
@@ -1108,15 +1275,15 @@ func (e *SlotEditor) SetRecoveryCode() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	s := slotV5{
+	s := fileSlot{
 		ID: id, Type: SlotRecoveryCode, Label: "Recovery code", CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		RecoveryCode: &recoverySlotV5{Salt: b64.EncodeToString(salt)},
 	}
-	kek, err := recoveryKEK(code, salt, e.fp, id)
+	kek, err := recoveryKEK(e.version, code, salt, e.fp, id)
 	if err != nil {
 		return "", err
 	}
-	if err := e.seal(&s, kek); err != nil {
+	if err := e.seal(e.version, &s, kek); err != nil {
 		clear(kek)
 		return "", err
 	}
@@ -1152,23 +1319,38 @@ func (e *SlotEditor) forget(id string) {
 	}
 }
 
-// Commit writes the key file as version 5. It needs at least one security
-// key and, unless allowSingle is set, a second way in: another security key
-// or a recovery code. Before the file is replaced, the new bytes are read
-// back and every slot added here, and the private block, must open.
+// Commit writes the key file as the editor's version: 5 with security keys,
+// 6 with KMS keys. It needs at least one such key and, unless allowSingle
+// is set, a second way in: another key of the same kind or a recovery
+// code. Before the file is replaced, the new bytes are read back and every
+// slot added here, and the private block, must open.
 func (e *SlotEditor) Commit(allowSingle bool) error {
 	if e.done {
 		return errors.New("editor is closed")
 	}
-	secKeys, codes := e.count(SlotSecurityKey), e.count(SlotRecoveryCode)
-	switch {
-	case secKeys == 0:
-		return fmt.Errorf("%w: a security key file needs at least one security key", ErrSlotRules)
-	case secKeys+codes < 2 && !allowSingle:
-		return fmt.Errorf("%w: add a second security key or a recovery code, or confirm a single way in", ErrSlotRules)
+	codes := e.count(SlotRecoveryCode)
+	switch e.version {
+	case securityKeyStorageVersion:
+		secKeys := e.count(SlotSecurityKey)
+		switch {
+		case secKeys == 0:
+			return fmt.Errorf("%w: a security key file needs at least one security key", ErrSlotRules)
+		case secKeys+codes < 2 && !allowSingle:
+			return fmt.Errorf("%w: add a second security key or a recovery code, or confirm a single way in", ErrSlotRules)
+		}
+	case kmsStorageVersion:
+		kmsKeys := e.count(SlotAWSKMS)
+		switch {
+		case kmsKeys == 0:
+			return fmt.Errorf("%w: a KMS key file needs at least one KMS key", ErrSlotRules)
+		case kmsKeys+codes < 2 && !allowSingle:
+			return fmt.Errorf("%w: add a second KMS key or a recovery code, or confirm a single way in", ErrSlotRules)
+		}
+	default:
+		return fmt.Errorf("%w: add a security key or a KMS key first", ErrSlotRules)
 	}
-	f := securityKeyFile{
-		StorageVersion: securityKeyStorageVersion,
+	f := slotFile{
+		StorageVersion: e.version,
 		ED25519Public:  e.kp.ED25519Public,
 		X25519Public:   e.kp.X25519Public,
 		MLKEM768PK:     e.kp.MLKEM768PK,
@@ -1180,7 +1362,7 @@ func (e *SlotEditor) Commit(allowSingle bool) error {
 		return err
 	}
 	defer clear(plain)
-	aad, err := privateAAD(e.fp, f.Slots)
+	aad, err := privateAAD(e.version, e.fp, f.Slots)
 	if err != nil {
 		return err
 	}
@@ -1206,16 +1388,19 @@ func (e *SlotEditor) Commit(allowSingle bool) error {
 // verify reads data back as a key file and opens every slot added here and
 // the private block, so a write can never lock the user out.
 func (e *SlotEditor) verify(data []byte) error {
-	f, err := parseSecurityKeyFile(data, e.fp)
+	f, err := parseSlotFile(data, e.fp)
 	if err != nil {
 		return err
+	}
+	if f.StorageVersion != e.version {
+		return fmt.Errorf("written as version %d, not %d", f.StorageVersion, e.version)
 	}
 	for i := range f.Slots {
 		kek, ok := e.added[f.Slots[i].ID]
 		if !ok {
 			continue
 		}
-		fk, err := openWrap(e.fp, &f.Slots[i], kek)
+		fk, err := openWrap(f.StorageVersion, e.fp, &f.Slots[i], kek)
 		if err != nil || !bytes.Equal(fk, e.fk) {
 			clear(fk)
 			return fmt.Errorf("slot %s does not open", f.Slots[i].ID)

@@ -65,6 +65,10 @@ secrets.EncryptOptions{
     // Resending under an existing name must list everyone with access now;
     // this revokes anyone the send leaves out.
     RevokeMissing: true,
+    // How the sender's key pair unlocks: Password, SecurityKey (package
+    // fido2), KMS (package awskms) or RecoveryCode. DecryptOptions has the
+    // same field.
+    Unlock:     keystore.Unlock{KMS: kmsClient},
 }
 ```
 
@@ -326,8 +330,10 @@ accepting any key again.
 | `keys.SafetyNumber`, `keys.PairSafetyNumber` | A fingerprint as digits to compare aloud |
 | `keystore.Save` / `keystore.Load` | Password-protected key storage |
 | `keystore.ReadInfo` | How a key file is protected, and its slots, without unlocking it |
-| `keystore.Open` | Unlock any key file: password, security key or recovery code |
+| `keystore.Open` | Unlock any key file: password, security key, AWS KMS key or recovery code |
 | `keystore.Edit` / `keystore.NewSecurityKeyFile` | Protect a key pair with security keys, add or remove them, set a recovery code |
+| `keystore.NewKMSKeyFile` / `SlotEditor.AddKMS` | Protect a key pair with AWS KMS keys, for automation ([docs/kms-design.md](docs/kms-design.md)) |
+| `keystore.Import` | Place a protected key file (version 5 or 6) made on another machine |
 
 ### `fido2`: Security Keys
 
@@ -337,6 +343,15 @@ accepting any key again.
 | `Check()` | Whether libfido2 is installed, and which security keys are connected |
 
 Builds with `-tags nofido2`, and builds for Windows, have no security key support.
+
+### `awskms`: AWS KMS
+
+| Function | Description |
+|---|---|
+| `New(ctx, Options)` | A `keystore.KMS` for AWS KMS, with credentials from the AWS default chain or a profile. The endpoint is the key's own regional one and the HTTP client trusts the system's roots: endpoint and CA overrides are ignored |
+| `CallerARN(ctx, region)` | The AWS identity the credentials belong to |
+
+Only `awskms` imports the AWS SDK: programs that do not use it do not link it.
 
 ### `apierror` and `transfer`
 

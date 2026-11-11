@@ -25,8 +25,9 @@ The SDK must be usable standalone without the CLI.
 - secrets → send, receive, local files, list, revoke, policy, resume, storage
 - trust → the keys this device knows: list, accept, verify, forget
 - keys → key pairs, fingerprints, safety numbers; no file access
-- keystore → key files, protection, security key slots, recovery codes
+- keystore → key files, protection, security key and KMS slots, recovery codes
 - fido2 → security keys
+- awskms → AWS KMS for KMS-protected key files (the only package that imports the AWS SDK)
 - apierror → what the server answered
 - transfer → a transfer's state, phases and limits
 - internal/transport → HTTP, presigned uploads and downloads
@@ -39,6 +40,7 @@ The SDK must be usable standalone without the CLI.
 
 3. No cross-layer leakage
 - keys, keystore, protocol, payload, archive and compress must not depend on transport
+- keystore, identity, secrets and the root package must not depend on awskms or the AWS SDK
 - a test enforces this: structure_test.go
 - only top-level SDK layers orchestrate across packages
 

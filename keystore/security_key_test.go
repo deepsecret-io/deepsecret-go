@@ -274,13 +274,18 @@ func TestSlotRules(t *testing.T) {
 	if err := e.Commit(false); !errors.Is(err, ErrSlotRules) {
 		t.Errorf("no security key: %v", err)
 	}
-	if _, err := e.SetRecoveryCode(); err != nil {
-		t.Fatal(err)
+	// The first key decides the version (5 or 6), so the recovery code
+	// comes after it.
+	if _, err := e.SetRecoveryCode(); !errors.Is(err, ErrSlotRules) {
+		t.Errorf("recovery code before a key: %v", err)
 	}
 	if err := e.Commit(true); !errors.Is(err, ErrSlotRules) {
-		t.Errorf("recovery code alone: %v", err)
+		t.Errorf("no way in: %v", err)
 	}
 	if _, err := e.AddSecurityKey(ctx, a, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.SetRecoveryCode(); err != nil {
 		t.Fatal(err)
 	}
 	// The same device cannot be enrolled twice as its own backup.
@@ -677,7 +682,7 @@ func TestDerivationVectors(t *testing.T) {
 	if got := hex.EncodeToString(kek); got != securityKEKVector {
 		t.Errorf("security key KEK = %s, want %s", got, securityKEKVector)
 	}
-	kek, err = recoveryKEK(bytes.Repeat([]byte{0x03}, 20), bytes.Repeat([]byte{0x04}, 16), fp, "0123456789abcdef")
+	kek, err = recoveryKEK(securityKeyStorageVersion, bytes.Repeat([]byte{0x03}, 20), bytes.Repeat([]byte{0x04}, 16), fp, "0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +734,7 @@ func FuzzParseSecurityKeyFile(f *testing.F) {
 	f.Add(data)
 	f.Add([]byte(`{"storage_version":5}`))
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		if file, err := parseSecurityKeyFile(data, fp); err == nil {
+		if file, err := parseSlotFile(data, fp); err == nil {
 			_, _, _ = file.unlock(context.Background(), fp, Unlock{RecoveryCode: "0000-0000-0000-0000-0000-0000-0000-0000"})
 		}
 	})

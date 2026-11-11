@@ -180,18 +180,11 @@ type EncryptOptions struct {
 	// If empty, the server-registered primary identity is used.
 	Identity string
 
-	// Password is the password for decrypting password-protected identity keys.
-	// If the primary key is encrypted and this is empty, encryption will fail.
-	Password string
-
-	// SecurityKey unlocks an identity key protected by a security key
-	// (key storage version 5); package fido2 provides one. A password or
-	// unprotected key never uses it.
-	SecurityKey keystore.Authenticator
-
-	// RecoveryCode unlocks a security-key protected identity key without
-	// its security key. When set, SecurityKey is not used.
-	RecoveryCode string
+	// Unlock is what unlocking the sender's key pair may use: its password
+	// (key storage version 4), a security key (package fido2, version 5),
+	// an AWS KMS client (package awskms, version 6), or the recovery code
+	// of a version 5 or 6 key file. An unprotected key needs none.
+	Unlock keystore.Unlock
 
 	// UploadThreads fixes the number of parallel part PUTs of a multipart
 	// upload, at most 32. 0 adapts it to the link: the upload starts with
@@ -295,17 +288,9 @@ type DecryptOptions struct {
 	// Logger receives the flow's logs, as for EncryptOptions. Optional.
 	Logger *slog.Logger
 
-	// Password is the password for decrypting password-protected identity keys.
-	Password string
-
-	// SecurityKey unlocks an identity key protected by a security key
-	// (key storage version 5); package fido2 provides one. A password or
-	// unprotected key never uses it.
-	SecurityKey keystore.Authenticator
-
-	// RecoveryCode unlocks a security-key protected identity key without
-	// its security key. When set, SecurityKey is not used.
-	RecoveryCode string
+	// Unlock is what unlocking the recipient's key pair may use, as for
+	// EncryptOptions.
+	Unlock keystore.Unlock
 
 	// DownloadThreads sets the maximum number of parallel Range GETs the SDK
 	// uses for downloading the payload. 0 = SDK default (4). 1 = one range
@@ -477,12 +462,12 @@ type FileMeta struct {
 
 // unlock is what unlocking the sender's key may use.
 func (o EncryptOptions) unlock() keystore.Unlock {
-	return keystore.Unlock{Password: o.Password, SecurityKey: o.SecurityKey, RecoveryCode: o.RecoveryCode}
+	return o.Unlock
 }
 
 // unlock is what unlocking the recipient's key may use.
 func (o DecryptOptions) unlock() keystore.Unlock {
-	return keystore.Unlock{Password: o.Password, SecurityKey: o.SecurityKey, RecoveryCode: o.RecoveryCode}
+	return o.Unlock
 }
 
 // phase reports the send's next phase to OnPhase, when set.

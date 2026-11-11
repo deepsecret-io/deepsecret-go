@@ -375,7 +375,7 @@ desktop Keys page, and the web app's Identities page.
 | Layer | Contents | cgo |
 |---|---|---|
 | `keystore` | Version 5 format, checks, slot rules, derivation, `ReadInfo`, `Open`, `Edit` / `NewSecurityKeyFile` (the slot editor), the `Authenticator` interface, typed errors | No |
-| `secrets`, `identity` | `EncryptOptions` and `DecryptOptions` gain `SecurityKey` and `RecoveryCode` beside `Password`. `Identity.LoadPrimary(Unlock)` and `Identity.PrimaryFingerprint()` are new. The identity is unlocked once per operation | No |
+| `secrets`, `identity` | `EncryptOptions` and `DecryptOptions` carry one `keystore.Unlock` (`Password`, `SecurityKey`, `RecoveryCode`, and since version 6 `KMS`; the next SDK release, v0.6.0, replaces the separate fields). `Identity.LoadPrimary(Unlock)` and `Identity.PrimaryFingerprint()` are new. The identity is unlocked once per operation | No |
 | `fido2` | libfido2 through purego: device list, silent check, PIN, make credential, assertion with `hmac-secret`, cancel. Implements `keystore.Authenticator` behind a `Prompter` (PIN, Touch, TouchDone, Insert) that each client provides | No |
 | CLI | Terminal prompter and the commands in section 5 | No |
 | Graphical clients | A window prompter (PIN dialog, touch state, cancel) and the same flows | Unchanged |
