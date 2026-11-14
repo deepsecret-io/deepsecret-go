@@ -10,6 +10,7 @@ import (
 
 	"github.com/deepsecret-io/deepsecret-go/identity"
 	"github.com/deepsecret-io/deepsecret-go/internal/knownkeys"
+	"github.com/deepsecret-io/deepsecret-go/internal/payload"
 	"github.com/deepsecret-io/deepsecret-go/internal/protocol"
 	"github.com/deepsecret-io/deepsecret-go/internal/transport"
 	"github.com/deepsecret-io/deepsecret-go/keystore"
@@ -48,6 +49,12 @@ const (
 // ErrOutdatedManifest is a manifest with no secret name: one sealed before the
 // name was signed. It cannot be opened; its sender has to send the secret again.
 var ErrOutdatedManifest = protocol.ErrOutdatedManifest
+
+// ErrFileChanged is a file that changed while a send read it, such as a log
+// still being written: it grew, shrank, or was replaced or removed after
+// its size was taken. Each file's size is part of what is sealed, so the
+// send stops. The error wrapping it names the file; send a copy instead.
+var ErrFileChanged = payload.ErrFileChanged
 
 // TransferStatus is the live state of an upload or a download, for a
 // progress display: pass one in the options and read it with Snapshot

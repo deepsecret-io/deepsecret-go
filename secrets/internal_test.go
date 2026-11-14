@@ -4,6 +4,7 @@
 package secrets
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -138,5 +139,27 @@ func writeTestFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	t.Helper()
 	if err := os.WriteFile(path, data, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A file sent on its own that is replaced between the scan and the read is
+// refused with ErrFileChanged, naming it, instead of sending the new file's
+// bytes under the scanned name and size.
+func TestFileSourceRefusesAReplacedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	writeTestFile(t, path, []byte("one\n"), 0o600)
+	info, err := archive.Capture(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := fileSource("app.log", path, info)
+
+	writeTestFile(t, path+".new", []byte("two\n"), 0o600)
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Open(); !errors.Is(err, ErrFileChanged) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("Open: %v, want ErrFileChanged naming %s", err, path)
 	}
 }

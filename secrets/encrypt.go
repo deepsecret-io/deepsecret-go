@@ -252,12 +252,13 @@ func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, 
 		if ef.IsDir || ef.IsSymlink {
 			continue
 		}
-		info, err := os.Stat(ef.FullPath)
+		info, err := archive.Capture(ef.FullPath)
 		if err != nil {
 			return nil, fmt.Errorf("stat %s: %w", ef.FullPath, err)
 		}
 		if !info.Mode().IsRegular() {
-			// A FIFO would block the send, and a device would go out empty.
+			// A FIFO would block the send, a device would go out empty,
+			// and a link could point elsewhere by the time it is read.
 			return nil, fmt.Errorf("%s is not a regular file", ef.FullPath)
 		}
 		if seen[ef.RelPath] {
@@ -270,26 +271,27 @@ func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, 
 }
 
 // encryptArchive sends the files as one tar archive. The tar inside the
-// payload is uncompressed, so its exact length is known before any file is
-// read (archive.TarSize), and the whole payload is zstd-compressed as it
-// streams.
+// payload is uncompressed and its headers are captured before any file is
+// read (archive.NewTar), so its exact length is known up front, and the
+// whole payload is zstd-compressed as it streams. A file that changes
+// after the capture fails the send with ErrFileChanged, naming it.
 func (c *Client) encryptArchive(ctx context.Context, recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
 	originalSize, err := preflightExpandedSize(expanded, maxPayloadSize(opt))
 	if err != nil {
 		return nil, err
 	}
-	tarSize, err := archive.TarSize(expanded)
+	tarball, err := archive.NewTar(expanded)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
-	tarFile := payload.FileSource{Name: "archive.tar", Size: tarSize, Open: func() (io.ReadCloser, error) {
+	tarFile := payload.FileSource{Name: "archive.tar", Size: tarball.Size, Open: func() (io.ReadCloser, error) {
 		pr, pw := io.Pipe()
-		go func() { pw.CloseWithError(archive.WriteTar(pw, expanded, compress.None)) }()
+		go func() { pw.CloseWithError(tarball.Write(pw, compress.None)) }()
 		return pr, nil
 	}}
 	p := &plaintext{
 		payloadType:    "files",
-		size:           tarSize + 512,
+		size:           tarball.Size + 512,
 		archived:       true,
 		archiveEntries: len(expanded),
 		archiveFiles:   regularFiles(expanded),
@@ -354,11 +356,11 @@ func filesPlaintext(srcs []payload.FileSource) *plaintext {
 }
 
 // fileSource reads the file at path, named name in the payload. info is
-// the file's stat: the send fails if the file's size changes before it is
-// read.
+// the file's capture (archive.Capture): the send fails with ErrFileChanged
+// if the file is replaced or its size changes before it is read.
 func fileSource(name, path string, info os.FileInfo) payload.FileSource {
 	return payload.FileSource{Name: name, Size: info.Size(), Mode: info.Mode(),
-		Open: func() (io.ReadCloser, error) { return os.Open(path) }} // #nosec G304 -- a file the caller chose to send.
+		Open: func() (io.ReadCloser, error) { return archive.OpenCaptured(path, info) }}
 }
 
 func maxPayloadSize(opt EncryptOptions) int64 {

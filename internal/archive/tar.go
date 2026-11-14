@@ -18,6 +18,7 @@ import (
 
 	"github.com/deepsecret-io/deepsecret-go/internal/compress"
 	"github.com/deepsecret-io/deepsecret-go/internal/disk"
+	"github.com/deepsecret-io/deepsecret-go/internal/payload"
 )
 
 // TarEntry represents an in-memory file for archive creation or extraction.
@@ -156,61 +157,68 @@ func keepSpecialBits(path string, mode os.FileMode) {
 //
 // This is the primary creation API. File contents are streamed from disk
 // through the tar writer and compressor to w without buffering the full
-// archive in memory.
+// archive in memory. It is [NewTar] and [Tar.Write] in one step.
 //
 // Files are written in the order provided (use [ExpandPaths] for sorted input).
 // Each RelPath is validated and used as the tar entry name. Duplicate paths
 // are rejected. See [CreateTar] docs for header normalization details.
 func WriteTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm) error {
-	return writeTar(w, files, algo, false)
-}
-
-// TarSize returns the exact length of the uncompressed archive WriteTar
-// writes for files, without reading their contents: each regular file is
-// written as zeros of its current size. If a file changes before WriteTar
-// runs, the archive's length can differ.
-func TarSize(files []ExpandedFile) (int64, error) {
-	var cw countingWriter
-	if err := writeTar(&cw, files, compress.None, true); err != nil {
-		return 0, err
+	t, err := NewTar(files)
+	if err != nil {
+		return err
 	}
-	return cw.n, nil
+	return t.Write(w, algo)
 }
 
-// writeTar is WriteTar; with zeros it writes each regular file's content as
-// zeros of its size instead of reading it, which gives TarSize.
-func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros bool) error {
+// Tar is a tar archive of files on disk, captured by [NewTar] without
+// reading their contents. Every entry's header, a regular file's size among
+// them, is fixed at the capture, so Size is the exact length Write writes.
+// A file that changes after the capture (a log that grows, a file cut
+// short, replaced or removed) fails Write with an error that wraps
+// payload.ErrFileChanged and names it, instead of archiving bytes the
+// capture did not measure.
+type Tar struct {
+	entries []tarEntry
+	Size    int64 // the uncompressed archive's length
+}
+
+// tarEntry is one captured entry: its header and, for a regular file, the
+// file it was captured from.
+type tarEntry struct {
+	hdr  *tar.Header
+	path string      // a regular file's path on disk
+	info os.FileInfo // a regular file's capture, for OpenCaptured
+}
+
+// NewTar captures files for an archive.
+func NewTar(files []ExpandedFile) (*Tar, error) {
 	if len(files) == 0 {
-		return fmt.Errorf("no files to archive")
+		return nil, fmt.Errorf("no files to archive")
 	}
 
 	seen := make(map[string]bool, len(files))
 	for _, ef := range files {
 		archivePath, err := ValidateArchivePath(ef.RelPath)
 		if err != nil {
-			return fmt.Errorf("invalid archive path for %s: %w", ef.FullPath, err)
+			return nil, fmt.Errorf("invalid archive path for %s: %w", ef.FullPath, err)
 		}
 		if seen[archivePath] {
-			return fmt.Errorf("duplicate archive path: %q", archivePath)
+			return nil, fmt.Errorf("duplicate archive path: %q", archivePath)
 		}
 		seen[archivePath] = true
 	}
 
-	wc, err := compress.NewCompressWriter(w, algo)
-	if err != nil {
-		return fmt.Errorf("compression writer: %w", err)
-	}
-	tw := tar.NewWriter(wc)
+	t := &Tar{entries: make([]tarEntry, 0, len(files))}
 
-	// Track inodes we've already emitted so subsequent occurrences are
+	// Track inodes we've already captured so subsequent occurrences are
 	// stored as hard links instead of duplicated content. Keyed by the
 	// composite (dev, ino): see sysFileInfo.hardLinkKey.
 	inodeIndex := map[[2]uint64]string{}
 
 	for _, ef := range files {
-		info, err := os.Lstat(ef.FullPath)
+		info, err := Capture(ef.FullPath)
 		if err != nil {
-			return fmt.Errorf("stat %s: %w", ef.FullPath, err)
+			return nil, fmt.Errorf("stat %s: %w", ef.FullPath, err)
 		}
 		archivePath, _ := ValidateArchivePath(ef.RelPath)
 		sys := sysStat(info)
@@ -221,7 +229,7 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 
 		if ef.IsSymlink {
 			if info.Mode()&os.ModeSymlink == 0 {
-				return fmt.Errorf("%s declared as symlink but is not", ef.FullPath)
+				return nil, fmt.Errorf("%s declared as symlink but is not", ef.FullPath)
 			}
 			hdr := &tar.Header{
 				Format:   tar.FormatPAX,
@@ -233,15 +241,13 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 				Uid:      sys.UID, Gid: sys.GID,
 			}
 			attachXattrs(hdr, xattrs)
-			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("tar symlink header %s: %w", archivePath, err)
-			}
+			t.entries = append(t.entries, tarEntry{hdr: hdr})
 			continue
 		}
 
 		if ef.IsDir {
 			if !info.IsDir() {
-				return fmt.Errorf("%s declared as dir but is not", ef.FullPath)
+				return nil, fmt.Errorf("%s declared as dir but is not", ef.FullPath)
 			}
 			name := archivePath
 			if !strings.HasSuffix(name, "/") {
@@ -256,14 +262,12 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 				Uid:      sys.UID, Gid: sys.GID,
 			}
 			attachXattrs(hdr, xattrs)
-			if err := tw.WriteHeader(hdr); err != nil {
-				return fmt.Errorf("tar dir header %s: %w", name, err)
-			}
+			t.entries = append(t.entries, tarEntry{hdr: hdr})
 			continue
 		}
 
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("%s is not a regular file", ef.FullPath)
+			return nil, fmt.Errorf("%s is not a regular file", ef.FullPath)
 		}
 
 		// Hard-link detection: if this inode has already been emitted as a
@@ -280,9 +284,7 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 						ModTime:  info.ModTime().UTC(),
 						Uid:      sys.UID, Gid: sys.GID,
 					}
-					if err := tw.WriteHeader(hdr); err != nil {
-						return fmt.Errorf("tar hardlink header %s: %w", archivePath, err)
-					}
+					t.entries = append(t.entries, tarEntry{hdr: hdr})
 					continue
 				}
 				inodeIndex[key] = archivePath
@@ -299,31 +301,75 @@ func writeTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm, zeros 
 			Uid:      sys.UID, Gid: sys.GID,
 		}
 		attachXattrs(hdr, xattrs)
-		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("tar header %s: %w", archivePath, err)
-		}
+		t.entries = append(t.entries, tarEntry{hdr: hdr, path: ef.FullPath, info: info})
+	}
 
+	var cw countingWriter
+	if err := t.write(&cw, compress.None, true); err != nil {
+		return nil, err
+	}
+	t.Size = cw.n
+	return t, nil
+}
+
+// Write writes the archive to w, compressed with algo, reading each regular
+// file as it goes.
+func (t *Tar) Write(w io.Writer, algo compress.Algorithm) error {
+	return t.write(w, algo, false)
+}
+
+// write is Write; with zeros it writes each regular file's content as zeros
+// of its captured size instead of reading it, which gives Size.
+func (t *Tar) write(w io.Writer, algo compress.Algorithm, zeros bool) error {
+	wc, err := compress.NewCompressWriter(w, algo)
+	if err != nil {
+		return fmt.Errorf("compression writer: %w", err)
+	}
+	tw := tar.NewWriter(wc)
+	for _, e := range t.entries {
+		if err := tw.WriteHeader(e.hdr); err != nil {
+			return fmt.Errorf("tar header %s: %w", e.hdr.Name, err)
+		}
+		if e.hdr.Typeflag != tar.TypeReg {
+			continue
+		}
 		if zeros {
-			if _, err := io.CopyN(tw, zeroReader{}, info.Size()); err != nil {
-				return fmt.Errorf("tar write %s: %w", archivePath, err)
+			if _, err := io.CopyN(tw, zeroReader{}, e.hdr.Size); err != nil {
+				return fmt.Errorf("tar write %s: %w", e.hdr.Name, err)
 			}
 			continue
 		}
-		f, err := os.Open(ef.FullPath)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", ef.FullPath, err)
-		}
-		_, copyErr := io.Copy(tw, f)
-		_ = f.Close() // f was only read; tw reports a short or long copy against the header's size.
-		if copyErr != nil {
-			return fmt.Errorf("tar write %s: %w", archivePath, copyErr)
+		if err := copyCaptured(tw, e); err != nil {
+			return err
 		}
 	}
-
 	if err := tw.Close(); err != nil {
 		return fmt.Errorf("tar close: %w", err)
 	}
 	return wc.Close()
+}
+
+// copyCaptured copies a regular file's captured size into tw. It fails,
+// naming the file, when the path no longer holds the file captured or the
+// file's length changed.
+func copyCaptured(tw io.Writer, e tarEntry) error {
+	f, err := OpenCaptured(e.path, e.info)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }() // f was only read
+	n, err := io.CopyN(tw, f, e.hdr.Size)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("%s %w: %d of %d bytes", e.path, payload.ErrFileChanged, n, e.hdr.Size)
+		}
+		return fmt.Errorf("tar write %s: %w", e.hdr.Name, err)
+	}
+	var probe [1]byte
+	if m, _ := f.Read(probe[:]); m > 0 {
+		return fmt.Errorf("%s %w: it is longer than %d bytes", e.path, payload.ErrFileChanged, e.hdr.Size)
+	}
+	return nil
 }
 
 // WriteTarFromBytes streams in-memory entries into a compressed tar archive

@@ -35,20 +35,19 @@ func sampleTree(t *testing.T) []ExpandedFile {
 	return files
 }
 
-// TarSize is the exact length of the archive WriteTar writes, without
-// reading any file.
-func TestTarSizeMatchesWriteTar(t *testing.T) {
-	files := sampleTree(t)
-	size, err := TarSize(files)
+// A Tar's Size is the exact length Write writes, known before any file is
+// read, so the payload can declare it first.
+func TestTarSizeMatchesWrite(t *testing.T) {
+	tarball, err := NewTar(sampleTree(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := WriteTar(&buf, files, compress.None); err != nil {
+	if err := tarball.Write(&buf, compress.None); err != nil {
 		t.Fatal(err)
 	}
-	if size != int64(buf.Len()) {
-		t.Fatalf("TarSize %d, WriteTar wrote %d", size, buf.Len())
+	if tarball.Size != int64(buf.Len()) {
+		t.Fatalf("Size %d, Write wrote %d", tarball.Size, buf.Len())
 	}
 }
 

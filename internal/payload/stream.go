@@ -31,6 +31,12 @@ import (
 // meets a file's data before its name, and the files before the archive
 // flag.
 
+// ErrFileChanged is a file that changed between the moment its size was
+// taken and the moment it was read: it grew, shrank, or was replaced or
+// removed. A payload declares each size before the data, so such a file
+// cannot be sent as it is. Errors wrapping it name the file.
+var ErrFileChanged = errors.New("changed while it was read")
+
 // FileSource is one file a streaming files payload reads.
 type FileSource struct {
 	Name string // the payload name, a portable relative path
@@ -195,14 +201,19 @@ func (e *streamEncoder) file(f FileSource) (string, error) {
 	h := sha256.New()
 	n, err := io.CopyN(io.MultiWriter(e.w, h), src, f.Size)
 	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return "", fmt.Errorf("%s changed while it was read: %d of %d bytes", f.Name, n, f.Size)
+		switch {
+		case errors.Is(err, io.EOF):
+			return "", fmt.Errorf("%s %w: %d of %d bytes", f.Name, ErrFileChanged, n, f.Size)
+		case errors.Is(err, ErrFileChanged):
+			// A file inside this source, such as one in an archive,
+			// changed: its error names that file, so it stays as it is.
+			return "", err
 		}
 		return "", fmt.Errorf("read %s: %w", f.Name, err)
 	}
 	var probe [1]byte
 	if m, _ := src.Read(probe[:]); m > 0 {
-		return "", fmt.Errorf("%s changed while it was read: it is longer than %d bytes", f.Name, f.Size)
+		return "", fmt.Errorf("%s %w: it is longer than %d bytes", f.Name, ErrFileChanged, f.Size)
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 

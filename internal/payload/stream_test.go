@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"os"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 type memFile struct {
@@ -105,9 +107,23 @@ func TestEncodeFilesRefusesChangedFiles(t *testing.T) {
 		src := []FileSource{{Name: "f", Size: 4, Open: func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(actual)), nil
 		}}}
-		if _, err := EncodeFiles(io.Discard, src, false, ""); err == nil || !strings.Contains(err.Error(), "changed while it was read") {
+		if _, err := EncodeFiles(io.Discard, src, false, ""); !errors.Is(err, ErrFileChanged) || !strings.Contains(err.Error(), "f changed while it was read") {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+// A source that reports a changed file, as an archive does for a file
+// inside it, keeps that error as it is: the message names the file that
+// changed, not the source.
+func TestEncodeFilesKeepsAChangedFileError(t *testing.T) {
+	changed := fmt.Errorf("/var/log/syslog %w: it is longer than 4 bytes", ErrFileChanged)
+	src := []FileSource{{Name: "archive.tar", Size: 4, Open: func() (io.ReadCloser, error) {
+		return io.NopCloser(iotest.ErrReader(changed)), nil
+	}}}
+	_, err := EncodeFiles(io.Discard, src, false, "")
+	if !errors.Is(err, ErrFileChanged) || err.Error() != changed.Error() {
+		t.Fatalf("EncodeFiles: %v, want %v", err, changed)
 	}
 }
 
