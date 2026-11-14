@@ -4,6 +4,7 @@
 package archive
 
 import (
+	"archive/tar"
 	"bytes"
 	"errors"
 	"io"
@@ -95,6 +96,119 @@ func TestTarWriteNamesAChangedFile(t *testing.T) {
 				t.Errorf("the error does not name %s: %v", path, err)
 			}
 		})
+	}
+}
+
+// Changed lists, in capture order, the files that are no longer as
+// captured: grown, removed or replaced. An untouched file is not listed.
+func TestChanged(t *testing.T) {
+	dir := t.TempDir()
+	var files []Captured
+	for _, name := range []string{"a.log", "b.log", "c.log", "d.log"} {
+		path := filepath.Join(dir, name)
+		writeOrFatal(t, path, []byte("one line\n"))
+		info, err := Capture(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, Captured{Path: path, Info: info})
+	}
+	f, err := os.OpenFile(files[0].Path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("two lines\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if err := os.Remove(files[2].Path); err != nil {
+		t.Fatal(err)
+	}
+	writeOrFatal(t, files[3].Path+".new", []byte("one line\n"))
+	if err := os.Rename(files[3].Path+".new", files[3].Path); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Changed(files, false)
+	want := []string{files[0].Path, files[2].Path, files[3].Path}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("Changed: %v, want %v", got, want)
+	}
+	// In a snapshot, a file that only grew is no change.
+	got = Changed(files, true)
+	want = []string{files[2].Path, files[3].Path}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("Changed in a snapshot: %v, want %v", got, want)
+	}
+}
+
+// A snapshot archive sends a file that grew after the capture with the
+// bytes it had then; a file cut short still stops it, naming the file.
+func TestTarSnapshot(t *testing.T) {
+	files := sampleTree(t)
+	path := fullPath(t, files, "nested/b.bin")
+	tarball, err := NewTar(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tarball.Snapshot = true
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("one more line\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	var buf bytes.Buffer
+	if err := tarball.Write(&buf, compress.None); err != nil {
+		t.Fatalf("a snapshot of a grown file: %v", err)
+	}
+	if tarball.Size != int64(buf.Len()) {
+		t.Fatalf("Size %d, Write wrote %d", tarball.Size, buf.Len())
+	}
+	tr := tar.NewReader(&buf)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			t.Fatalf("no nested/b.bin in the archive: %v", err)
+		}
+		if strings.HasSuffix(hdr.Name, "nested/b.bin") {
+			data, err := io.ReadAll(tr)
+			if err != nil || !bytes.Equal(data, bytes.Repeat([]byte{7}, 70000)) {
+				t.Fatalf("b.bin went out as %d bytes (%v), want its 70000 captured bytes", len(data), err)
+			}
+			break
+		}
+	}
+
+	if err := os.Truncate(path, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarball.Write(io.Discard, compress.None); !errors.Is(err, payload.ErrFileChanged) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("a snapshot of a file cut short: %v", err)
+	}
+}
+
+// A Tar's Captured lists its regular files, the ones Write reads.
+func TestTarCaptured(t *testing.T) {
+	files := sampleTree(t)
+	tarball, err := NewTar(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range tarball.Captured() {
+		got = append(got, filepath.Base(c.Path))
+	}
+	// Without inode numbers, Windows archives the hard link as a copy.
+	want := "a.txt,empty,b.bin"
+	if runtime.GOOS == "windows" {
+		want = "a.txt,empty,hard,b.bin"
+	}
+	if strings.Join(got, ",") != want {
+		t.Fatalf("Captured: %v, want %s", got, want)
 	}
 }
 

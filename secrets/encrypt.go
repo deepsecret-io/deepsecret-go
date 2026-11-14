@@ -241,6 +241,7 @@ func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, 
 	}
 
 	var srcs []payload.FileSource
+	var captured []archive.Captured
 	seen := make(map[string]bool, len(expanded))
 	for _, ef := range expanded {
 		// Skip directory entries: they have no byte content; the flat
@@ -265,9 +266,11 @@ func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, 
 			return nil, fmt.Errorf("two files would be named %q: a secret's files need distinct names", ef.RelPath)
 		}
 		seen[ef.RelPath] = true
-		srcs = append(srcs, fileSource(ef.RelPath, ef.FullPath, info))
+		srcs = append(srcs, fileSource(ef.RelPath, ef.FullPath, info, opt.Snapshot))
+		captured = append(captured, archive.Captured{Path: ef.FullPath, Info: info})
 	}
-	return c.encryptAndSend(ctx, recipients, filesPlaintext(srcs), opt)
+	res, err := c.encryptAndSend(ctx, recipients, filesPlaintext(srcs), opt)
+	return res, alsoChanged(err, captured, opt.Snapshot)
 }
 
 // encryptArchive sends the files as one tar archive. The tar inside the
@@ -284,6 +287,7 @@ func (c *Client) encryptArchive(ctx context.Context, recipients []string, expand
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
+	tarball.Snapshot = opt.Snapshot
 	tarFile := payload.FileSource{Name: "archive.tar", Size: tarball.Size, Open: func() (io.ReadCloser, error) {
 		pr, pw := io.Pipe()
 		go func() { pw.CloseWithError(tarball.Write(pw, compress.None)) }()
@@ -301,7 +305,41 @@ func (c *Client) encryptArchive(ctx context.Context, recipients []string, expand
 		_, err := payload.EncodeFiles(w, []payload.FileSource{tarFile}, true, "")
 		return err
 	}
-	return c.encryptAndSend(ctx, recipients, p, opt)
+	res, err := c.encryptAndSend(ctx, recipients, p, opt)
+	return res, alsoChanged(err, tarball.Captured(), opt.Snapshot)
+}
+
+// maxChangedListed is how many other changed files a send's error names.
+const maxChangedListed = 20
+
+// alsoChanged adds to a send stopped by one changed file every other file
+// it captured that has changed since, such as more logs being written, so
+// one look at the error shows them all. Other errors pass as they are.
+func alsoChanged(err error, files []archive.Captured, snapshot bool) error {
+	var first *payload.FileChangedError
+	if !errors.As(err, &first) {
+		return err
+	}
+	var others []string
+	for _, path := range archive.Changed(files, snapshot) {
+		if path != first.Path {
+			others = append(others, path)
+		}
+	}
+	if len(others) == 0 {
+		return err
+	}
+	word := "files"
+	if len(others) == 1 {
+		word = "file"
+	}
+	list := others
+	more := ""
+	if len(list) > maxChangedListed {
+		more = fmt.Sprintf(", and %d more", len(list)-maxChangedListed)
+		list = list[:maxChangedListed]
+	}
+	return fmt.Errorf("%w; %d more %s changed during the send: %s%s", err, len(others), word, strings.Join(list, ", "), more)
 }
 
 // plaintext is what a send seals: a payload written as a stream, and what
@@ -357,9 +395,10 @@ func filesPlaintext(srcs []payload.FileSource) *plaintext {
 
 // fileSource reads the file at path, named name in the payload. info is
 // the file's capture (archive.Capture): the send fails with ErrFileChanged
-// if the file is replaced or its size changes before it is read.
-func fileSource(name, path string, info os.FileInfo) payload.FileSource {
-	return payload.FileSource{Name: name, Size: info.Size(), Mode: info.Mode(),
+// if the file is replaced or its size changes before it is read, unless it
+// only grew in a snapshot, which sends the bytes it had then.
+func fileSource(name, path string, info os.FileInfo, snapshot bool) payload.FileSource {
+	return payload.FileSource{Name: name, Path: path, Size: info.Size(), Mode: info.Mode(), Snapshot: snapshot,
 		Open: func() (io.ReadCloser, error) { return archive.OpenCaptured(path, info) }}
 }
 

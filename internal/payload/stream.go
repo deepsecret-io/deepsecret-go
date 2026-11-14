@@ -37,12 +37,30 @@ import (
 // cannot be sent as it is. Errors wrapping it name the file.
 var ErrFileChanged = errors.New("changed while it was read")
 
+// FileChangedError is one file that changed while it was read: where it is
+// read from and how it changed. It matches ErrFileChanged.
+type FileChangedError struct {
+	Path   string
+	Detail string
+}
+
+func (e *FileChangedError) Error() string {
+	return e.Path + " " + ErrFileChanged.Error() + ": " + e.Detail
+}
+
+// Is makes errors.Is(err, ErrFileChanged) true.
+func (e *FileChangedError) Is(target error) bool { return target == ErrFileChanged }
+
 // FileSource is one file a streaming files payload reads.
 type FileSource struct {
 	Name string // the payload name, a portable relative path
+	Path string // where it is read from, named in its errors; Name when empty
 	Size int64  // the exact byte count; encoding fails if the file has more or fewer
-	Mode os.FileMode
-	Open func() (io.ReadCloser, error)
+	// Snapshot reads a file that grew past Size up to Size, the bytes it had
+	// when it was measured, instead of failing. Fewer bytes still fail.
+	Snapshot bool
+	Mode     os.FileMode
+	Open     func() (io.ReadCloser, error)
 }
 
 // FileInfo is one file of a files payload, without its data.
@@ -200,10 +218,14 @@ func (e *streamEncoder) file(f FileSource) (string, error) {
 	defer func() { _ = src.Close() }()
 	h := sha256.New()
 	n, err := io.CopyN(io.MultiWriter(e.w, h), src, f.Size)
+	where := f.Path
+	if where == "" {
+		where = f.Name
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, io.EOF):
-			return "", fmt.Errorf("%s %w: %d of %d bytes", f.Name, ErrFileChanged, n, f.Size)
+			return "", &FileChangedError{Path: where, Detail: fmt.Sprintf("%d of %d bytes", n, f.Size)}
 		case errors.Is(err, ErrFileChanged):
 			// A file inside this source, such as one in an archive,
 			// changed: its error names that file, so it stays as it is.
@@ -211,9 +233,11 @@ func (e *streamEncoder) file(f FileSource) (string, error) {
 		}
 		return "", fmt.Errorf("read %s: %w", f.Name, err)
 	}
-	var probe [1]byte
-	if m, _ := src.Read(probe[:]); m > 0 {
-		return "", fmt.Errorf("%s %w: it is longer than %d bytes", f.Name, ErrFileChanged, f.Size)
+	if !f.Snapshot {
+		var probe [1]byte
+		if m, _ := src.Read(probe[:]); m > 0 {
+			return "", &FileChangedError{Path: where, Detail: fmt.Sprintf("it is longer than %d bytes", f.Size)}
+		}
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 

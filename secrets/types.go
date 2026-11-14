@@ -129,6 +129,15 @@ type EncryptOptions struct {
 	TTL        string // "30m", "24h", "7d"
 	IPs        []string
 
+	// Snapshot sends each file as it was when the send measured it: a file
+	// that grows while it is read, such as a log being written, goes out
+	// with the bytes it had then instead of stopping the send with
+	// ErrFileChanged. A file that shrinks, is replaced or is removed still
+	// stops it. For files that are only appended to: a file truncated and
+	// written again past its size during the send (copy-and-truncate log
+	// rotation) goes out with bytes written after the truncation.
+	Snapshot bool
+
 	// RevokeMissing confirms that a send under an existing name may leave
 	// out people who have access to that secret now, revoking them.
 	// Without it such a send fails with apierror.ErrConflict and the server's

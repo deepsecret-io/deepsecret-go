@@ -43,9 +43,9 @@ func OpenCaptured(path string, info os.FileInfo) (*os.File, error) {
 	f, err := openNoFollow(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return nil, fmt.Errorf("%s %w: it was removed", path, payload.ErrFileChanged)
+		return nil, &payload.FileChangedError{Path: path, Detail: "it was removed"}
 	case errors.Is(err, errLink):
-		return nil, fmt.Errorf("%s %w: it was replaced by a link", path, payload.ErrFileChanged)
+		return nil, &payload.FileChangedError{Path: path, Detail: "it was replaced by a link"}
 	case err != nil:
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
@@ -56,7 +56,33 @@ func OpenCaptured(path string, info os.FileInfo) (*os.File, error) {
 	}
 	if !now.Mode().IsRegular() || !os.SameFile(info, now) {
 		_ = f.Close()
-		return nil, fmt.Errorf("%s %w: it was replaced", path, payload.ErrFileChanged)
+		return nil, &payload.FileChangedError{Path: path, Detail: "it was replaced"}
 	}
 	return f, nil
+}
+
+// Captured is a regular file as Capture took it.
+type Captured struct {
+	Path string
+	Info os.FileInfo
+}
+
+// Changed lists, in their order, the files that are no longer as captured:
+// removed, replaced, or with another size or modification time. In a
+// snapshot, a file that only grew is no change: it is sent as captured.
+// It reads no file, so it is cheap to run once a send stopped on one.
+func Changed(files []Captured, snapshot bool) []string {
+	var changed []string
+	for _, c := range files {
+		now, err := os.Lstat(c.Path)
+		switch {
+		case err != nil || !now.Mode().IsRegular() || !os.SameFile(c.Info, now):
+		case snapshot && now.Size() >= c.Info.Size():
+			continue
+		case now.Size() == c.Info.Size() && now.ModTime().Equal(c.Info.ModTime()):
+			continue
+		}
+		changed = append(changed, c.Path)
+	}
+	return changed
 }

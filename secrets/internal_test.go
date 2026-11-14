@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/archive"
+	"github.com/deepsecret-io/deepsecret-go/internal/payload"
 	"github.com/deepsecret-io/deepsecret-go/keys"
 	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
@@ -153,7 +154,7 @@ func TestFileSourceRefusesAReplacedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := fileSource("app.log", path, info)
+	src := fileSource("app.log", path, info, false)
 
 	writeTestFile(t, path+".new", []byte("two\n"), 0o600)
 	if err := os.Rename(path+".new", path); err != nil {
@@ -161,5 +162,50 @@ func TestFileSourceRefusesAReplacedFile(t *testing.T) {
 	}
 	if _, err := src.Open(); !errors.Is(err, ErrFileChanged) || !strings.Contains(err.Error(), path) {
 		t.Fatalf("Open: %v, want ErrFileChanged naming %s", err, path)
+	}
+}
+
+// A send stopped by one changed file names, after it, the other captured
+// files that changed: up to 20 of them, then how many more.
+func TestAlsoChanged(t *testing.T) {
+	dir := t.TempDir()
+	var files []archive.Captured
+	for n := range 25 {
+		path := filepath.Join(dir, fmt.Sprintf("%02d.log", n))
+		writeTestFile(t, path, []byte("line\n"), 0o600)
+		info, err := archive.Capture(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, archive.Captured{Path: path, Info: info})
+	}
+	first := &payload.FileChangedError{Path: files[0].Path, Detail: "it is longer than 5 bytes"}
+
+	if err := alsoChanged(first, files, false); err != error(first) {
+		t.Errorf("nothing else changed: %v", err)
+	}
+	other := errors.New("upload failed")
+	if err := alsoChanged(other, files, false); err != other {
+		t.Errorf("another error: %v", err)
+	}
+
+	if err := os.Remove(files[1].Path); err != nil {
+		t.Fatal(err)
+	}
+	err := alsoChanged(first, files, false)
+	if !errors.Is(err, ErrFileChanged) || !strings.HasPrefix(err.Error(), first.Error()) ||
+		!strings.HasSuffix(err.Error(), "; 1 more file changed during the send: "+files[1].Path) {
+		t.Errorf("one more: %v", err)
+	}
+
+	for _, f := range files[2:] {
+		if err := os.Remove(f.Path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msg := alsoChanged(first, files, false).Error()
+	if !strings.Contains(msg, "; 24 more files changed during the send: ") || !strings.Contains(msg, files[20].Path) ||
+		strings.Contains(msg, files[21].Path) || !strings.HasSuffix(msg, ", and 4 more") {
+		t.Errorf("24 more: %s", msg)
 	}
 }

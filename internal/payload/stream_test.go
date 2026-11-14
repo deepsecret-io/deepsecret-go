@@ -113,11 +113,43 @@ func TestEncodeFilesRefusesChangedFiles(t *testing.T) {
 	}
 }
 
+// A changed file's error is a FileChangedError naming where the file is
+// read from, when the source says, and it matches ErrFileChanged.
+func TestEncodeFilesNamesTheChangedFile(t *testing.T) {
+	src := []FileSource{{Name: "logs/app.log", Path: "/srv/logs/app.log", Size: 4, Open: func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte("abcdef"))), nil
+	}}}
+	_, err := EncodeFiles(io.Discard, src, false, "")
+	var fc *FileChangedError
+	if !errors.As(err, &fc) || fc.Path != "/srv/logs/app.log" || !errors.Is(err, ErrFileChanged) {
+		t.Fatalf("EncodeFiles: %v, want a FileChangedError for /srv/logs/app.log", err)
+	}
+	if want := "/srv/logs/app.log changed while it was read: it is longer than 4 bytes"; err.Error() != want {
+		t.Fatalf("message %q, want %q", err.Error(), want)
+	}
+}
+
+// A snapshot source that grew is read up to its size, the bytes it had
+// when it was measured, instead of failing.
+func TestEncodeFilesSnapshot(t *testing.T) {
+	src := []FileSource{{Name: "app.log", Size: 4, Snapshot: true, Open: func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader([]byte("abcdef"))), nil
+	}}}
+	var out bytes.Buffer
+	sums, err := EncodeFiles(&out, src, false, "")
+	if err != nil {
+		t.Fatalf("EncodeFiles: %v", err)
+	}
+	if want := fmt.Sprintf("%x", sha256.Sum256([]byte("abcd"))); len(sums) != 1 || sums[0] != want {
+		t.Fatalf("digests %v, want the digest of the first 4 bytes", sums)
+	}
+}
+
 // A source that reports a changed file, as an archive does for a file
 // inside it, keeps that error as it is: the message names the file that
 // changed, not the source.
 func TestEncodeFilesKeepsAChangedFileError(t *testing.T) {
-	changed := fmt.Errorf("/var/log/syslog %w: it is longer than 4 bytes", ErrFileChanged)
+	changed := &FileChangedError{Path: "/var/log/syslog", Detail: "it is longer than 4 bytes"}
 	src := []FileSource{{Name: "archive.tar", Size: 4, Open: func() (io.ReadCloser, error) {
 		return io.NopCloser(iotest.ErrReader(changed)), nil
 	}}}

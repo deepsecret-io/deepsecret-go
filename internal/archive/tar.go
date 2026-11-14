@@ -180,6 +180,14 @@ func WriteTar(w io.Writer, files []ExpandedFile, algo compress.Algorithm) error 
 type Tar struct {
 	entries []tarEntry
 	Size    int64 // the uncompressed archive's length
+
+	// Snapshot sends a regular file that grew after the capture with its
+	// first captured-size bytes, instead of failing: for files that are only
+	// appended to, such as logs, those are the bytes it had then. A file
+	// cut short, replaced or removed still fails Write. A file truncated and
+	// written again past its captured size (copy-and-truncate log rotation)
+	// cannot be told from one that grew.
+	Snapshot bool
 }
 
 // tarEntry is one captured entry: its header and, for a regular file, the
@@ -312,6 +320,18 @@ func NewTar(files []ExpandedFile) (*Tar, error) {
 	return t, nil
 }
 
+// Captured lists the regular files the archive reads, as NewTar captured
+// them.
+func (t *Tar) Captured() []Captured {
+	var files []Captured
+	for _, e := range t.entries {
+		if e.hdr.Typeflag == tar.TypeReg {
+			files = append(files, Captured{Path: e.path, Info: e.info})
+		}
+	}
+	return files
+}
+
 // Write writes the archive to w, compressed with algo, reading each regular
 // file as it goes.
 func (t *Tar) Write(w io.Writer, algo compress.Algorithm) error {
@@ -339,7 +359,7 @@ func (t *Tar) write(w io.Writer, algo compress.Algorithm, zeros bool) error {
 			}
 			continue
 		}
-		if err := copyCaptured(tw, e); err != nil {
+		if err := copyCaptured(tw, e, t.Snapshot); err != nil {
 			return err
 		}
 	}
@@ -351,8 +371,8 @@ func (t *Tar) write(w io.Writer, algo compress.Algorithm, zeros bool) error {
 
 // copyCaptured copies a regular file's captured size into tw. It fails,
 // naming the file, when the path no longer holds the file captured or the
-// file's length changed.
-func copyCaptured(tw io.Writer, e tarEntry) error {
+// file's length changed; in a snapshot, a file that grew is no failure.
+func copyCaptured(tw io.Writer, e tarEntry, snapshot bool) error {
 	f, err := OpenCaptured(e.path, e.info)
 	if err != nil {
 		return err
@@ -361,13 +381,15 @@ func copyCaptured(tw io.Writer, e tarEntry) error {
 	n, err := io.CopyN(tw, f, e.hdr.Size)
 	if err != nil {
 		if errors.Is(err, io.EOF) {
-			return fmt.Errorf("%s %w: %d of %d bytes", e.path, payload.ErrFileChanged, n, e.hdr.Size)
+			return &payload.FileChangedError{Path: e.path, Detail: fmt.Sprintf("%d of %d bytes", n, e.hdr.Size)}
 		}
 		return fmt.Errorf("tar write %s: %w", e.hdr.Name, err)
 	}
-	var probe [1]byte
-	if m, _ := f.Read(probe[:]); m > 0 {
-		return fmt.Errorf("%s %w: it is longer than %d bytes", e.path, payload.ErrFileChanged, e.hdr.Size)
+	if !snapshot {
+		var probe [1]byte
+		if m, _ := f.Read(probe[:]); m > 0 {
+			return &payload.FileChangedError{Path: e.path, Detail: fmt.Sprintf("it is longer than %d bytes", e.hdr.Size)}
+		}
 	}
 	return nil
 }
