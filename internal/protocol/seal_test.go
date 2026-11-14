@@ -87,7 +87,7 @@ func TestSealOpenRoundTrip(t *testing.T) {
 	for _, size := range []int{0, 1, ChunkSize - 1, ChunkSize, ChunkSize + 1, 2*ChunkSize + 5} {
 		plaintext := randomBytes(t, size)
 		ct, sealed := seal(t, plaintext, sender, msgParams, alice, bob, sender)
-		if int64(len(ct)) != sealed.Manifest.CiphertextSize || sealed.Manifest.CiphertextSize != ciphertextSizeFor(int64(size)) {
+		if want, ok := ciphertextSizeFor(int64(size)); !ok || int64(len(ct)) != sealed.Manifest.CiphertextSize || sealed.Manifest.CiphertextSize != want {
 			t.Fatalf("size %d: ciphertext %d, manifest %d", size, len(ct), sealed.Manifest.CiphertextSize)
 		}
 		if len(sealed.Wraps) != 3 || len(sealed.Manifest.Recipients) != 3 {

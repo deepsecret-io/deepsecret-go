@@ -13,6 +13,13 @@
 // while the replaced keys still check secrets they signed. A key new to
 // this device is recorded once the send or decrypt relying on it succeeds.
 //
+// A key belongs to one address on a server. One recorded for a contact is
+// refused for anyone else, known or new (KeyRelabelledError): the server
+// names a secret's sender, so it could otherwise present a contact's secret
+// under a new address, where nothing is recorded yet. For the same reason
+// the newest signing time opened per secret, which refuses a rollback, is
+// kept under the key that signed as well as under the sender's address.
+//
 // The user's own accounts are recorded too, so the server cannot pass off
 // another key as theirs by lying about who the caller is: only key pairs on
 // this device pass for them. One is recorded when a key is registered for

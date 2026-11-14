@@ -109,8 +109,9 @@ func (e *KeyChangedError) Error() string {
 
 // StaleRevisionError refuses the revision the server gives as a secret's
 // latest when this device already opened a revision of that secret, from
-// the same sender, signed later: the server may be rolling the secret back.
-// Requesting RevisionID explicitly opens it anyway.
+// the same sender or signed with the same key, signed later: the server may
+// be rolling the secret back. Requesting RevisionID explicitly opens it
+// anyway.
 type StaleRevisionError struct {
 	SecretName  string
 	SenderEmail string
@@ -138,6 +139,38 @@ type UnrecordedSenderError struct {
 func (e *UnrecordedSenderError) Error() string {
 	return fmt.Sprintf("this secret is signed with %s, a key on this device, but the server names %s as its sender, an account this device does not know as yours: refusing it (possible relabelling by the server; if %s is your own account, sign in as it and record it as yours with key %s on this device first)",
 		keys.ShortFingerprint(e.Fingerprint), e.Email, e.Email, keys.ShortFingerprint(e.Fingerprint))
+}
+
+// KeyRelabelledError refuses a send to Email, or a secret from them, under
+// Fingerprint, a key this device recorded for RecordedEmail on the same
+// server. A key belongs to one address, so the server may be relabelling
+// RecordedEmail's key as Email's: that is how an old revision, served under
+// a new sender address, would get past the rollback record. If they really
+// changed address, forgetting RecordedEmail's key (Forget) and trying again
+// accepts it for Email on first use. With SameSend set nothing is recorded:
+// the server lists Fingerprint for Email and for RecordedEmail, two
+// recipients of one send, both new to this device, so there is no record to
+// forget and the send is refused as a possible key substitution.
+type KeyRelabelledError struct {
+	Email         string // the address the server presents the key for
+	RecordedEmail string // the address this device recorded the key for, or with SameSend the send's other recipient listed with it
+	Fingerprint   string
+	Sender        bool // Fingerprint signed a secret being decrypted; otherwise the server lists it for Email
+	SameSend      bool // RecordedEmail is another recipient of the same send, not a record on this device
+}
+
+func (e *KeyRelabelledError) Error() string {
+	fp := keys.ShortFingerprint(e.Fingerprint)
+	if e.SameSend {
+		return fmt.Sprintf("the server lists key %s for both %s and %s in this send, but a key belongs to one address: refusing the send (possible key substitution by the server)",
+			fp, e.RecordedEmail, e.Email)
+	}
+	if e.Sender {
+		return fmt.Sprintf("this secret is signed with key %s, which this device knows as %s's, but the server names %s as its sender: refusing it (possible relabelling by the server; if they changed address, forget %s's key and try again)",
+			fp, e.RecordedEmail, e.Email, e.RecordedEmail)
+	}
+	return fmt.Sprintf("the server lists key %s for %s, but this device knows it as %s's: refusing it (possible relabelling by the server; if they changed address, forget %s's key and try again)",
+		fp, e.Email, e.RecordedEmail, e.RecordedEmail)
 }
 
 // List returns the keys this device accepted for email on the store's server,
@@ -171,7 +204,9 @@ func (s *Store) List(email string) ([]KnownKey, error) {
 // email, or all of them when fingerprint is empty, and returns how many it
 // removed. Once none is left, the next send to them, or secret from them,
 // accepts their key on first use again. For one of the user's own accounts
-// it forgets that the account is theirs.
+// it forgets that the account is theirs. The newest signing times recorded
+// for their secrets stay (CheckNewest), so forgetting someone does not let
+// the server roll their secrets back.
 func (s *Store) Forget(email, fingerprint string) (int, error) {
 	email = strings.ToLower(email)
 	fingerprint = strings.ToLower(fingerprint)
@@ -215,9 +250,10 @@ func NormalizeKeyRef(email, fingerprint string) (string, string, error) {
 
 // Trust accepts fingerprint as email's key on this device with state,
 // replacing their other keys: sends go to it alone, and the others only check
-// secrets they signed. It refuses one of the user's own accounts. The caller
-// must have normalized both with NormalizeKeyRef and already fetched and
-// verified the key through package directory: this only records the decision.
+// secrets they signed. It refuses one of the user's own accounts, and a key
+// recorded for someone else (KeyRelabelledError). The caller must have
+// normalized both with NormalizeKeyRef and already fetched and verified the
+// key through package directory: this only records the decision.
 func (s *Store) Trust(email, fingerprint string, state State) error {
 	server := s.server
 	var refused error
@@ -226,6 +262,10 @@ func (s *Store) Trust(email, fingerprint string, state State) error {
 		entries := people[email]
 		if OwnAccount(entries) {
 			refused = fmt.Errorf("%s is your own account on this device: only key pairs on this device pass for it (if it is not yours, forget it first)", email)
+			return false
+		}
+		if other, _ := contactWith(people, fingerprint, email); other != "" {
+			refused = &KeyRelabelledError{Email: email, RecordedEmail: other, Fingerprint: fingerprint}
 			return false
 		}
 		changed := false
@@ -345,6 +385,50 @@ func ownerOf(people map[string][]Entry, fp, email string) string {
 	return ""
 }
 
+// contactWith returns the contact, other than email, that fp is recorded for
+// in people, replaced or not, or "". A key belongs to one address: the
+// server presenting it for another may be relabelling it. A key recorded for
+// one of the user's own accounts is not a contact's, whoever else it is
+// recorded for: ownerOf and the rules for the user's own keys decide on it.
+// unrecorded reports that the contact has fp from the send or the call in
+// progress alone (see firstUse), not from a record on this device. A record
+// comes first, so it is never reported as unrecorded; of several contacts
+// alike it names the first by address, so the answer is stable.
+func contactWith(people map[string][]Entry, fp, email string) (found string, unrecorded bool) {
+	for e, entries := range people {
+		if e == email {
+			continue
+		}
+		for _, k := range entries {
+			switch {
+			case k.Fingerprint != fp:
+			case k.State == Own:
+				return "", false
+			case found == "" || (unrecorded && !k.unrecorded) || (unrecorded == k.unrecorded && e < found):
+				found, unrecorded = e, k.unrecorded
+			}
+		}
+	}
+	return found, unrecorded
+}
+
+// firstUse is fp as the one key of someone new to this device, first used by
+// the send or the call in progress and not recorded yet. A key belongs to
+// one address, so CheckKey refuses it for anyone else that send or call
+// names, with a KeyRelabelledError whose SameSend is set: nothing is
+// recorded, so there is nothing to forget.
+func firstUse(fp string) []Entry {
+	return []Entry{{Fingerprint: fp, State: FirstUse, FirstSeen: time.Now().UTC(), unrecorded: true}}
+}
+
+// NoteFirstUse notes in people, a send's own copy of what this device knows,
+// that fp, a key new to this device, is email's in that send, so the same
+// key listed for another of its recipients is refused before anything is
+// sealed. It records nothing: RecordFirstUse does, once the send succeeds.
+func NoteFirstUse(people map[string][]Entry, email, fp string) {
+	people[email] = firstUse(fp)
+}
+
 // hasOwnAccount reports whether any of people is one of the user's own
 // accounts.
 func hasOwnAccount(people map[string][]Entry) bool {
@@ -360,6 +444,8 @@ func hasOwnAccount(people map[string][]Entry) bool {
 // people, or a secret from them when sender is set, relied on once it
 // succeeded. Should another process have recorded a different key for one
 // of them meanwhile, it records nothing and returns that KeyChangedError.
+// The same goes for a key recorded for someone else meanwhile, or listed
+// for two of people: a KeyRelabelledError, with SameSend set for the two.
 func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 	if len(people) == 0 {
 		return nil
@@ -377,7 +463,7 @@ func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 				return false
 			}
 			if first {
-				known[email] = []Entry{{Fingerprint: p.Fingerprint, State: FirstUse, FirstSeen: time.Now().UTC()}}
+				known[email] = firstUse(p.Fingerprint)
 				changed = true
 			}
 		}
@@ -407,8 +493,11 @@ func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 // recorded here, so this takes a key that only signed elsewhere or for an
 // account not recorded.
 //
-// Anyone else's key must pass CheckKey. It changes nothing: a key new to this
-// device is reported as first, for RecordFirstUse once the decrypt succeeds.
+// Anyone else's key must pass CheckKey, which also refuses a key this device
+// recorded for another contact: the server names the sender, and the record
+// CheckNewest keeps per address is only as good as that name. It changes
+// nothing: a key new to this device is reported as first, for RecordFirstUse
+// once the decrypt succeeds.
 // The result says which case passed, so callers can show the limit above:
 // Local without OwnAccount.
 func (s *Store) CheckSenderKey(email, fp string, log *slog.Logger) (SenderKey, error) {
@@ -454,44 +543,69 @@ type SenderKey struct {
 	OwnAccount bool
 }
 
+// newestAhead is how far past this device's clock a recorded signing time
+// may be: room for a sender's clock that runs a little fast.
+const newestAhead = 5 * time.Minute
+
 // CheckNewest refuses m, the revision the server gives as its secret's
 // latest, when this device already opened a revision of the same secret
-// from email that was signed later.
+// that was signed later, from email or with the key that signed m. The
+// server names the sender and the manifest signs the key, so the record per
+// key holds when the server names the sender under another address.
 func (s *Store) CheckNewest(email string, m *protocol.Manifest) error {
 	disk, err := s.file.read()
 	if err != nil {
 		return err
 	}
-	newest, ok := disk.Newest[s.server][strings.ToLower(email)][m.SecretName]
-	if ok && m.Timestamp < newest {
-		return &StaleRevisionError{SecretName: m.SecretName, SenderEmail: email, RevisionID: m.RevisionID,
-			SignedAt: time.Unix(m.Timestamp, 0), NewestSeen: time.Unix(newest, 0)}
+	records := [2]map[string]int64{
+		disk.Newest[s.server][strings.ToLower(email)],
+		disk.NewestByKey[s.server][strings.ToLower(m.SenderFingerprint)],
+	}
+	for _, record := range records {
+		if newest, ok := record[m.SecretName]; ok && m.Timestamp < newest {
+			return &StaleRevisionError{SecretName: m.SecretName, SenderEmail: email, RevisionID: m.RevisionID,
+				SignedAt: time.Unix(m.Timestamp, 0), NewestSeen: time.Unix(newest, 0)}
+		}
 	}
 	return nil
 }
 
 // NewestRecorder records m's signing time as the newest of its secret from
-// email, once a decrypt of it succeeded. It never lowers a recorded time.
+// email, and from the key that signed it, once a decrypt of it succeeded.
+// It never lowers a recorded time. The sender's clock is signed, not
+// trusted: a time more than newestAhead past this device's clock is
+// recorded as that limit, so one revision signed far ahead cannot make the
+// sender's later ones look stale for as long.
 func (s *Store) NewestRecorder(email string, m *protocol.Manifest) func() error {
-	server, sender, name, signed := s.server, strings.ToLower(email), m.SecretName, m.Timestamp
+	server, sender, fp, name, signed := s.server, strings.ToLower(email), strings.ToLower(m.SenderFingerprint), m.SecretName, m.Timestamp
 	return func() error {
+		at := min(signed, s.now().Add(newestAhead).Unix())
 		return s.file.update(func(d *knownKeysDisk) bool {
-			if newest, ok := d.Newest[server][sender][name]; ok && newest >= signed {
-				return false
-			}
-			if d.Newest == nil {
-				d.Newest = map[string]map[string]map[string]int64{}
-			}
-			if d.Newest[server] == nil {
-				d.Newest[server] = map[string]map[string]int64{}
-			}
-			if d.Newest[server][sender] == nil {
-				d.Newest[server][sender] = map[string]int64{}
-			}
-			d.Newest[server][sender][name] = signed
-			return true
+			byEmail := raiseNewest(&d.Newest, server, sender, name, at)
+			byKey := raiseNewest(&d.NewestByKey, server, fp, name, at)
+			return byEmail || byKey
 		})
 	}
+}
+
+// raiseNewest records at as the newest signing time of the secret name from
+// owner on server, unless one as late is recorded, and reports whether it
+// did.
+func raiseNewest(newest *map[string]map[string]map[string]int64, server, owner, name string, at int64) bool {
+	if have, ok := (*newest)[server][owner][name]; ok && have >= at {
+		return false
+	}
+	if *newest == nil {
+		*newest = map[string]map[string]map[string]int64{}
+	}
+	if (*newest)[server] == nil {
+		(*newest)[server] = map[string]map[string]int64{}
+	}
+	if (*newest)[server][owner] == nil {
+		(*newest)[server][owner] = map[string]int64{}
+	}
+	(*newest)[server][owner][name] = at
+	return true
 }
 
 // CheckKey checks fp, the key the server lists for email (or, when sender
@@ -499,7 +613,10 @@ func (s *Store) NewestRecorder(email string, m *protocol.Manifest) func() error 
 // people, what this device knows on the server. A key new to this device,
 // for someone it knows no key of, is reported as first; any key fails for
 // one of the user's own accounts, whose keys are the key pairs on this
-// device; anyone else's must pass keyCheck.
+// device; a key recorded for another contact fails for email, known or new,
+// with a KeyRelabelledError (see contactWith), whose SameSend is set when
+// that contact has it from the same send alone (see firstUse); anyone else's
+// must pass keyCheck.
 func CheckKey(people map[string][]Entry, email, fp string, sender bool) (first bool, err error) {
 	entries := people[email]
 	switch {
@@ -509,7 +626,11 @@ func CheckKey(people map[string][]Entry, email, fp string, sender bool) (first b
 	case OwnAccount(entries):
 		return false, fmt.Errorf("the server lists key %s for %s, your own account on this device, but it is not a key on this device: refusing to encrypt to it (possible key substitution; if %s is not yours, forget it)",
 			keys.ShortFingerprint(fp), email, email)
-	case len(entries) == 0:
+	}
+	if other, unrecorded := contactWith(people, fp, email); other != "" {
+		return false, &KeyRelabelledError{Email: email, RecordedEmail: other, Fingerprint: fp, Sender: sender, SameSend: unrecorded}
+	}
+	if len(entries) == 0 {
 		return true, nil
 	}
 	return false, keyCheck(email, fp, sender, entries)
@@ -576,8 +697,9 @@ type Person struct {
 // public face; a send and a decrypt call it directly.
 type Store struct {
 	file    knownKeysFile
-	server  string // the name keys are kept under, so keys known for one server never pass for another
-	keysDir string // this device's key pairs, the user's own
+	server  string           // the name keys are kept under, so keys known for one server never pass for another
+	keysDir string           // this device's key pairs, the user's own
+	now     func() time.Time // this device's clock, which bounds the signing times it records; tests set it
 }
 
 // New returns the store in file on server, the API base URL, for the user
@@ -587,7 +709,7 @@ func New(file, server, keysDir string) *Store {
 	if file == "" {
 		file = filepath.Join(filepath.Dir(keysDir), "known_keys.json")
 	}
-	return &Store{file: knownKeysFile(file), server: strings.ToLower(server), keysDir: keysDir}
+	return &Store{file: knownKeysFile(file), server: strings.ToLower(server), keysDir: keysDir, now: time.Now}
 }
 
 // knownKeysFile is the path of a known keys file. Readers see the old file
@@ -605,6 +727,10 @@ type knownKeysDisk struct {
 	// name, the signing time (Unix seconds) of the newest revision this
 	// device opened. A latest revision signed earlier is refused.
 	Newest map[string]map[string]map[string]int64 `json:"newest,omitempty"`
+	// NewestByKey holds the same by the fingerprint of the key that signed,
+	// which the manifest signs, in place of the email the server names. A
+	// file written before it was kept has none.
+	NewestByKey map[string]map[string]map[string]int64 `json:"newest_by_key,omitempty"`
 }
 
 type Entry struct {
@@ -612,6 +738,11 @@ type Entry struct {
 	State       State     `json:"state"`
 	FirstSeen   time.Time `json:"first_seen"`
 	Replaced    bool      `json:"replaced,omitempty"`
+
+	// unrecorded marks a key first used by the send or the call in
+	// progress (see firstUse). It is never written, so no entry read from
+	// the file has it.
+	unrecorded bool
 }
 
 // peopleOn returns the people known on server, adding the server when it is

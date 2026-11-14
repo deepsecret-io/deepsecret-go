@@ -12,6 +12,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/deepsecret-io/deepsecret-go/internal/canon"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -37,9 +38,30 @@ func Marshal(v any) ([]byte, error) {
 	return enc.Marshal(v)
 }
 
-// Unmarshal decodes CBOR bytes into v.
+const (
+	// maxItems bounds the files or the entries of a payload decoded in
+	// memory.
+	maxItems = 131072
+
+	// maxMapPairs bounds the keys of a map in a payload. The payload itself
+	// is the largest, with six.
+	maxMapPairs = 16
+)
+
+// decoder decodes a payload strictly (see canon.StrictDecMode).
+var decoder = sync.OnceValues(func() (cbor.DecMode, error) {
+	return canon.StrictDecMode(maxItems, maxMapPairs)
+})
+
+// Unmarshal decodes CBOR bytes into v. The bytes are what a sender sealed,
+// so they are decoded strictly: a duplicate key, an unknown field or an
+// indefinite length is refused.
 func Unmarshal(data []byte, v any) error {
-	return cbor.Unmarshal(data, v)
+	dec, err := decoder()
+	if err != nil {
+		return fmt.Errorf("cbor decoder init: %w", err)
+	}
+	return dec.Unmarshal(data, v)
 }
 
 // Payload is the CBOR-encoded plaintext structure inside an encrypted secret.

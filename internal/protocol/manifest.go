@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/canon"
@@ -34,7 +35,17 @@ const (
 	// maxSecretNameLen bounds the secret name in bytes. The API allows 255
 	// characters, at most 1020 bytes of UTF-8.
 	maxSecretNameLen = 1024
+
+	// maxManifestMapPairs bounds the keys of a map in a manifest. The
+	// manifest itself is the largest, with 20.
+	maxManifestMapPairs = 32
 )
+
+// manifestDecMode decodes a manifest strictly (see canon.StrictDecMode). The
+// only array in a manifest is its recipient list.
+var manifestDecMode = sync.OnceValues(func() (cbor.DecMode, error) {
+	return canon.StrictDecMode(MaxRecipients, maxManifestMapPairs)
+})
 
 // ManifestRecipient lists one wrap in the manifest.
 type ManifestRecipient struct {
@@ -128,13 +139,19 @@ func (m *Manifest) Marshal() ([]byte, error) {
 }
 
 // UnmarshalManifest parses a serialized manifest and checks its structure.
-// It does not verify the signatures; Open does.
+// It does not verify the signatures; Open does. The signatures cover the
+// decoded fields, not the bytes, so the bytes are decoded strictly: a
+// duplicate key, an unknown field or an indefinite length is refused.
 func UnmarshalManifest(data []byte) (*Manifest, error) {
 	if len(data) == 0 || len(data) > maxManifestSize {
 		return nil, fmt.Errorf("manifest must be 1 to %d bytes, got %d", maxManifestSize, len(data))
 	}
+	dec, err := manifestDecMode()
+	if err != nil {
+		return nil, fmt.Errorf("cbor decoder init: %w", err)
+	}
 	var m Manifest
-	if err := cbor.Unmarshal(data, &m); err != nil {
+	if err := dec.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("unmarshal manifest: %w", err)
 	}
 	if err := m.validate(); err != nil {
@@ -176,7 +193,10 @@ func (m *Manifest) validate() error {
 	if m.ChunkSize != ChunkSize {
 		return fmt.Errorf("unsupported chunk size %d (expected %d)", m.ChunkSize, ChunkSize)
 	}
-	if m.PlaintextSize < 0 || m.CiphertextSize != ciphertextSizeFor(m.PlaintextSize) {
+	// Callers allocate by these sizes, so both must be ones a payload can
+	// have: the smallest stored payload is one empty chunk, a single tag.
+	storedSize, ok := ciphertextSizeFor(m.PlaintextSize)
+	if !ok || m.CiphertextSize < chunkTagSize || m.CiphertextSize != storedSize {
 		return fmt.Errorf("malformed manifest: ciphertext size %d does not fit plaintext size %d", m.CiphertextSize, m.PlaintextSize)
 	}
 	if len(m.PayloadDigest) != sha256.Size {

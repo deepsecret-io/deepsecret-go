@@ -4,5 +4,6 @@
 // Package trust is the keys this device knows for people: listing them, and
 // accepting, verifying and forgetting them after comparing fingerprints. A send
 // and a decrypt check every key against this record, and refuse one it does not
-// know with a KeyChangedError.
+// know with a KeyChangedError, or one it knows as someone else's with a
+// KeyRelabelledError.
 package trust

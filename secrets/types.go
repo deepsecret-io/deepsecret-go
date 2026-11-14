@@ -121,7 +121,8 @@ type EncryptOptions struct {
 	// under a name the sender already has adds a revision to that secret.
 	// The manifest signs it, so recipients can tell which secret a revision
 	// belongs to. Empty means the base name of the one path EncryptPaths
-	// was given, or else "sdk-" and the Unix time.
+	// was given, or else "sdk-", the Unix time and a random suffix: a name
+	// no other send has, so the send is a secret of its own.
 	Name       string
 	Compress   Compression
 	Archive    bool
@@ -417,6 +418,9 @@ type PolicyResult struct {
 	Name       string   `json:"name"`
 	ExpiresAt  *string  `json:"expires_at,omitempty"`
 	AllowedIPs []string `json:"allowed_ips,omitempty"`
+	// IPLockSource says where the IP lock comes from after the update, as
+	// Info.IPLockSource does: an "org-enforced" lock lists no AllowedIPs.
+	IPLockSource string `json:"ip_lock_source,omitempty"`
 }
 
 // RevisionInfo holds metadata for a single revision of a secret.
@@ -469,11 +473,12 @@ type RevisionRecipient struct {
 	KeyStatus      *string `json:"key_status,omitempty" yaml:"key_status,omitempty"`
 }
 
-// FileMeta holds per-file metadata as stored on the server.
+// FileMeta is what the server lists for one file of a revision: its name and
+// size. The server keeps no hash of a file's content; the SHA-256 a decrypt
+// reports comes from the encrypted payload, once it is verified.
 type FileMeta struct {
-	Name   string `json:"name" yaml:"name"`
-	Size   int64  `json:"size" yaml:"size"`
-	SHA256 string `json:"sha256" yaml:"sha256"`
+	Name string `json:"name" yaml:"name"`
+	Size int64  `json:"size" yaml:"size"`
 }
 
 // unlock is what unlocking the sender's key may use.

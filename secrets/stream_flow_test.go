@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -78,8 +79,8 @@ func assertFile(t *testing.T, path string, want []byte, mode os.FileMode) {
 
 // Files stream from the sender's disk to the recipient's: names and
 // contents arrive, each file private to the recipient with only its
-// owner's execute bit kept, files_meta lists each file, and neither side
-// leaves its temporary ciphertext behind.
+// owner's execute bit kept, files_meta lists each file by name and size,
+// and neither side leaves its temporary ciphertext behind.
 func TestStreamFilesRoundTrip(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	src := t.TempDir()
@@ -97,11 +98,10 @@ func TestStreamFilesRoundTrip(t *testing.T) {
 	if res.FilesCount != 3 || f.lastReq.FilesCount != 3 || len(f.lastReq.FilesMeta) != 3 {
 		t.Fatalf("files %d, request %d with %d metadata entries", res.FilesCount, f.lastReq.FilesCount, len(f.lastReq.FilesMeta))
 	}
-	sum := sha256.Sum256(big)
 	found := false
 	root := filepath.Base(src)
 	for _, m := range f.lastReq.FilesMeta {
-		if m.Name == root+"/sub/b.bin" && m.Size == int64(len(big)) && m.SHA256 == hex.EncodeToString(sum[:]) {
+		if m.Name == root+"/sub/b.bin" && m.Size == int64(len(big)) {
 			found = true
 		}
 	}
@@ -641,5 +641,44 @@ func TestCallsEndWithTheirContext(t *testing.T) {
 	}
 	if _, err := c.Identity.WhoAmI(context.Background()); err != nil {
 		t.Fatalf("a later call on the same client: %v", err)
+	}
+}
+
+// A send without a name gets a name of its own. The server adds a send to
+// the secret of that name its sender has, so unnamed sends that shared a
+// name, as any two in one second did, were merged into one secret, refused
+// for leaving out the first one's recipient or, with RevokeMissing, revoked
+// them. The names pass the protocol's check: sealing refuses any other.
+func TestUnnamedSendsAreSeparateSecrets(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	alice := f.client("alice@example.com")
+	send := func(to string) *secrets.EncryptResult {
+		t.Helper()
+		res, err := alice.Secrets.EncryptText(context.Background(), []string{to}, "for "+to, secrets.EncryptOptions{})
+		if err != nil {
+			t.Fatalf("unnamed send to %s: %v", to, err)
+		}
+		return res
+	}
+	// Both sends within one second of the clock: again if it ticked.
+	var first, second *secrets.EncryptResult
+	for sameSecond := false; !sameSecond; {
+		start := time.Now().Unix()
+		first, second = send("bob@example.com"), send("carol@example.com")
+		sameSecond = time.Now().Unix() == start
+	}
+
+	if first.Secret.Name == second.Secret.Name || first.Secret.ID == second.Secret.ID {
+		t.Fatalf("two unnamed sends share secret %s (%q) and %s (%q)", first.Secret.ID, first.Secret.Name, second.Secret.ID, second.Secret.Name)
+	}
+	defaultName := regexp.MustCompile(`^sdk-[0-9]+-[0-9a-f]{12}$`)
+	for to, res := range map[string]*secrets.EncryptResult{"bob@example.com": first, "carol@example.com": second} {
+		if !defaultName.MatchString(res.Secret.Name) || res.Secret.RevisionNumber != 1 || len(res.Revoked) != 0 {
+			t.Errorf("send to %s: secret %+v, revoked %v; want the first revision of a secret named sdk-, the time and a random suffix", to, res.Secret, res.Revoked)
+		}
+		out, err := f.client(to).Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
+		if err != nil || out.Decrypted.Message != "for "+to || out.SecretName != res.Secret.Name {
+			t.Errorf("%s opens their secret: %+v, %v", to, out, err)
+		}
 	}
 }

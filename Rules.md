@@ -111,7 +111,7 @@ Never expose raw endpoint logic to callers.
 - Compression (zstd)
 
 12. Metadata handling
-- Default: metadata visible (names, sizes)
+- Default: the server sees file names and sizes only, never a hash of the content
 - Archive mode: hides metadata completely
 
 ---

@@ -123,6 +123,10 @@ func Fingerprint(kp *Pair) (string, error) {
 // FingerprintFromPubs computes a full SHA-256 hex fingerprint from base64-encoded
 // public keys. Inputs are raw bytes (base64-decoded), concatenated in order:
 // ed25519_pub || x25519_pub || mlkem768_pub || mldsa65_pub.
+//
+// It does not check the size of any key, and keys of other sizes can hash
+// like a whole bundle: check the sizes of keys from an untrusted source
+// before comparing their fingerprint.
 func FingerprintFromPubs(ed25519Pub, x25519Pub, mlkemPK, mldsa65PK string) (string, error) {
 	ed, err := base64.RawStdEncoding.DecodeString(ed25519Pub)
 	if err != nil {

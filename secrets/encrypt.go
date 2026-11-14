@@ -6,6 +6,7 @@ package secrets
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -97,7 +98,7 @@ func (c *Client) EncryptBytes(ctx context.Context, recipients []string, raw []by
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	meta := []fileMetaEntry{{Name: file.Name, Size: file.Size, SHA256: file.SHA256}}
+	meta := []fileMetaEntry{{Name: file.Name, Size: file.Size}}
 	return c.encryptAndSend(ctx, recipients, memPlaintext("files", data, meta), opt)
 }
 
@@ -349,9 +350,9 @@ type plaintext struct {
 	size        int64 // the bytes write produces before compression, or a close estimate
 	write       func(w io.Writer) error
 
-	// files are listed in files_meta. For streamed files they are set when
-	// write completes, since their SHA-256 is computed as they stream. An
-	// archive lists none.
+	// files are listed in files_meta, by name and size. Each file's SHA-256
+	// stays in the payload, for the recipient: the server gets no hash of
+	// what it stores encrypted. An archive lists none.
 	files []fileMetaEntry
 
 	archived       bool
@@ -375,20 +376,14 @@ func memPlaintext(payloadType string, data []byte, files []fileMetaEntry) *plain
 
 // filesPlaintext streams files into a files payload.
 func filesPlaintext(srcs []payload.FileSource) *plaintext {
-	p := &plaintext{payloadType: "files", size: 64}
-	for _, s := range srcs {
+	p := &plaintext{payloadType: "files", size: 64, files: make([]fileMetaEntry, len(srcs))}
+	for i, s := range srcs {
 		p.size += s.Size + int64(len(s.Name)) + 128
+		p.files[i] = fileMetaEntry{Name: s.Name, Size: s.Size}
 	}
 	p.write = func(w io.Writer) error {
-		sums, err := payload.EncodeFiles(w, srcs, false, "")
-		if err != nil {
-			return err
-		}
-		p.files = make([]fileMetaEntry, len(srcs))
-		for i, s := range srcs {
-			p.files[i] = fileMetaEntry{Name: s.Name, Size: s.Size, SHA256: sums[i]}
-		}
-		return nil
+		_, err := payload.EncodeFiles(w, srcs, false, "")
+		return err
 	}
 	return p
 }
@@ -852,6 +847,12 @@ func (c *Client) loadIdentity(ctx context.Context, fp string, u keystore.Unlock)
 // Anyone else's must pass checkKey against known, what this device knows
 // on the server; a key new to it is reported as first, for recordFirstUse
 // once the send succeeds.
+//
+// A key new to this device is also noted in known, this send's own copy, as
+// that recipient's (knownkeys.NoteFirstUse). A key belongs to one address,
+// so the same key listed for a later recipient of the send is refused here
+// with a KeyRelabelledError naming both, its SameSend set since nothing is
+// recorded for either, before anything is read or sealed for them.
 func (c *Client) recipientKeys(ctx context.Context, known map[string][]knownkeys.Entry, email string, self bool, senderFP string) (pubKeys *keys.PublicKeys, first bool, err error) {
 	if pubKeys, err = directory.GetRecipientKeys(ctx, c.api, email); err != nil {
 		return nil, false, fmt.Errorf("resolve recipient %s: %w", email, err)
@@ -862,7 +863,11 @@ func (c *Client) recipientKeys(ctx context.Context, known map[string][]knownkeys
 			err = fmt.Errorf("%w (%s is recorded as your own account on this device; if it is not yours, forget it)", err, email)
 		}
 	} else {
-		first, err = knownkeys.CheckKey(known, strings.ToLower(email), pubKeys.Fingerprint, false)
+		contact := strings.ToLower(email)
+		first, err = knownkeys.CheckKey(known, contact, pubKeys.Fingerprint, false)
+		if first {
+			knownkeys.NoteFirstUse(known, contact, pubKeys.Fingerprint)
+		}
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve recipient %s: %w", email, err)
@@ -884,13 +889,18 @@ func (c *Client) senderAccount(ctx context.Context, opt EncryptOptions) (*identi
 }
 
 // secretName is the name a send goes under: opt.Name without surrounding
-// white space, as the API stores it, or "sdk-" and the Unix time. The
-// manifest signs it, so it is chosen before sealing.
+// white space, as the API stores it, or "sdk-", the Unix time and 12 random
+// hex digits. The server adds a send to the secret of that name its sender
+// has, so a send without a name needs one no other send has: the time alone
+// merged two sends made in one second. The manifest signs the name, so it is
+// chosen before sealing.
 func secretName(opt EncryptOptions) string {
 	if name := strings.TrimSpace(opt.Name); name != "" {
 		return name
 	}
-	return fmt.Sprintf("sdk-%d", time.Now().Unix())
+	var suffix [6]byte
+	_, _ = rand.Read(suffix[:]) // crypto/rand.Read never fails; it aborts the program instead.
+	return fmt.Sprintf("sdk-%d-%x", time.Now().Unix(), suffix)
 }
 
 // chooseCompression picks how p is compressed, and logs why. An archive is

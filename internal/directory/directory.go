@@ -29,7 +29,8 @@ type SignedKeyBundle struct {
 }
 
 // VerifySignedBundle checks both of a bundle's self-signatures: each must
-// be present, and each must verify.
+// be present, and each must verify. Every key and signature must have its
+// exact size.
 func VerifySignedBundle(k SignedKeyBundle) error {
 	switch {
 	case k.Signature == "":
@@ -40,10 +41,22 @@ func VerifySignedBundle(k SignedKeyBundle) error {
 	return VerifyKeyBundleSignature(k.ED25519, k.X25519, k.MLKEM768, k.MLDSA65, k.Signature, k.SignatureMLDSA65)
 }
 
+// bundleFingerprint computes the fingerprint of a bundle's public keys once
+// each has its exact size. The fingerprint hashes the keys end to end, so
+// without the sizes a byte moved from one key to the next would leave a
+// malformed bundle with the fingerprint of a whole one.
+func bundleFingerprint(k SignedKeyBundle) (string, error) {
+	if _, err := decodeBundleKeys(k.ED25519, k.X25519, k.MLKEM768, k.MLDSA65); err != nil {
+		return "", err
+	}
+	return keys.FingerprintFromPubs(k.ED25519, k.X25519, k.MLKEM768, k.MLDSA65)
+}
+
 // GetRecipientKeys fetches a recipient's primary public keys by email. The
 // bundle must carry its fingerprint and both self-signatures (Ed25519 and
-// ML-DSA-65): the fingerprint must be the hash of its public keys, and both
-// signatures must verify. A bundle missing any of them is refused.
+// ML-DSA-65): every key and signature must have its exact size, the
+// fingerprint must be the hash of its public keys, and both signatures must
+// verify. A bundle missing any of them is refused.
 //
 // These checks prove the bundle is whole and self-consistent, not that it
 // belongs to the recipient: a server can still list a bundle of its own.
@@ -75,9 +88,9 @@ func GetRecipientKeys(ctx context.Context, c *transport.Client, email string) (*
 	if rk.Fingerprint == "" {
 		return nil, fmt.Errorf("recipient key bundle has no fingerprint: refusing to use it")
 	}
-	computed, err := keys.FingerprintFromPubs(rk.ED25519, rk.X25519, rk.MLKEM768, rk.MLDSA65)
+	computed, err := bundleFingerprint(rk)
 	if err != nil {
-		return nil, fmt.Errorf("compute recipient fingerprint: %w", err)
+		return nil, fmt.Errorf("recipient key bundle is malformed: %w", err)
 	}
 	if computed != rk.Fingerprint {
 		return nil, fmt.Errorf("recipient key fingerprint mismatch (possible tampering)")
@@ -116,7 +129,7 @@ func ResolveED25519ByEmail(ctx context.Context, c *transport.Client, email, fing
 
 	if fingerprint != "" {
 		for _, k := range pubKeys.Keys {
-			fp, err := keys.FingerprintFromPubs(k.ED25519, k.X25519, k.MLKEM768, k.MLDSA65)
+			fp, err := bundleFingerprint(k)
 			if err != nil || fp != fingerprint {
 				continue
 			}

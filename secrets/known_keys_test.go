@@ -428,6 +428,118 @@ func TestOwnKeyDoesNotPassAsNewSender(t *testing.T) {
 	}
 }
 
+// A key belongs to one address for a send too. A server that lists a
+// contact's key for someone new to this device does not get it accepted for
+// them on first use: the send is refused before anything is sealed, for a
+// secret and for a local file, and so is accepting the key for them. Nothing
+// is recorded for the new address.
+func TestContactKeyIsRefusedForAnotherRecipient(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	c := f.client("alice@example.com")
+	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	carol.kp, carol.fp = bob.kp, bob.fp
+	creates := f.creates
+	f.mu.Unlock()
+
+	relabelled := func(what string, err error) {
+		t.Helper()
+		var refused *trust.KeyRelabelledError
+		if !errors.As(err, &refused) {
+			t.Fatalf("%s: %v, want a trust.KeyRelabelledError", what, err)
+		}
+		// The key is recorded for bob on this device: not the case of
+		// one key for two recipients of one send.
+		if refused.Email != carol.email || refused.RecordedEmail != bob.email || refused.Fingerprint != bob.fp || refused.Sender || refused.SameSend {
+			t.Fatalf("%s: error %+v", what, refused)
+		}
+		if !strings.Contains(err.Error(), "forget "+bob.email+"'s key") {
+			t.Errorf("%s: the message does not name the record to forget: %v", what, err)
+		}
+	}
+	_, err := c.Secrets.EncryptText(context.Background(), []string{carol.email}, "hello", secrets.EncryptOptions{Name: "n2"})
+	relabelled("send", err)
+	path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+	_, err = c.Secrets.EncryptText(context.Background(), []string{carol.email}, "hello", secrets.EncryptOptions{LocalFile: path})
+	relabelled("local send", err)
+	relabelled("accept", c.Trust.Accept(context.Background(), carol.email, bob.fp))
+	if f.creates != creates {
+		t.Fatal("a refused send reached the server")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused local send left %s: %v", path, err)
+	}
+	if known := knownKeys(t, c, carol.email); len(known) != 0 {
+		t.Fatalf("carol's known keys %+v, want none", known)
+	}
+
+	// Bob really moved to carol's address: forgetting his key lets it pass
+	// for hers, on first use.
+	if n, err := c.Trust.Forget(bob.email, ""); err != nil || n != 1 {
+		t.Fatalf("forget: %d, %v", n, err)
+	}
+	res, err := c.Secrets.EncryptText(context.Background(), []string{carol.email}, "hello", secrets.EncryptOptions{Name: "n2"})
+	if err != nil || len(res.FirstUse) != 1 || res.FirstUse[0].Email != carol.email || res.FirstUse[0].Fingerprint != bob.fp {
+		t.Fatalf("send, bob's key forgotten: %+v, %v", res, err)
+	}
+}
+
+// A key belongs to one address within one send too. A server that lists one
+// key for two recipients, both new to this device, is refused as soon as the
+// second is resolved, with the error that names both addresses, before the
+// payload is read, sealed or sent, for a secret and for a local file.
+// Nothing is recorded for either, so a send to one of them alone still
+// accepts the key on first use.
+func TestOneKeyForTwoNewRecipientsIsRefused(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
+	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	c := f.client("alice@example.com")
+	f.mu.Lock()
+	carol.kp, carol.fp = bob.kp, bob.fp
+	f.mu.Unlock()
+	both := []string{bob.email, carol.email}
+
+	path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+	for what, opt := range map[string]secrets.EncryptOptions{"send": {Name: "n"}, "local send": {LocalFile: path}} {
+		var began phaseRecorder
+		opt.OnPhase = began.record
+		_, err := c.Secrets.EncryptText(context.Background(), both, "hello", opt)
+		var refused *trust.KeyRelabelledError
+		if !errors.As(err, &refused) {
+			t.Fatalf("%s: %v, want a trust.KeyRelabelledError", what, err)
+		}
+		if refused.Email != carol.email || refused.RecordedEmail != bob.email || refused.Fingerprint != bob.fp || refused.Sender || !refused.SameSend {
+			t.Fatalf("%s: error %+v", what, refused)
+		}
+		// Nothing is recorded for bob, so the message must not say this
+		// device knows the key as his, or send the user to forget it.
+		if msg := err.Error(); strings.Contains(msg, "forget") || strings.Contains(msg, "this device knows") ||
+			!strings.Contains(msg, "for both "+bob.email+" and "+carol.email+" in this send") || !strings.Contains(msg, "possible key substitution by the server") {
+			t.Errorf("%s: message %q", what, msg)
+		}
+		began.check(t, what+", refused before anything is sealed")
+	}
+	if f.creates != 0 || f.puts != 0 {
+		t.Fatalf("a refused send reached the server: %d creates, %d uploads", f.creates, f.puts)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused local send left %s: %v", path, err)
+	}
+	for _, email := range both {
+		if known := knownKeys(t, c, email); len(known) != 0 {
+			t.Fatalf("%s's known keys %+v, want none", email, known)
+		}
+	}
+
+	res, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"})
+	if err != nil || len(res.FirstUse) != 1 || res.FirstUse[0].Email != bob.email || res.FirstUse[0].Fingerprint != bob.fp {
+		t.Fatalf("send to bob alone: %+v, %v", res, err)
+	}
+}
+
 // relabelLocalSender rewrites the unsigned sender label of a local file.
 func relabelLocalSender(t *testing.T, path, email string) {
 	t.Helper()

@@ -147,7 +147,9 @@ func Seal(dst io.Writer, src io.Reader, sender *keys.Pair, recipients []*keys.Pu
 // payload object.
 func SealBytes(plaintext []byte, sender *keys.Pair, recipients []*keys.PublicKeys, p SealParams) ([]byte, *Sealed, error) {
 	var out bytes.Buffer
-	out.Grow(int(ciphertextSizeFor(int64(len(plaintext)))))
+	if size, ok := ciphertextSizeFor(int64(len(plaintext))); ok {
+		out.Grow(int(size))
+	}
 	sealed, err := Seal(&out, bytes.NewReader(plaintext), sender, recipients, p)
 	if err != nil {
 		return nil, nil, err

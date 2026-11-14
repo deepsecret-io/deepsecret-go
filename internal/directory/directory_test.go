@@ -131,3 +131,81 @@ func TestGetRecipientKeysChecksThePrimary(t *testing.T) {
 		t.Fatal("broken primary bundle accepted")
 	}
 }
+
+// A server can list a bundle whose Ed25519 key is a byte short and whose
+// X25519 key is a byte long: end to end the keys are those of a whole
+// bundle, so its fingerprint and both self-signatures match. Every lookup
+// refuses it by its key sizes, and none of them panics.
+func TestLookupsRefuseABundleWithShiftedKeys(t *testing.T) {
+	kp, fp := newKeyPair(t)
+	b := bundle(t, kp)
+	b["ed25519"], b["x25519"] = shiftedKeys(t, kp)
+	if got, err := keys.FingerprintFromPubs(b["ed25519"].(string), b["x25519"].(string), kp.MLKEM768PK, kp.MLDSA65PK); err != nil || got != fp {
+		t.Fatalf("the shifted bundle computes fingerprint %s, %v: want the whole bundle's", got, err)
+	}
+	c := keysServer(t, b)
+	ctx := context.Background()
+
+	lookups := map[string]func() error{
+		"recipient keys": func() error {
+			_, err := GetRecipientKeys(ctx, c, "bob@example.com")
+			return err
+		},
+		"signing key by fingerprint": func() error {
+			_, err := ResolveED25519ByEmail(ctx, c, "bob@example.com", fp)
+			return err
+		},
+		"primary signing key": func() error {
+			_, err := ResolveED25519ByEmail(ctx, c, "bob@example.com", "")
+			return err
+		},
+	}
+	for name, lookup := range lookups {
+		t.Run(name, func(t *testing.T) {
+			if err := noPanic(t, lookup); err == nil {
+				t.Fatal("a bundle with a 31-byte Ed25519 key and a 33-byte X25519 key was accepted")
+			}
+		})
+	}
+}
+
+// A signature of the wrong size is refused as one, whichever lookup meets it.
+func TestLookupsRefuseWrongSizeSignatures(t *testing.T) {
+	kp, fp := newKeyPair(t)
+	cases := map[string]struct {
+		field string
+		by    int
+		want  string
+	}{
+		"short Ed25519 signature":   {"signature", -1, "ed25519 signature must be 64 bytes, got 63"},
+		"long Ed25519 signature":    {"signature", 1, "ed25519 signature must be 64 bytes, got 65"},
+		"short ML-DSA-65 signature": {"signature_mldsa65", -1, "mldsa65 signature must be 3309 bytes, got 3308"},
+		"long ML-DSA-65 signature":  {"signature_mldsa65", 1, "mldsa65 signature must be 3309 bytes, got 3310"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			b := bundle(t, kp)
+			b[tc.field] = resize(t, b[tc.field].(string), tc.by)
+			c := keysServer(t, b)
+			if _, err := GetRecipientKeys(context.Background(), c, "bob@example.com"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("recipient keys: err = %v, want %q", err, tc.want)
+			}
+			if _, err := ResolveED25519ByEmail(context.Background(), c, "bob@example.com", fp); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("signing key: err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The signing key lookup returns the Ed25519 key of a whole bundle, by
+// fingerprint or as the primary key.
+func TestResolveED25519ByEmail(t *testing.T) {
+	kp, fp := newKeyPair(t)
+	c := keysServer(t, bundle(t, kp))
+	for _, want := range []string{fp, ""} {
+		got, err := ResolveED25519ByEmail(context.Background(), c, "bob@example.com", want)
+		if err != nil || got != kp.ED25519Public {
+			t.Errorf("fingerprint %q: key %q, %v", want, got, err)
+		}
+	}
+}

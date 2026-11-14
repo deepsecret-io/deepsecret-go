@@ -39,10 +39,10 @@ const (
 type KeyChangedError = knownkeys.KeyChangedError
 
 // StaleRevisionError refuses the revision the server gives as a secret's latest
-// when this device already opened a revision of it, from the same sender, signed
-// later: the server may be rolling the secret back. Its fields are SecretName,
-// SenderEmail, RevisionID, SignedAt and NewestSeen. Requesting RevisionID
-// explicitly opens it anyway.
+// when this device already opened a revision of it, from the same sender or
+// signed with the same key, signed later: the server may be rolling the secret
+// back. Its fields are SecretName, SenderEmail, RevisionID, SignedAt and
+// NewestSeen. Requesting RevisionID explicitly opens it anyway.
 type StaleRevisionError = knownkeys.StaleRevisionError
 
 // UnrecordedSenderError refuses a secret signed with a key pair on this device
@@ -53,6 +53,19 @@ type StaleRevisionError = knownkeys.StaleRevisionError
 // is the user's, Identity.RecordOwnAccount with Fingerprint, signed in as
 // Email, records it and the secret opens.
 type UnrecordedSenderError = knownkeys.UnrecordedSenderError
+
+// KeyRelabelledError refuses a send to someone, or a secret from them, under a
+// key this device recorded for another address on the same server: a key
+// belongs to one address, so the server may be relabelling it. Its fields are
+// Email (the address the server presents the key for), RecordedEmail (the
+// address this device recorded it for), Fingerprint and Sender (the key signed
+// a secret being decrypted; otherwise the server lists it for Email). If they
+// really changed address, Forget with RecordedEmail and trying again accepts
+// the key for Email on first use. SameSend is set when nothing is recorded:
+// the server lists the key for Email and RecordedEmail, two recipients of one
+// send both new to this device, so there is nothing to forget and the send is
+// refused as a possible key substitution.
+type KeyRelabelledError = knownkeys.KeyRelabelledError
 
 // Client reaches the keys this device knows. Get one from deepsecret.NewClient,
 // as its Trust field.
@@ -78,7 +91,8 @@ func (c *Client) List(email string) ([]KnownKey, error) {
 // other keys: sends go to it alone, and the others only check secrets they
 // signed. It must be a full fingerprint of a key the server lists for email,
 // with valid self-signatures, and email must not be one of the user's own
-// accounts.
+// accounts. A key this device recorded for someone else is refused with a
+// KeyRelabelledError.
 func (c *Client) Accept(ctx context.Context, email, fingerprint string) error {
 	return c.record(ctx, email, fingerprint, Accepted)
 }
@@ -107,7 +121,8 @@ func (c *Client) record(ctx context.Context, email, fingerprint string, state St
 // all of them when fingerprint is empty, and returns how many it removed. Once
 // none is left, the next send to them, or secret from them, accepts their key
 // on first use again. For one of the user's own accounts it forgets that the
-// account is theirs.
+// account is theirs. The newest signing times recorded for their secrets stay,
+// so forgetting someone does not let the server roll their secrets back.
 func (c *Client) Forget(email, fingerprint string) (int, error) {
 	return c.store.Forget(email, fingerprint)
 }

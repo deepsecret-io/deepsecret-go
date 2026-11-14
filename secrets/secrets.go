@@ -50,6 +50,11 @@ type Info struct {
 	UpdatedAt        time.Time         `json:"updated_at" yaml:"updated_at"`
 	ExpiresAt        string            `json:"expires_at,omitempty" yaml:"expires_at,omitempty"`
 	AllowedIPs       []string          `json:"allowed_ips,omitempty" yaml:"allowed_ips,omitempty"`
+	// IPLockSource says where the secret's IP lock comes from: "sender-set"
+	// (AllowedIPs lists it), "org-enforced" (the organization enforces one,
+	// and AllowedIPs is empty: its addresses are for the organization's
+	// admins), or "" when there is no lock.
+	IPLockSource string `json:"ip_lock_source,omitempty" yaml:"ip_lock_source,omitempty"`
 
 	// DismissedAt is the caller's own dismissal, when the caller is a
 	// recipient who hid the secret.
@@ -191,11 +196,13 @@ type secretWrap struct {
 	Ct  []byte `json:"ct"`
 }
 
-// fileMetaEntry is per-file metadata sent to the server for the file tree UI.
+// fileMetaEntry is what a send tells the server about one file, for the file
+// tree UI: its name and size. It never carries a hash of the content, which
+// would let the server recognise a file it has seen or confirm a guess at
+// one: the payload carries the file's SHA-256, encrypted, for the recipient.
 type fileMetaEntry struct {
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
 }
 
 // createResponse is the server's response to creating a secret.

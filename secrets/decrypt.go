@@ -5,6 +5,7 @@ package secrets
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -528,6 +529,9 @@ func (o *OpenedSecret) Payload(ctx context.Context) (*DecryptedPayload, error) {
 			if err != nil {
 				return nil, fmt.Errorf("the payload names an unsafe file: %w", err)
 			}
+			if err := checkDeclared(name, f); err != nil {
+				return nil, fmt.Errorf("check payload: %w", err)
+			}
 			decrypted.Files = append(decrypted.Files, DecryptedFile{
 				Name: name, Data: f.Data, Size: f.Size, SHA256: f.SHA256, Mode: f.Mode,
 			})
@@ -538,6 +542,20 @@ func (o *OpenedSecret) Payload(ctx context.Context) (*DecryptedPayload, error) {
 		}
 	}
 	return decrypted, nil
+}
+
+// checkDeclared refuses a file, named name, whose data does not have the
+// size or the SHA-256 its sender declared for it. WriteFiles makes the same
+// checks as it decodes; without them Payload would hand the caller a size
+// and a hash that nothing compared with the data.
+func checkDeclared(name string, f payload.FileEntry) error {
+	if f.Size != int64(len(f.Data)) {
+		return fmt.Errorf("%s declares %d bytes but holds %d", name, f.Size, len(f.Data))
+	}
+	if sum := sha256.Sum256(f.Data); f.SHA256 != hex.EncodeToString(sum[:]) {
+		return fmt.Errorf("%s does not match its SHA-256", name)
+	}
+	return nil
 }
 
 // WriteOptions configures WriteFiles.

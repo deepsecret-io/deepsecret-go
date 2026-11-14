@@ -58,7 +58,7 @@ type fakeRevision struct {
 	id, secretID string
 	manifest     []byte
 	wraps        map[string]fakeWrap // by actor id
-	filesMeta    any                 // the files_meta of the create request, served back as the API does
+	filesMeta    any                 // the names and sizes in the create request's files_meta, served back as the API does
 }
 
 type fakeSecret struct {
@@ -78,6 +78,9 @@ type fakeAPI struct {
 	creates int
 	puts    int
 	lastReq createBody
+	// lastBody is the last create request as the client sent it, for tests
+	// of what a send tells the server.
+	lastBody []byte
 	// secretGets, revisionLists and accountGets count the reads of a
 	// secret, of its revisions and of the caller's account.
 	secretGets, revisionLists, accountGets int
@@ -93,6 +96,10 @@ type fakeAPI struct {
 	// known holds each client's known keys file, as each person's own
 	// device would.
 	known string
+	// ipLockSource, when set, is the ip_lock_source every secret is served
+	// with. The API lists no allowed_ips for a lock the organization
+	// enforces, and the fake lists none at all.
+	ipLockSource string
 
 	// Multipart: a create at or above multipartAt bytes answers
 	// is_multipart with partSize parts.
@@ -138,9 +145,8 @@ type createBody struct {
 	Compressed      bool   `json:"compressed"`
 	Compression     string `json:"compression"`
 	FilesMeta       []struct {
-		Name   string `json:"name"`
-		Size   int64  `json:"size"`
-		SHA256 string `json:"sha256"`
+		Name string `json:"name"`
+		Size int64  `json:"size"`
 	} `json:"files_meta"`
 	Recipients []struct {
 		RecipientID    string `json:"recipient_id"`
@@ -209,6 +215,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("POST /api/v1/secrets/revisions/{id}/presign", f.presignDownload)
 	mux.HandleFunc("GET /api/v1/secrets/revisions/{id}/manifest", f.manifest)
 	mux.HandleFunc("GET /api/v1/secrets/{id}", f.secret)
+	mux.HandleFunc("PUT /api/v1/secrets/{id}/policies", f.secret)
 	mux.HandleFunc("GET /api/v1/secrets/{id}/revisions", f.revisions)
 	mux.HandleFunc("DELETE /api/v1/secrets/{id}/recipients/{actor}", f.revoke)
 	f.srv = httptest.NewServer(mux)
@@ -333,13 +340,18 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	sender := f.caller(r)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
 	var req createBody
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		fail(w, 400, err.Error())
 		return
 	}
 	f.creates++
-	f.lastReq = req
+	f.lastReq, f.lastBody = req, body
 	m, err := protocol.UnmarshalManifest(req.Manifest)
 	if err != nil {
 		fail(w, 400, err.Error())
@@ -641,6 +653,8 @@ func (f *fakeAPI) manifest(w http.ResponseWriter, r *http.Request) {
 		"wrap": map[string][]byte{"enc": wr.enc, "ct": wr.ct}})
 }
 
+// secret serves a secret as the API does, to a read and to a policy update
+// alike: the update changes nothing here.
 func (f *fakeAPI) secret(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -650,8 +664,12 @@ func (f *fakeAPI) secret(w http.ResponseWriter, r *http.Request) {
 	for _, id := range s.recipients {
 		recipients = append(recipients, map[string]string{"id": id, "email": f.byID(id).email})
 	}
-	ok(w, map[string]any{"id": s.id, "name": s.name, "sender_id": s.senderID, "sender_email": f.byID(s.senderID).email,
-		"recipients": recipients, "latest_revision_id": s.revisions[len(s.revisions)-1].id, "revision_count": len(s.revisions)})
+	out := map[string]any{"id": s.id, "name": s.name, "sender_id": s.senderID, "sender_email": f.byID(s.senderID).email,
+		"recipients": recipients, "latest_revision_id": s.revisions[len(s.revisions)-1].id, "revision_count": len(s.revisions)}
+	if f.ipLockSource != "" {
+		out["ip_lock_source"] = f.ipLockSource
+	}
+	ok(w, out)
 }
 
 func (f *fakeAPI) revisions(w http.ResponseWriter, r *http.Request) {
@@ -851,6 +869,124 @@ func TestServerCannotSwapOrRollBackRevisions(t *testing.T) {
 	serve(honest...)
 	if got, err := open(secrets.DecryptOptions{}); err != nil || got.Decrypted.Message != "TOKEN=v2-active" {
 		t.Fatalf("honest again: %+v, %v", got, err)
+	}
+}
+
+// relabelledRollback is a rollback a server tries under another sender
+// address: the first revision of a secret served as its latest, with a new
+// address named as the sender and the real sender's key listed for it.
+type relabelledRollback struct {
+	f            *fakeAPI
+	bob          *deepsecret.Client // the recipient, who opened the newest revision
+	alice, alias *fakeActor         // the sender, and the address the server names instead
+	secretID     string
+	replayed     string // the first revision, served as the latest
+}
+
+// open opens the secret's latest revision as bob, or the one opt asks for.
+func (r relabelledRollback) open(opt secrets.DecryptOptions) (*secrets.DecryptResult, error) {
+	return r.bob.Secrets.Decrypt(context.Background(), r.secretID, opt)
+}
+
+// newRelabelledRollback has alice send bob two revisions of a secret and bob
+// open the newest, then turns the server against him.
+func newRelabelledRollback(t *testing.T) relabelledRollback {
+	t.Helper()
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "alice.new@example.com")
+	alice, alias := f.actors["alice@example.com"], f.actors["alice.new@example.com"]
+	send := func(text string) *secrets.EncryptResult {
+		t.Helper()
+		res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, text, secrets.EncryptOptions{Name: "api-token"})
+		if err != nil {
+			t.Fatalf("send %s: %v", text, err)
+		}
+		return res
+	}
+	v1 := send("TOKEN=v1-revoked")
+	nextSecond()
+	v2 := send("TOKEN=v2-active")
+	r := relabelledRollback{f: f, bob: f.client("bob@example.com"), alice: alice, alias: alias,
+		secretID: v1.Secret.ID, replayed: v1.Secret.RevisionID}
+	if got, err := r.open(secrets.DecryptOptions{}); err != nil || got.RevisionID != v2.Secret.RevisionID ||
+		got.Decrypted.Message != "TOKEN=v2-active" || got.SenderEmail != alice.email {
+		t.Fatalf("honest: %+v, %v", got, err)
+	}
+
+	f.mu.Lock()
+	secret := f.secrets[r.secretID]
+	slices.Reverse(secret.revisions)
+	secret.senderID = alias.id
+	alias.old = append(alias.old, alice.kp)
+	f.mu.Unlock()
+	return r
+}
+
+// The rollback record is kept per sender address, and the server names the
+// sender. So a server that cannot roll a secret back under its sender's
+// address tries another: it serves the old revision as the latest, names a
+// new address as its sender, and lists the sender's real key for it. The
+// key is already recorded for the sender, and a key belongs to one address:
+// the decrypt is refused, as is a local file relabelled the same way, and
+// nothing is recorded for the new address.
+func TestServerCannotRollBackByRelabellingTheSender(t *testing.T) {
+	r := newRelabelledRollback(t)
+	relabelled := func(what string, got *secrets.DecryptResult, err error) {
+		t.Helper()
+		var refused *trust.KeyRelabelledError
+		if !errors.As(err, &refused) {
+			t.Fatalf("%s: %+v, %v, want a trust.KeyRelabelledError", what, got, err)
+		}
+		if refused.Email != r.alias.email || refused.RecordedEmail != r.alice.email || refused.Fingerprint != r.alice.fp || !refused.Sender || refused.SameSend {
+			t.Fatalf("%s: error %+v", what, refused)
+		}
+	}
+	got, err := r.open(secrets.DecryptOptions{})
+	relabelled("rollback under a new address", got, err)
+	// Asking for the revision by id skips the rollback check, not this one.
+	got, err = r.open(secrets.DecryptOptions{Revision: r.replayed})
+	relabelled("the old revision by id under a new address", got, err)
+
+	path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
+	if _, err := r.f.client(r.alice.email).Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "from alice", secrets.EncryptOptions{LocalFile: path}); err != nil {
+		t.Fatal(err)
+	}
+	relabelLocalSender(t, path, r.alias.email)
+	got, err = openLocalWith(r.bob, path)
+	relabelled("local file under a new address", got, err)
+
+	if known := knownKeys(t, r.bob, r.alias.email); len(known) != 0 {
+		t.Fatalf("the new address's known keys %+v, want none", known)
+	}
+	if known := knownKeys(t, r.bob, r.alice.email); len(known) != 1 || known[r.alice.fp].State != trust.FirstUse {
+		t.Fatalf("alice's known keys %+v, want them unchanged", known)
+	}
+}
+
+// Forgetting the sender's key lets a new address take it on first use, as
+// for someone who really changed address. It does not reopen the rollback:
+// the newest signing time is kept under the key that signed as well, which
+// the manifest signs and the server cannot rename. The old revision still
+// opens when asked for by id.
+func TestForgettingTheSenderKeepsTheRollbackRecordOfTheirKey(t *testing.T) {
+	r := newRelabelledRollback(t)
+	if n, err := r.bob.Trust.Forget(r.alice.email, ""); err != nil || n != 1 {
+		t.Fatalf("forget: %d, %v", n, err)
+	}
+	var stale *trust.StaleRevisionError
+	if got, err := r.open(secrets.DecryptOptions{}); !errors.As(err, &stale) ||
+		stale.RevisionID != r.replayed || stale.SecretName != "api-token" || stale.SenderEmail != r.alias.email {
+		t.Fatalf("rollback under a new address, the sender's key forgotten: %+v, %v, want a trust.StaleRevisionError", got, err)
+	}
+	if known := knownKeys(t, r.bob, r.alias.email); len(known) != 0 {
+		t.Fatalf("a refused rollback recorded a key for the new address: %+v", known)
+	}
+
+	got, err := r.open(secrets.DecryptOptions{Revision: r.replayed})
+	if err != nil || got.Decrypted.Message != "TOKEN=v1-revoked" || !got.SenderFirstUse || got.SenderEmail != r.alias.email {
+		t.Fatalf("the old revision by id: %+v, %v", got, err)
+	}
+	if _, err := r.open(secrets.DecryptOptions{}); !errors.As(err, &stale) {
+		t.Fatalf("rollback after opening the old revision by id: %v, want a trust.StaleRevisionError", err)
 	}
 }
 

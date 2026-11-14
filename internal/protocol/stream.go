@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 // ── Payload stream (protocol v4 §2 and §3) ──────────────────────────────────
@@ -71,12 +72,23 @@ func chunkNonce(i uint64, last bool) []byte {
 
 // ciphertextSizeFor returns the stored size of a payload of plaintextSize
 // bytes: every chunk carries a tag, and an empty payload is one empty chunk.
-func ciphertextSizeFor(plaintextSize int64) int64 {
+// It reports false for a size no payload has: a negative one, or one so
+// large that the tags push the stored size past an int64. Such a sum would
+// wrap around to a negative size that then passes for the matching one.
+func ciphertextSizeFor(plaintextSize int64) (int64, bool) {
+	if plaintextSize < 0 {
+		return 0, false
+	}
 	chunks := plaintextSize / ChunkSize
 	if plaintextSize%ChunkSize != 0 || plaintextSize == 0 {
 		chunks++
 	}
-	return plaintextSize + chunks*chunkTagSize
+	// At most 2^43 chunks fit an int64 of plaintext, so tags cannot overflow.
+	tags := chunks * chunkTagSize
+	if plaintextSize > math.MaxInt64-tags {
+		return 0, false
+	}
+	return plaintextSize + tags, true
 }
 
 func newPayloadAEAD(payloadKey []byte) (cipher.AEAD, error) {

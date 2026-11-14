@@ -34,6 +34,35 @@ func Marshal(v any) ([]byte, error) {
 	return enc.Marshal(v)
 }
 
+// strictMaxNestedLevels is how deep a strictly decoded message may nest: a
+// map, an array in it, a map in that, and one level to spare (the least the
+// decoder can be held to).
+const strictMaxNestedLevels = 4
+
+// StrictDecMode returns a decoder for CBOR someone else wrote: a manifest
+// the server hands over, a payload a sender sealed. It refuses what Marshal
+// never writes and another parser could read differently: an indefinite
+// length, a map key given twice, and a key the target struct has no field
+// for, a key that differs only in case included. It also refuses an array
+// of more than maxArrayElements, a map of more than maxMapPairs and
+// anything nested deeper than strictMaxNestedLevels; each caller passes the
+// bounds of the message it reads.
+//
+// It does not check that the bytes are the canonical ones: key order, the
+// shortest form of a number, a tag around a value and a null in place of
+// one are left as they come.
+func StrictDecMode(maxArrayElements, maxMapPairs int) (cbor.DecMode, error) {
+	return cbor.DecOptions{
+		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
+		IndefLength:       cbor.IndefLengthForbidden,
+		MaxNestedLevels:   strictMaxNestedLevels,
+		MaxArrayElements:  maxArrayElements,
+		MaxMapPairs:       maxMapPairs,
+		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
+		FieldNameMatching: cbor.FieldNameMatchingCaseSensitive,
+	}.DecMode()
+}
+
 // IsLayoutControl reports whether r is a control character, a line or
 // paragraph separator, or a bidi formatting character: one that can change
 // how the text around it reads.

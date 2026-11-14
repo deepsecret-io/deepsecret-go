@@ -72,6 +72,9 @@ secrets.EncryptOptions{
 }
 ```
 
+Without `Archive`, the server is told each file's name and size and nothing
+else: never a hash of a file's content.
+
 ## Memory Model
 
 Files stream, so memory stays flat at any size, up to 100 GiB a secret.
@@ -265,6 +268,15 @@ belongs to:
   decrypt succeeds. After that, a send to them or a secret from them under
   any other key is refused with a `*KeyChangedError`, before anything is
   sealed or downloaded.
+- **One key, one address.** A key this device recorded for one contact is
+  refused for anyone else, known or new, with a `*KeyRelabelledError`, on a
+  send, a decrypt, `Trust.Accept` and `Trust.Verify`: the server names a
+  secret's sender, so it could otherwise present a contact's secret under a
+  new address. If they really changed address, `Trust.Forget` the old one
+  and try again. One key the server lists for two recipients of one send,
+  both new to this device, is refused the same way before anything is
+  sealed, with `SameSend` set: nothing is recorded, so there is nothing to
+  forget. Your own keys keep the rules above.
 - **A changed key.** Once the new key is confirmed with its owner,
   `Trust.Accept(ctx, email, fingerprint)` accepts it, and `Trust.Verify` records a key
   you compared. Both take the full fingerprint of a key the server lists
@@ -281,10 +293,16 @@ belongs to:
   sender signed: show them, or compare the name with the secret you meant
   to open. Opening a secret's latest revision also refuses one signed
   before a revision of that secret this device already opened, with a
-  `*StaleRevisionError` (a possible rollback by the server). Setting
+  `*StaleRevisionError` (a possible rollback by the server). That signing
+  time is kept under the sender's address and under the key that signed, so
+  naming the sender under another address does not get around it, and
+  `Trust.Forget` does not clear it. A time more than five minutes ahead of
+  this device's clock is recorded as that limit, so a sender whose clock ran
+  ahead does not make their later revisions look stale. Setting
   `DecryptOptions.Revision` opens an older revision on purpose.
 
-Known keys, and the newest signing time opened per secret, are kept per
+Known keys, and the newest signing time opened per secret (by sender
+address and by signing key), are kept per
 API server in `~/.deepsecret/known_keys.json` (mode 0600;
 `WithKnownKeysFile` moves it). A damaged file refuses sends rather than
 accepting any key again.
@@ -319,7 +337,7 @@ accepting any key again.
 |---|---|
 | `List`, `Accept`, `Verify`, `Forget` | The keys this device knows |
 | `ServerListedKeys` | What the server lists for someone: only its claim, to compare and never to decide whom to trust |
-| `KeyChangedError`, `StaleRevisionError`, `UnrecordedSenderError` | What a send or a decrypt refuses with |
+| `KeyChangedError`, `KeyRelabelledError`, `StaleRevisionError`, `UnrecordedSenderError` | What a send or a decrypt refuses with |
 
 ### `keys` and `keystore`: Keys
 
