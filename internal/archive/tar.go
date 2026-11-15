@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,19 +110,6 @@ func extractXattrs(hdr *tar.Header) map[string]string {
 	return out
 }
 
-// applyXattrsBestEffort writes each xattr extraction restores to path.
-// Per-attribute failures are silent: common reasons (cross-platform name
-// namespaces, unsupported FS) are routine and shouldn't derail extraction.
-// Critical bytes (file content, mode, mtime) are written unconditionally
-// elsewhere; xattrs are pure metadata.
-func applyXattrsBestEffort(path string, xattrs map[string]string) {
-	for name, value := range xattrs {
-		if restorableXattr(name) {
-			_ = writeXattr(path, name, value)
-		}
-	}
-}
-
 // restorableXattr reports whether extraction restores the extended
 // attribute name. Linux's security, trusted and system namespaces are left
 // out: they hold file capabilities, SELinux labels and ACLs, with which an
@@ -137,17 +123,39 @@ func restorableXattr(name string) bool {
 	return true
 }
 
-// keepSpecialBits adds mode's setuid, setgid and sticky bits to path,
-// which open(2) and mkdir(2) leave out. They are set only with
-// KeepSpecialModes (see Limits.entryMode). The permission bits stay as the
-// file or directory was created, with the umask applied.
-func keepSpecialBits(path string, mode os.FileMode) {
+// setMeta restores an entry's metadata on f, a file or folder extraction
+// created, through its handle, so nothing another account puts at its name
+// meanwhile (a link, or a hard link to a file elsewhere) is changed: the
+// owner with KeepOwnership, then the special bits (chown clears setuid and
+// setgid), the extended attributes, and last mtime when not zero, so the
+// other changes do not move it. Each step is best-effort: missing
+// privileges or file system features do not fail the extraction.
+func setMeta(f *os.File, hdr *tar.Header, mode os.FileMode, lim *Limits, mtime time.Time) {
+	if lim.KeepOwnership {
+		_ = setOwner(f, hdr.Uid, hdr.Gid)
+	}
+	keepSpecialBits(f, mode)
+	for name, value := range extractXattrs(hdr) {
+		if restorableXattr(name) {
+			_ = setXattr(f, name, value)
+		}
+	}
+	if !mtime.IsZero() {
+		_ = disk.SetTimes(f, mtime)
+	}
+}
+
+// keepSpecialBits adds mode's setuid, setgid and sticky bits to f, which
+// open(2) and mkdir(2) leave out. They are set only with KeepSpecialModes
+// (see Limits.entryMode). The permission bits stay as the file or folder
+// was created, with the umask applied.
+func keepSpecialBits(f *os.File, mode os.FileMode) {
 	special := mode & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 	if special == 0 {
 		return
 	}
-	if info, err := os.Lstat(path); err == nil {
-		_ = os.Chmod(path, info.Mode().Perm()|special)
+	if info, err := f.Stat(); err == nil {
+		_ = f.Chmod(info.Mode().Perm() | special)
 	}
 }
 
@@ -563,20 +571,10 @@ func WriteTarStream(w io.Writer, entries []TarStreamEntry, algo compress.Algorit
 //
 // This is the primary extraction API. It streams data from r through the
 // decompressor and tar reader to disk without buffering the full archive in
-// memory.
-//
-// All security guarantees from [ExtractTar] apply: path validation, duplicate
-// rejection, type rejection, size limits, symlink escape checks, atomic writes.
-//
-// outputDir is created if it does not exist. Everything extraction creates
-// is private to its owner, whatever modes the archive asks for:
-// directories, outputDir among them, are 0700, and files 0600, or 0700
-// when the entry has its owner's execute bit, with the umask applied (on
-// Windows, private to this user). The owner is the user who extracts it,
-// or with KeepOwnership when extracting as root, the archive's owner.
-// Directories that already exist keep their mode, owner, attributes and
-// times. With AllowOverwrite, a file is replaced by a new one renamed over
-// it, so it gets the private mode, not the old file's.
+// memory. It opens outputDir once ([OpenOutput]) and extracts through it
+// ([Output.ExtractTar]); see those for its security guarantees: path
+// validation, duplicate rejection, type rejection, size limits, no write
+// through or out of a link, atomic writes.
 //
 // When extraction fails, everything it created is removed, files it
 // overwrote among them; what was there before stays. The error names
@@ -584,37 +582,44 @@ func WriteTarStream(w io.Writer, entries []TarStreamEntry, algo compress.Algorit
 //
 // Returns the number of files successfully extracted.
 func ExtractTarReader(r io.Reader, outputDir string, algo compress.Algorithm, limits *Limits) (int, error) {
-	var undo Undo
-	n, err := ExtractTarReaderInto(r, outputDir, algo, limits, &undo)
+	out, err := OpenOutput(outputDir)
 	if err != nil {
-		return 0, undo.Remove(err)
+		return 0, err
 	}
-	return n, nil
+	n, err := out.ExtractTar(r, algo, limits)
+	if err != nil {
+		return 0, out.Remove(err)
+	}
+	return n, out.Close()
 }
 
-// ExtractTarReaderInto is [ExtractTarReader], but it records what it
-// creates and overwrites in undo and leaves it in place when it fails: for
-// a caller with checks of its own after extraction, which removes the
-// whole write with [Undo.Remove] when any of them fails.
-func ExtractTarReaderInto(r io.Reader, outputDir string, algo compress.Algorithm, limits *Limits, undo *Undo) (int, error) {
-	lim := limits.resolve()
-
-	if err := undo.MkdirAll(outputDir, 0o700); err != nil {
-		return 0, fmt.Errorf("create output directory %q: %w", outputDir, err)
-	}
-	if info, err := os.Stat(outputDir); err != nil {
-		return 0, fmt.Errorf("stat output directory %q: %w", outputDir, err)
-	} else if !info.IsDir() {
-		return 0, fmt.Errorf("output path %q exists but is not a directory", outputDir)
-	}
-
+// ExtractTar extracts a compressed tar archive from r into the output
+// directory, and records what it creates and overwrites, for Remove. It
+// leaves all of it in place when it fails: the caller removes the whole
+// write with [Output.Remove], also when checks of its own after extraction
+// fail.
+//
+// Every name resolves inside the output directory (see [Output]). No entry
+// is created, and no hard link's source is read, through a folder that is
+// a link or not a folder when the entry is checked (Output.walkParents). Everything extraction creates is private to its
+// owner, whatever modes the archive asks for: directories are 0700, and
+// files 0600, or 0700 when the entry has its owner's execute bit, with the
+// umask applied (on Windows, private to this user). The owner is the user
+// who extracts it, or with KeepOwnership when extracting as root, the
+// archive's owner. Directories that already exist keep their mode, owner,
+// attributes and times. With AllowOverwrite, a file is replaced by a new
+// one renamed over it, so it gets the private mode, not the old file's. A
+// symlink entry keeps its target as written, wherever it points, and gets
+// the extracting user as owner and the time it is made: a link's own
+// metadata cannot be set through a handle, and setting it by name could
+// reach a file another account put there.
+func (o *Output) ExtractTar(r io.Reader, algo compress.Algorithm, limits *Limits) (int, error) {
 	rc, err := compress.NewDecompressReader(r, algo)
 	if err != nil {
 		return 0, fmt.Errorf("decompression reader: %w", err)
 	}
 	defer func() { _ = rc.Close() }()
-
-	return extractTarFromReader(rc, outputDir, lim, undo)
+	return o.extract(rc, limits.resolve())
 }
 
 // ValidateTarReader checks an archive the way ExtractTarReader would
@@ -728,20 +733,19 @@ func checkNameLimits(name string, total *int64, lim *Limits) error {
 	return nil
 }
 
-// extractTarFromReader is the shared extraction core used by both
-// ExtractTarReader and ExtractTar. It records what it creates and
-// overwrites in undo.
-func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo) (int, error) {
+// extract is the extraction core of ExtractTar, reading the uncompressed
+// archive from r.
+func (o *Output) extract(r io.Reader, lim *Limits) (int, error) {
 	tr := tar.NewReader(r)
 	count := 0
 	var totalSize int64
 	seenNames := make(map[string]bool)
 	// Restoring directory mtimes is deferred to the end of extraction
 	// because writing files into a directory updates that directory's
-	// mtime. We collect (path, mtime) pairs as we go and apply them in
+	// mtime. We collect (name, mtime) pairs as we go and apply them in
 	// reverse depth order once all entries are written.
 	type pendingDirTime struct {
-		path  string
+		rel   string
 		mtime time.Time
 	}
 	var dirTimes []pendingDirTime
@@ -782,12 +786,8 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			return count, fmt.Errorf("archive exceeds maximum entry count (%d)", lim.MaxEntries)
 		}
 
-		target := filepath.Join(outputDir, filepath.FromSlash(cleanName))
-
-		if err := ensureInsideDir(outputDir, target); err != nil {
-			return count, fmt.Errorf("symlink escape for %q: %w", cleanName, err)
-		}
-		if err := noLinkBetween(outputDir, target); err != nil {
+		rel := filepath.FromSlash(cleanName)
+		if err := o.walkParents(rel, true); err != nil {
 			return count, fmt.Errorf("entry %q: %w", cleanName, err)
 		}
 
@@ -795,30 +795,25 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			// A directory that is already there stays as it is: the
 			// archive does not change the mode, owner, attributes or
 			// times of what it did not create.
-			if info, err := os.Lstat(target); err == nil {
+			if info, err := o.root.Lstat(rel); err == nil {
 				if !info.IsDir() {
-					return count, fmt.Errorf("mkdir %q: %s exists and is not a directory", cleanName, target)
+					return count, fmt.Errorf("mkdir %q: %s exists and is not a directory", cleanName, o.path(rel))
 				}
 				continue
 			}
-			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return count, fmt.Errorf("mkdir for %q: %w", cleanName, err)
-			}
 			mode := lim.entryMode(hdr.Mode, true)
-			// Mkdir applies the umask to the private permission bits; on
-			// Windows the folder is private to this user.
-			if err := disk.Mkdir(target, mode.Perm()); err != nil {
+			// MkdirIn applies the umask to the private permission bits;
+			// on Windows the folder is private to this user.
+			if err := disk.MkdirIn(o.root, rel, mode.Perm()); err != nil {
 				return count, fmt.Errorf("mkdir %q: %w", cleanName, err)
 			}
-			undo.add(target)
-			// chown first so its sgid-clearing doesn't undo the special bits.
-			if lim.KeepOwnership {
-				_ = lchown(target, hdr.Uid, hdr.Gid)
+			o.made = append(o.made, rel)
+			if d, err := disk.OpenDirIn(o.root, rel); err == nil {
+				setMeta(d, hdr, mode, lim, time.Time{})
+				_ = d.Close() // metadata only
 			}
-			keepSpecialBits(target, mode)
-			applyXattrsBestEffort(target, extractXattrs(hdr))
 			if !hdr.ModTime.IsZero() {
-				dirTimes = append(dirTimes, pendingDirTime{path: target, mtime: hdr.ModTime})
+				dirTimes = append(dirTimes, pendingDirTime{rel: rel, mtime: hdr.ModTime})
 			}
 			continue
 		}
@@ -827,31 +822,20 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			if err := validateSymlinkTarget(hdr.Linkname); err != nil {
 				return count, fmt.Errorf("unsafe symlink %q -> %q: %w", cleanName, hdr.Linkname, err)
 			}
-			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return count, fmt.Errorf("mkdir for symlink %q: %w", cleanName, err)
-			}
-			if err := replaceLeaf(target, lim.AllowOverwrite); err != nil {
+			if err := o.replaceLeaf(rel, lim.AllowOverwrite); err != nil {
 				return count, err
 			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			if err := o.root.Symlink(hdr.Linkname, rel); err != nil {
 				return count, fmt.Errorf("symlink %q: %w", cleanName, err)
 			}
-			undo.add(target)
-			if lim.KeepOwnership {
-				_ = lchown(target, hdr.Uid, hdr.Gid)
-			}
-			applyXattrsBestEffort(target, extractXattrs(hdr))
-			if !hdr.ModTime.IsZero() {
-				_ = lchtimes(target, hdr.ModTime)
-			}
+			o.made = append(o.made, rel)
 			continue
 		}
 
 		if hdr.Typeflag == tar.TypeLink {
-			// Hard link to a previously-extracted file. Resolve the target
-			// inside outputDir and verify it stays in-tree, then create
-			// the link. Falls through to file-create on platforms / FS that
-			// don't support hard links.
+			// Hard link to a previously-extracted file. The source must be
+			// a regular file reached through real folders only; both names
+			// resolve inside the output directory.
 			if hdr.Linkname == "" {
 				return count, fmt.Errorf("hardlink %q has empty target", cleanName)
 			}
@@ -859,26 +843,20 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 			if err != nil {
 				return count, fmt.Errorf("hardlink %q has invalid target %q: %w", cleanName, hdr.Linkname, err)
 			}
-			linkSrc := filepath.Join(outputDir, filepath.FromSlash(linkSrcRel))
-			if err := ensureInsideDir(outputDir, linkSrc); err != nil {
-				return count, fmt.Errorf("hardlink target escape for %q: %w", cleanName, err)
-			}
-			if err := noLinkBetween(outputDir, linkSrc); err != nil {
+			src := filepath.FromSlash(linkSrcRel)
+			if err := o.walkParents(src, false); err != nil {
 				return count, fmt.Errorf("hardlink %q: %w", cleanName, err)
 			}
-			if info, err := os.Lstat(linkSrc); err != nil || !info.Mode().IsRegular() {
+			if info, err := o.root.Lstat(src); err != nil || !info.Mode().IsRegular() {
 				return count, fmt.Errorf("hardlink %q: %q is not a regular file", cleanName, linkSrcRel)
 			}
-			if err := undo.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return count, fmt.Errorf("mkdir for hardlink %q: %w", cleanName, err)
-			}
-			if err := replaceLeaf(target, lim.AllowOverwrite); err != nil {
+			if err := o.replaceLeaf(rel, lim.AllowOverwrite); err != nil {
 				return count, err
 			}
-			if err := os.Link(linkSrc, target); err != nil {
+			if err := o.root.Link(src, rel); err != nil {
 				return count, fmt.Errorf("hardlink %q -> %q: %w", cleanName, linkSrcRel, err)
 			}
-			undo.add(target)
+			o.made = append(o.made, rel)
 			count++
 			continue
 		}
@@ -895,55 +873,34 @@ func extractTarFromReader(r io.Reader, outputDir string, lim *Limits, undo *Undo
 				cleanName, hdr.Size, lim.MaxTotalSize, totalSize)
 		}
 
-		targetDir := filepath.Dir(target)
-		if err := undo.MkdirAll(targetDir, 0o700); err != nil {
-			return count, fmt.Errorf("mkdir for %q: %w", cleanName, err)
-		}
-
-		// Re-verify after MkdirAll to detect a race where a directory was
-		// swapped for a symlink between the checks.
-		if err := ensureInsideDir(outputDir, target); err != nil {
-			return count, fmt.Errorf("symlink escape (post-mkdir) for %q: %w", cleanName, err)
-		}
-
 		mode := lim.entryMode(hdr.Mode, false)
 
 		// open(2) applies the umask to the private permission bits, for a
-		// new file and for one replacing an old file alike. setuid/setgid/
-		// sticky are added by keepSpecialBits after the write completes.
-		written, err := writeFileAtomicBounded(target, targetDir, mode.Perm(), tr, lim.MaxEntrySize, lim.AllowOverwrite)
+		// new file and for one replacing an old file alike. The owner,
+		// special bits, xattrs and mtime are set through the new file's
+		// handle once its content is written (setMeta).
+		written, err := o.writeNew(rel, mode.Perm(), tr, lim.MaxEntrySize, lim.AllowOverwrite, func(f *os.File) {
+			setMeta(f, hdr, mode, lim, hdr.ModTime)
+		})
 		if err != nil {
 			return count, fmt.Errorf("write %q: %w", cleanName, err)
 		}
-		undo.add(target)
+		o.made = append(o.made, rel)
 
 		totalSize += written
 		if totalSize > lim.MaxTotalSize {
 			return count, fmt.Errorf("archive exceeds total size limit %d", lim.MaxTotalSize)
 		}
-
-		// Restore owner first: POSIX chown(2) clears setuid/setgid for
-		// security, so the special bits have to come after. Then xattrs,
-		// and finally mtime so attribute writes don't bump it. Each step
-		// is best-effort; missing privileges or unsupported FS features
-		// must not fail the whole extraction.
-		if lim.KeepOwnership {
-			_ = lchown(target, hdr.Uid, hdr.Gid)
-		}
-		keepSpecialBits(target, mode)
-		applyXattrsBestEffort(target, extractXattrs(hdr))
-		if !hdr.ModTime.IsZero() {
-			_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
-		}
-
 		count++
 	}
 
 	// Apply directory mtimes from deepest to shallowest so writing into a
 	// child doesn't roll the parent's mtime forward after we restore it.
+	// Only a real folder is changed, through its own handle.
 	for i := len(dirTimes) - 1; i >= 0; i-- {
-		if info, err := os.Lstat(dirTimes[i].path); err == nil && info.IsDir() {
-			_ = os.Chtimes(dirTimes[i].path, dirTimes[i].mtime, dirTimes[i].mtime)
+		if d, err := disk.OpenDirIn(o.root, dirTimes[i].rel); err == nil {
+			_ = disk.SetTimes(d, dirTimes[i].mtime)
+			_ = d.Close() // metadata only
 		}
 	}
 
@@ -987,95 +944,7 @@ func ExtractTar(data []byte, outputDir string, algo compress.Algorithm, limits *
 	return ExtractTarReader(bytes.NewReader(data), outputDir, algo, limits)
 }
 
-// WriteFile writes one file into outputDir the way extraction writes a
-// regular entry: name is checked as a portable path and must stay inside
-// outputDir after symlinks resolve, missing parents are created, and the
-// file is created without following a symlink at its leaf and, unless
-// allowOverwrite, without replacing anything. Missing parents are private
-// (0700), and so is the file whatever mode asks for: 0600, or 0700 when
-// mode has the owner's execute bit (privatePerm), with the umask applied,
-// also when it replaces an old file. It writes at most maxSize bytes from
-// r and returns the file's path and the bytes written. It records the
-// directories and the file it creates or overwrites in undo, which may be
-// nil.
-func WriteFile(outputDir, name string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool, undo *Undo) (string, int64, error) {
-	cleanName, err := ValidateArchivePath(name)
-	if err != nil {
-		return "", 0, fmt.Errorf("unsafe file name: %w", err)
-	}
-	target := filepath.Join(outputDir, filepath.FromSlash(cleanName))
-	if err := ensureInsideDir(outputDir, target); err != nil {
-		return "", 0, fmt.Errorf("symlink escape for %q: %w", cleanName, err)
-	}
-	if err := noLinkBetween(outputDir, target); err != nil {
-		return "", 0, fmt.Errorf("file %q: %w", cleanName, err)
-	}
-	targetDir := filepath.Dir(target)
-	if err := undo.MkdirAll(targetDir, 0o700); err != nil {
-		return "", 0, fmt.Errorf("mkdir for %q: %w", cleanName, err)
-	}
-	// Re-verify after MkdirAll to detect a directory swapped for a symlink.
-	if err := ensureInsideDir(outputDir, target); err != nil {
-		return "", 0, fmt.Errorf("symlink escape (post-mkdir) for %q: %w", cleanName, err)
-	}
-	written, err := writeFileAtomicBounded(target, targetDir, privatePerm(mode, false), r, maxSize, allowOverwrite)
-	if err != nil {
-		return "", 0, fmt.Errorf("write %q: %w", cleanName, err)
-	}
-	undo.add(target)
-	return target, written, nil
-}
-
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-// noLinkBetween refuses target when an existing component between dir and
-// target's parent is not a real directory: extraction never creates, links
-// or records anything through a link, so no later entry can redirect a
-// path it already used (undo, directory times).
-func noLinkBetween(dir, target string) error {
-	rel, err := filepath.Rel(dir, filepath.Dir(target))
-	if err != nil {
-		return err
-	}
-	if rel == "." {
-		return nil
-	}
-	p := dir
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		p = filepath.Join(p, part)
-		info, err := os.Lstat(p)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("%s is not a directory", p)
-		}
-	}
-	return nil
-}
-
-// replaceLeaf makes room for a link at target: nothing there is fine; an
-// existing file or link is removed only with allowOverwrite; a directory is
-// never removed, so no path an earlier entry used can change meaning.
-func replaceLeaf(target string, allowOverwrite bool) error {
-	info, err := os.Lstat(target)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !allowOverwrite || info.IsDir() {
-		return fmt.Errorf("destination already exists: %s", target)
-	}
-	if err := os.Remove(target); err != nil {
-		return fmt.Errorf("remove existing %s: %w", target, err)
-	}
-	return nil
-}
 
 // zeroReader yields zeros forever.
 type zeroReader struct{}
@@ -1091,119 +960,4 @@ type countingWriter struct{ n int64 }
 func (c *countingWriter) Write(p []byte) (int, error) {
 	c.n += int64(len(p))
 	return len(p), nil
-}
-
-// writeFileAtomicBounded writes at most maxSize bytes from r to target in
-// dir and returns how many it wrote. Without allowOverwrite it creates
-// target, refusing one that exists. With it, it writes a new file beside
-// target and renames it over target once complete, so target gets mode
-// (with the umask applied; private to this user on Windows) instead of
-// keeping an old file's, a link at target is replaced rather than written
-// through, and a reader never sees half a file. Either way the file is
-// created new and never through a link at its path (see safeCreate), so an
-// attacker cannot redirect the write through a symlink even if they win
-// the TOCTOU race against ensureInsideDir.
-func writeFileAtomicBounded(target, dir string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool) (int64, error) {
-	path := target
-	if allowOverwrite {
-		path = tempPath(dir)
-	}
-	f, err := safeCreate(path, mode)
-	if err != nil {
-		return 0, err
-	}
-
-	// One byte past maxSize tells a source that is too long; maxSize+1
-	// would overflow when maxSize is math.MaxInt64.
-	limit := maxSize
-	if limit < math.MaxInt64 {
-		limit++
-	}
-	written, err := io.Copy(f, io.LimitReader(r, limit))
-	if closeErr := f.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return 0, removeAfter(path, err)
-	}
-
-	if written > maxSize {
-		return 0, removeAfter(path, fmt.Errorf("content exceeds size limit %d", maxSize))
-	}
-
-	if path != target {
-		if err := os.Rename(path, target); err != nil {
-			return 0, removeAfter(path, fmt.Errorf("replace %s: %w", target, err))
-		}
-	}
-	return written, nil
-}
-
-// removeAfter removes target, a file err left incomplete, and returns err,
-// joined with the reason when the file could not be removed, so a partly
-// written file is never left behind unreported.
-func removeAfter(target string, err error) error {
-	if rmErr := os.Remove(target); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-		return errors.Join(err, fmt.Errorf("the partly written %s is left behind: %w", target, rmErr))
-	}
-	return err
-}
-
-// ensureInsideDir verifies that target resolves to a path inside dir after
-// symlink resolution. This is best-effort and NOT race-free: a concurrent
-// local filesystem attacker could swap a directory for a symlink between this
-// check and the subsequent file write. For full race safety, extraction would
-// need openat/O_NOFOLLOW-style fd-based operations, which are platform-specific
-// and not portable to other SDK languages. The current approach is safe against
-// all non-concurrent attack vectors (pre-existing symlinks, tar-slip, etc.).
-//
-// Both inputs are normalized to canonical absolute paths before comparison:
-//   - filepath.Abs converts to absolute form (joins with CWD if relative).
-//   - filepath.EvalSymlinks resolves any symlinks in the existing prefix.
-//
-// On systems where common roots are themselves symlinks (e.g. macOS
-// `/tmp` → `/private/tmp`) the two-step normalization keeps both sides in
-// the same canonical form so a legitimate path inside `dir` doesn't get
-// reported as an escape.
-func ensureInsideDir(dir, target string) error {
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	if resolved, err := filepath.EvalSymlinks(absDir); err == nil {
-		absDir = resolved
-	}
-
-	// Make target absolute up front. If it was relative (relative to CWD),
-	// EvalSymlinks below would otherwise return a relative result and the
-	// later filepath.Abs would re-resolve via os.Getwd(), which on macOS
-	// often holds the unresolved /tmp form even when absDir is already
-	// /private/tmp: the comparison would then fail on a legitimate path.
-	absTarget, err := filepath.Abs(target)
-	if err != nil {
-		return err
-	}
-
-	check := absTarget
-	for {
-		resolved, err := filepath.EvalSymlinks(check)
-		if err == nil {
-			// EvalSymlinks may still return a path containing symlinked
-			// roots (rare but observed); run filepath.Abs to canonicalize.
-			absResolved, err := filepath.Abs(resolved)
-			if err != nil {
-				return err
-			}
-			if !strings.HasPrefix(absResolved+string(filepath.Separator), absDir+string(filepath.Separator)) &&
-				absResolved != absDir {
-				return fmt.Errorf("resolved path %s escapes output directory %s", absResolved, absDir)
-			}
-			return nil
-		}
-		parent := filepath.Dir(check)
-		if parent == check {
-			return nil
-		}
-		check = parent
-	}
 }

@@ -51,11 +51,18 @@
 //
 // Extraction is hardened against:
 //   - Path traversal (../ in entry names)
-//   - Symlink traversal: no entry, hard link source or recorded path may
-//     pass through a symlink or other non-directory below the output
-//     directory, and AllowOverwrite never replaces a directory, so cleanup
-//     and directory times only touch what extraction created (not race-free
-//     against concurrent local filesystem attackers)
+//   - Symlink traversal: the output directory is opened once as an
+//     os.Root ([OpenOutput]), so the kernel resolves every name a write
+//     creates, links, renames or removes inside it, also when another
+//     local account swaps a folder for a link while the write runs; no
+//     entry or hard link source may pass through a symlink or other
+//     non-directory below the output directory that is there when the
+//     entry is checked, and AllowOverwrite never
+//     replaces a directory, so cleanup and directory times only touch what
+//     extraction created
+//   - Hard links to files elsewhere: content, owner, modes, attributes and
+//     times go only to files and directories extraction created, through
+//     their own handles, never by name
 //   - Archive bombs (configurable size and entry count limits, pre-checked
 //     before writing)
 //   - Dangerous entry types (devices, FIFOs and sockets are rejected;

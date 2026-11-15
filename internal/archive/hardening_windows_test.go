@@ -29,7 +29,7 @@ func TestExtractTarCreatesPrivateEntries(t *testing.T) {
 	if _, err := ExtractTar(data, out, compress.None, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := WriteFile(out, "other/file.txt", 0o644, strings.NewReader("o"), 1, false, nil); err != nil {
+	if _, _, err := writeOne(out, "other/file.txt", 0o644, strings.NewReader("o"), 1, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{

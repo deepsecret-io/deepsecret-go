@@ -10,6 +10,20 @@ import (
 	"testing"
 )
 
+// writeOne writes one file into dir as WriteFiles does (Output.WriteFile),
+// and removes what it made when the write fails.
+func writeOne(dir, name string, mode os.FileMode, r io.Reader, maxSize int64, allowOverwrite bool) (string, int64, error) {
+	out, err := OpenOutput(dir)
+	if err != nil {
+		return "", 0, err
+	}
+	path, n, err := out.WriteFile(name, mode, r, maxSize, allowOverwrite)
+	if err != nil {
+		return "", 0, out.Remove(err)
+	}
+	return path, n, out.Close()
+}
+
 // writeOrFatal writes a file or fails the test.
 func writeOrFatal(t *testing.T, path string, data []byte) {
 	t.Helper()

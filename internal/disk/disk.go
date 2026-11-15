@@ -8,9 +8,10 @@
 // on Unix, and on Windows, which ignores those modes, a security descriptor
 // that makes this user the owner and grants nobody else any access
 // (private_windows.go). CreateTemp and MkdirPrivate always create private
-// files and folders. CreateNew and Mkdir take a mode, which Unix applies
-// and Windows replaces with that descriptor. ReadPrivate and
-// CheckPrivateDir refuse what someone else may open.
+// files and folders. Mkdir, and CreateIn and MkdirIn, which create inside
+// an os.Root, take a mode, which Unix applies and Windows replaces with
+// that descriptor. ReadPrivate and CheckPrivateDir refuse what someone
+// else may open.
 package disk
 
 import (

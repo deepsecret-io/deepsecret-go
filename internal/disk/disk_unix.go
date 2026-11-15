@@ -25,13 +25,6 @@ func FreeBytes(dir string) (int64, bool) {
 	return blocksToBytes(st.Bavail, uint64(st.Bsize)), true // #nosec G115 -- Bsize is positive here (int64 on Linux, uint32 on macOS).
 }
 
-// CreateNew creates path, which must not exist, for writing, with mode
-// (the umask applies). O_NOFOLLOW makes the kernel refuse a symlink at
-// path; folders above path are still followed.
-func CreateNew(path string, mode os.FileMode) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, mode) // #nosec G304 -- callers pass a path they checked; O_NOFOLLOW refuses a link at its leaf.
-}
-
 // CreateTemp creates a new file in dir for writing, private to this user
 // (0600): it is os.CreateTemp.
 func CreateTemp(dir, pattern string) (*os.File, error) {

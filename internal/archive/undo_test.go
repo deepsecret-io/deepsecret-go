@@ -118,26 +118,51 @@ func TestExtractTarFailureRemovesOverwrittenFiles(t *testing.T) {
 
 // Removing a directory the write made leaves it when someone else put a
 // file in it meanwhile, and reports it.
-func TestUndoKeepsAndReportsWhatOthersAdded(t *testing.T) {
+func TestRemoveKeepsAndReportsWhatOthersAdded(t *testing.T) {
 	out := t.TempDir()
-	var undo Undo
 	dir := filepath.Join(out, "made", "here")
-	if err := undo.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := undo.MkdirAll(dir, 0o700); err != nil { // already there: nothing more recorded
+	o, err := OpenOutput(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	theirs := filepath.Join(out, "made", "theirs.txt")
 	if err := os.WriteFile(theirs, []byte("t"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := undo.Remove(nil)
+	err = o.Remove(nil)
 	if err == nil || !strings.Contains(err.Error(), filepath.Join(out, "made")+" is left behind") {
 		t.Errorf("err = %v, want made/ reported", err)
 	}
 	if got := tree(t, out); strings.Join(got, ",") != "made/,made/theirs.txt" {
 		t.Errorf("the output holds %v, want made/ with the other file", got)
+	}
+}
+
+// An output directory that is a link, or not a directory, is refused, and
+// opening one that is there makes and records nothing.
+func TestOpenOutputRefusesALink(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "real")
+	mkdirOrFatal(t, dir)
+	if err := os.Symlink(dir, filepath.Join(base, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := OpenOutput(filepath.Join(base, "link")); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("a link as the output directory: %v, want a refusal", err)
+	}
+	writeOrFatal(t, filepath.Join(base, "file"), []byte("f"))
+	if _, err := OpenOutput(filepath.Join(base, "file")); err == nil {
+		t.Error("a file as the output directory was opened")
+	}
+	o, err := OpenOutput(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Remove(nil); err != nil {
+		t.Errorf("remove after nothing was written: %v", err)
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		t.Errorf("the output directory that was there is gone: %v", err)
 	}
 }
 
@@ -153,7 +178,7 @@ func TestOverwriteReplacesFileAndMode(t *testing.T) {
 	if err := os.Chmod(old, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := WriteFile(out, "secret.txt", 0o600, strings.NewReader("new"), 100, true, nil); err != nil {
+	if _, _, err := writeOne(out, "secret.txt", 0o600, strings.NewReader("new"), 100, true); err != nil {
 		t.Fatal(err)
 	}
 	assertPrivateFile(t, old, "new")
@@ -180,7 +205,7 @@ func TestOverwriteReplacesFileAndMode(t *testing.T) {
 	if err := os.Symlink("other.txt", old); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if _, _, err := WriteFile(out, "secret.txt", 0o600, strings.NewReader("newest"), 100, true, nil); err != nil {
+	if _, _, err := writeOne(out, "secret.txt", 0o600, strings.NewReader("newest"), 100, true); err != nil {
 		t.Fatal(err)
 	}
 	assertPrivateFile(t, old, "newest")

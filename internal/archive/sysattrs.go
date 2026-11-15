@@ -3,11 +3,6 @@
 
 package archive
 
-import (
-	"os"
-	"time"
-)
-
 // sysFileInfo is the per-file metadata we need beyond what os.FileInfo
 // exposes portably: owner uid/gid for tar headers, and (dev, ino) for hard
 // link detection. Fields are -1 / 0 when unavailable on the host platform
@@ -36,19 +31,8 @@ func (s sysFileInfo) hardLinkKey() (key [2]uint64, ok bool) {
 // Platform-specific functions: see sysattrs_unix.go and sysattrs_windows.go.
 //
 //   sysStat(info)           : pull uid/gid/dev/ino/nlink out of os.FileInfo.Sys()
-//   readXattrs(path)        : list+get xattrs on the leaf file (Llistxattr)
-//   writeXattr(path, k, v)  : Lsetxattr-style write (does not follow symlinks)
-//   lchtimes(path, mtime)   : set mtime without following symlinks
-//   lchown(path, uid, gid)  : chown without following symlinks (best-effort)
+//   readXattrs(path)        : list+get xattrs on the leaf file (Llistxattr), for archiving
+//   setXattr(f, k, v)       : set one xattr through an open file's descriptor
+//   setOwner(f, uid, gid)   : chown through an open file's descriptor (best-effort)
 //
 // Windows builds compile to no-ops where the concept doesn't exist.
-
-var (
-	_ = readXattrs
-	_ = writeXattr
-	_ = lchtimes
-	_ = lchown
-	_ = sysStat
-	_ time.Time
-	_ os.FileInfo
-)

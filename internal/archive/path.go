@@ -12,10 +12,11 @@ import (
 // The link string itself is stored verbatim: including absolute paths and
 // "../" segments: so the original filesystem state round-trips faithfully.
 //
-// The extractor relies on a separate guarantee for safety: every regular
-// file write goes through ensureInsideDir + O_NOFOLLOW, so even if a symlink
-// resolves outside the extraction root, no subsequent write can escape
-// through it. The link itself is just an inode pointing at a string.
+// The extractor relies on a separate guarantee for safety: every name it
+// writes resolves inside the output directory's os.Root (Output), and no
+// entry is created through a link, so even if a symlink resolves outside
+// the extraction root, no subsequent write can escape through it. The link
+// itself is just an inode pointing at a string.
 func validateSymlinkTarget(linkname string) error {
 	if linkname == "" {
 		return fmt.Errorf("symlink target is empty")

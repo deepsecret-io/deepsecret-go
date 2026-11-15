@@ -129,3 +129,38 @@ func TestCheckDestination(t *testing.T) {
 		t.Fatalf("a destination under a read-only directory: %v", err)
 	}
 }
+
+// CheckDestination refuses a link at the destination itself, as WriteFiles
+// does, so a decrypt into one stops before anything is downloaded. A link
+// above the destination is followed, as it is when writing (/tmp is one on
+// macOS).
+func TestCheckDestinationRefusesALinkAtTheDestination(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("creating a symlink needs a privilege this account lacks: %v", err)
+	}
+	dangling := filepath.Join(base, "dangling")
+	if err := os.Symlink(filepath.Join(base, "missing"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	files := []secrets.FileMeta{{Name: "c.txt", Size: 1}}
+	for _, dir := range []string{link, dangling} {
+		if err := secrets.CheckDestination(dir, files, false); err == nil || !strings.Contains(err.Error(), "a link to one is refused") {
+			t.Errorf("CheckDestination(%s): %v, want the link refused", dir, err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(base, "missing")); !os.IsNotExist(err) {
+		t.Errorf("the dangling link's target: %v, want it not created", err)
+	}
+	if entries, err := os.ReadDir(target); err != nil || len(entries) != 0 {
+		t.Errorf("the link's target holds %v, %v", entries, err)
+	}
+	if err := secrets.CheckDestination(filepath.Join(link, "new"), files, false); err != nil {
+		t.Errorf("a destination under a link: %v", err)
+	}
+}

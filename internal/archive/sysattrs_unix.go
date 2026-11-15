@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"syscall"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,37 +62,27 @@ func readXattrs(path string) (map[string]string, error) {
 	return out, nil
 }
 
-// writeXattr applies a single xattr to path without following symlinks.
-// Errors are returned to the caller, which decides whether to log or fail.
-// In practice xattr writes can fail because:
+// setXattr sets one extended attribute on the open file f, through its
+// descriptor. Errors are returned to the caller, which decides whether to
+// log or fail. In practice xattr writes can fail because:
 //   - destination FS doesn't support them (ENOTSUP)
 //   - cross-platform names (com.apple.* on Linux) are rejected
 //   - missing capabilities (security.* needs CAP_SYS_ADMIN)
 //
 // Callers should treat per-xattr errors as warnings, not fatal.
-func writeXattr(path, name, value string) error {
-	return unix.Lsetxattr(path, name, []byte(value), 0)
+func setXattr(f *os.File, name, value string) error {
+	return unix.Fsetxattr(int(f.Fd()), name, []byte(value), 0) // #nosec G115 -- a file descriptor fits in an int.
 }
 
-// lchtimes sets mtime (and atime to the same value) on a path without
-// following symlinks. macOS, Linux, *BSD all support AT_SYMLINK_NOFOLLOW
-// on utimensat/UtimesNanoAt.
-func lchtimes(path string, mtime time.Time) error {
-	ts := []unix.Timespec{
-		unix.NsecToTimespec(mtime.UnixNano()),
-		unix.NsecToTimespec(mtime.UnixNano()),
-	}
-	return unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW)
-}
-
-// lchown chowns a path without following symlinks. Best-effort: most
-// non-root callers can only chown to their own uid/gid, and cross-machine
-// uid/gid mappings rarely line up. Caller treats failures as soft.
-func lchown(path string, uid, gid int) error {
+// setOwner sets the owner and group of the open file f, through its
+// descriptor. Best-effort: most non-root callers can only chown to their
+// own uid/gid, and cross-machine uid/gid mappings rarely line up. Caller
+// treats failures as soft.
+func setOwner(f *os.File, uid, gid int) error {
 	if uid < 0 || gid < 0 {
 		return nil
 	}
-	return os.Lchown(path, uid, gid)
+	return f.Chown(uid, gid)
 }
 
 // parseNullList splits a NUL-terminated buffer (the format Llistxattr

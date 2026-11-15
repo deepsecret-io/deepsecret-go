@@ -52,7 +52,7 @@ func TestTotalSizeLimitDoesNotOverflow(t *testing.T) {
 // overflowing the one-byte-past-the-limit probe and writing nothing.
 func TestWriteFileWithLargestLimit(t *testing.T) {
 	dir := t.TempDir()
-	path, n, err := WriteFile(dir, "a.txt", 0o600, strings.NewReader("hello"), math.MaxInt64, false, nil)
+	path, n, err := writeOne(dir, "a.txt", 0o600, strings.NewReader("hello"), math.MaxInt64, false)
 	if err != nil {
 		t.Fatal(err)
 	}

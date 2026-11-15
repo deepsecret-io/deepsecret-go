@@ -104,11 +104,12 @@ func ExpandPaths(paths []string, skipHidden bool) ([]ExpandedFile, error) {
 				}
 
 				// Symlinks: capture the link string verbatim, regardless of
-				// where it points. The extractor validates each subsequent
-				// write through ensureInsideDir, so a symlink pointing
-				// outside the extraction root cannot be used to escape: it
-				// just becomes a (possibly dangling) link on the recipient's
-				// disk. Symlinked directories are never traversed.
+				// where it points. The extractor resolves every name inside
+				// the output directory (Output) and never writes through a
+				// link, so a symlink pointing outside the extraction root
+				// cannot be used to escape: it just becomes a (possibly
+				// dangling) link on the recipient's disk. Symlinked
+				// directories are never traversed.
 				if d.Type()&os.ModeSymlink != 0 {
 					target, lerr := os.Readlink(path)
 					if lerr != nil {

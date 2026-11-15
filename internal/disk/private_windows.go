@@ -10,9 +10,10 @@ package disk
 // owned by this user, with a protected DACL (nothing inherited from the
 // folder above) that grants this user full control and nobody else
 // anything. A folder's entry is inheritable, so what other code creates in
-// it is private too. The descriptor goes to CreateFile and CreateDirectory,
-// never on afterwards: another user could open the file in the moment
-// between creating it and fixing its ACL, and keep that handle.
+// it is private too. The descriptor goes to CreateFile, CreateDirectory
+// and NtCreateFile (root_windows.go), never on afterwards: another user
+// could open the file in the moment between creating it and fixing its
+// ACL, and keep that handle.
 //
 // The CLI (github.com/deepsecret-io/cli) holds the same code in
 // internal/safefile: change both.
@@ -63,12 +64,14 @@ func privateAttrs(folder bool) (*windows.SecurityAttributes, error) {
 	return sa, nil
 }
 
-// CreateNew creates path, which must not exist, for writing, private to
+// createNew creates path, which must not exist, for writing, private to
 // this user whatever mode says; a mode without the owner's write bit makes
 // it read-only, as os.OpenFile does. FILE_FLAG_OPEN_REPARSE_POINT makes it
 // refuse a link at path instead of creating the file the link points at;
-// folders above path are still followed.
-func CreateNew(path string, mode os.FileMode) (*os.File, error) {
+// folders above path are still followed. Decrypted files are written with
+// CreateIn instead (root_windows.go), which follows nothing outside its
+// root.
+func createNew(path string, mode os.FileMode) (*os.File, error) {
 	sa, err := privateAttrs(false)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
@@ -104,7 +107,7 @@ func CreateTemp(dir, pattern string) (*os.File, error) {
 		prefix, suffix = pattern[:i], pattern[i+1:]
 	}
 	for range 10 {
-		f, err := CreateNew(filepath.Join(dir, prefix+rand.Text()+suffix), 0o600)
+		f, err := createNew(filepath.Join(dir, prefix+rand.Text()+suffix), 0o600)
 		if !errors.Is(err, os.ErrExist) {
 			return f, err
 		}

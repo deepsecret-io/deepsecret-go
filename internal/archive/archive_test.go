@@ -406,8 +406,8 @@ func TestExtractTar_RejectsPathTraversal(t *testing.T) {
 
 func TestExtractTar_PreservesAbsoluteSymlinkTarget(t *testing.T) {
 	// Absolute symlink targets are stored verbatim: the link is just a
-	// string in the inode. ensureInsideDir + O_NOFOLLOW prevent any actual
-	// write from escaping through the link.
+	// string in the inode. The output root and the walk that refuses links
+	// on the way prevent any actual write from escaping through the link.
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	tw.WriteHeader(&tar.Header{
@@ -435,7 +435,7 @@ func TestExtractTar_BlocksWriteThroughEscapingSymlink(t *testing.T) {
 	// A symlink with an escaping target is fine on its own; the safety
 	// guarantee is that subsequent writes can't go *through* it. Here we
 	// create the link and then try to write a file at link/escaped.txt;
-	// ensureInsideDir must reject the write.
+	// the write must be rejected.
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	tw.WriteHeader(&tar.Header{
@@ -1450,8 +1450,16 @@ func TestExtractTar_RoundTripsXattrs(t *testing.T) {
 	}
 	// Try to set a user-namespace xattr; bail out if the FS doesn't
 	// support them (some CI tmpfs / overlayfs setups don't).
-	if err := writeXattr(srcFile, "user.ds_test", "v1"); err != nil {
-		t.Skipf("filesystem does not support user xattrs: %v", err)
+	tagged, err := os.OpenFile(srcFile, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xerr := setXattr(tagged, "user.ds_test", "v1")
+	if err := tagged.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if xerr != nil {
+		t.Skipf("filesystem does not support user xattrs: %v", xerr)
 	}
 
 	files, err := ExpandPaths([]string{srcFile}, false)

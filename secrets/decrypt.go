@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -588,13 +589,17 @@ func (w WriteOptions) limits() (payload.DecodeLimits, *archive.Limits) {
 }
 
 // CheckDestination checks, before a download, that the files of a pending
-// one (UpcomingDownload.Files) can be written into dir: dir, or the nearest
-// directory above it that exists, accepts new files; none of the files
-// exists there already unless overwrite; and the disk holds them. The list
-// comes from the server and is only a prediction: a name that is not a
-// safe relative path is skipped here, and WriteFiles checks the payload's
-// own names again before writing anything.
+// one (UpcomingDownload.Files) can be written into dir: dir is not a link
+// (WriteFiles refuses one); dir, or the nearest directory above it that
+// exists, accepts new files; none of the files exists there already unless
+// overwrite; and the disk holds them. The list comes from the server and is
+// only a prediction: a name that is not a safe relative path is skipped
+// here, and WriteFiles checks the payload's own names again before writing
+// anything.
 func CheckDestination(dir string, files []FileMeta, overwrite bool) error {
+	if err := archive.CheckOutputDir(dir); err != nil {
+		return err
+	}
 	if err := checkWritable(dir); err != nil {
 		return err
 	}
@@ -605,7 +610,7 @@ func CheckDestination(dir string, files []FileMeta, overwrite bool) error {
 		if err != nil {
 			continue
 		}
-		if err := checkDestination(dir, name, overwrite); err != nil {
+		if err := checkDestination(lstatIn(dir), dir, name, overwrite); err != nil {
 			return err
 		}
 	}
@@ -649,30 +654,42 @@ func checkWritable(dir string) error {
 // checkDestination refuses a payload entry that could not be written under
 // dir: a parent that exists but is not a directory, a destination that
 // exists unless overwrite, or any lookup that fails for another reason
-// than not existing.
-func checkDestination(dir, name string, overwrite bool) error {
+// than not existing. lstat looks a path relative to dir up without
+// following a link at it: lstatIn(dir) by path before a download, or
+// through the opened output directory (archive.Output.Lstat) before a
+// write.
+func checkDestination(lstat func(string) (os.FileInfo, error), dir, name string, overwrite bool) error {
 	parts := strings.Split(name, "/")
-	path := dir
+	rel := ""
 	for i, part := range parts {
-		path = filepath.Join(path, part)
-		info, err := os.Lstat(path)
+		rel = path.Join(rel, part)
+		info, err := lstat(rel)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
+		at := filepath.Join(dir, filepath.FromSlash(rel))
 		if err != nil {
-			return fmt.Errorf("check destination %s: %w", path, err)
+			return fmt.Errorf("check destination %s: %w", at, err)
 		}
 		if i < len(parts)-1 {
 			if !info.IsDir() {
-				return fmt.Errorf("cannot write %s: %s is not a directory", filepath.Join(dir, filepath.FromSlash(name)), path)
+				return fmt.Errorf("cannot write %s: %s is not a directory", filepath.Join(dir, filepath.FromSlash(name)), at)
 			}
 			continue
 		}
 		if !overwrite {
-			return fmt.Errorf("destination already exists: %s (allow overwriting to replace it)", path)
+			return fmt.Errorf("destination already exists: %s (allow overwriting to replace it)", at)
 		}
 	}
 	return nil
+}
+
+// lstatIn looks a slash-separated path relative to dir up, by path,
+// without following a link at it.
+func lstatIn(dir string) func(string) (os.FileInfo, error) {
+	return func(rel string) (os.FileInfo, error) {
+		return os.Lstat(filepath.Join(dir, filepath.FromSlash(rel)))
+	}
 }
 
 // WrittenFile is one file WriteFiles wrote.
@@ -695,19 +712,43 @@ type WriteResult struct {
 // there, in constant memory. It decrypts the verified ciphertext once to
 // check the whole payload (structure, names, sizes, SHA-256 of every file,
 // and an archive's entries), and only then again to write, so a payload
-// that fails a check writes nothing. Names are portable relative paths and
+// that fails a check leaves nothing behind. Names are portable relative paths and
 // every write stays inside dir; existing files are not replaced unless
 // w.Overwrite is set. When writing fails midway, or the second decryption differs
 // from the first, everything it created is removed, files it overwrote
 // among them; what was there before stays.
+//
+// dir is opened once, before anything is decrypted, and created with any
+// missing folders above it when it is not there (private to this user).
+// It must be a real directory, not a link to one. Every check and write
+// after that goes through the opened directory (archive.Output), so no
+// file, link or folder is written outside it, even when another account
+// swaps dir, or a folder inside it, for a link while the write runs.
 func (o *OpenedSecret) WriteFiles(ctx context.Context, dir string, w WriteOptions) (*WriteResult, error) {
-	m := o.opened.Manifest
-	if m.PayloadType != "files" {
-		return nil, fmt.Errorf("the payload is %s, not files: decrypt it with Payload", m.PayloadType)
+	if pt := o.opened.Manifest.PayloadType; pt != "files" {
+		return nil, fmt.Errorf("the payload is %s, not files: decrypt it with Payload", pt)
 	}
+	out, err := archive.OpenOutput(dir)
+	if err != nil {
+		return nil, err
+	}
+	result, err := o.writeFiles(ctx, out, dir, w)
+	if err != nil {
+		return nil, out.Remove(err)
+	}
+	// Everything is written; closing a directory handle loses nothing.
+	_ = out.Close()
+	return result, nil
+}
+
+// writeFiles is WriteFiles into out, the opened dir. What it creates stays
+// in out's record when it fails, for the caller to remove.
+func (o *OpenedSecret) writeFiles(ctx context.Context, out *archive.Output, dir string, w WriteOptions) (*WriteResult, error) {
+	m := o.opened.Manifest
 	decLim, tarLim := w.limits()
 
-	// Pass 1: check the payload, writing nothing.
+	// Pass 1: check the payload. Nothing is written yet, but for out
+	// itself when OpenOutput made it.
 	tCheck := time.Now()
 	var info *payload.Files
 	if err := o.pass(ctx, DecryptChecking, func(r io.Reader) error {
@@ -756,27 +797,20 @@ func (o *OpenedSecret) WriteFiles(ctx context.Context, dir string, w WriteOption
 		return nil, err
 	}
 	for _, name := range names {
-		if err := checkDestination(dir, name, w.Overwrite); err != nil {
+		if err := checkDestination(out.Lstat, dir, name, w.Overwrite); err != nil {
 			return nil, err
 		}
 	}
 	logattr.Module(o.log, "decrypt").Debug("payload checked", "archived", info.Archive, "files", len(names), "size", logattr.Bytes(total),
 		"elapsed", time.Since(tCheck).Round(time.Millisecond))
 
-	// Directories made to hold decrypted files are private. undo records
-	// what the write creates, so a failure removes all of it.
-	var undo archive.Undo
-	if err := undo.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create output directory: %w", err)
-	}
-
-	// Pass 2: write.
+	// Pass 2: write. Folders made to hold decrypted files are private.
 	tWrite := time.Now()
 	result := &WriteResult{Archived: info.Archive, Size: total}
 	err := o.pass(ctx, DecryptWriting, func(r io.Reader) error {
-		out, err := payload.DecodeFiles(r, decLim, func(idx int, size int64, data io.Reader) error {
+		decoded, err := payload.DecodeFiles(r, decLim, func(idx int, size int64, data io.Reader) error {
 			if info.Archive {
-				n, err := archive.ExtractTarReaderInto(data, dir, archiveAlgo, tarLim, &undo)
+				n, err := out.ExtractTar(data, archiveAlgo, tarLim)
 				result.Extracted = n
 				return err
 			}
@@ -785,32 +819,32 @@ func (o *OpenedSecret) WriteFiles(ctx context.Context, dir string, w WriteOption
 			if mode == 0 {
 				mode = 0o600
 			}
-			path, _, err := archive.WriteFile(dir, f.Name, mode, data, size, w.Overwrite, &undo)
+			at, _, err := out.WriteFile(f.Name, mode, data, size, w.Overwrite)
 			if err != nil {
 				return err
 			}
-			result.Files = append(result.Files, WrittenFile{Path: path, Name: f.Name, Size: f.Size, SHA256: f.SHA256})
+			result.Files = append(result.Files, WrittenFile{Path: at, Name: f.Name, Size: f.Size, SHA256: f.SHA256})
 			return nil
 		})
 		if err != nil {
 			return err
 		}
 		// The second decryption must read exactly what the first checked.
-		if len(out.Files) != len(info.Files) {
+		if len(decoded.Files) != len(info.Files) {
 			return fmt.Errorf("the payload changed between passes")
 		}
-		for i := range out.Files {
-			if out.Files[i] != info.Files[i] {
+		for i := range decoded.Files {
+			if decoded.Files[i] != info.Files[i] {
 				return fmt.Errorf("the payload changed between passes")
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, undo.Remove(fmt.Errorf("write files: %w", err))
+		return nil, fmt.Errorf("write files: %w", err)
 	}
 	if err := o.decrypted(); err != nil {
-		return nil, undo.Remove(err)
+		return nil, err
 	}
 	o.spool.keep = false // decrypted: a kept download has done its job
 	written := []any{"archived", info.Archive}

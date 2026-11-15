@@ -22,9 +22,10 @@ type Limits struct {
 	MaxTotalSize int64
 
 	// AllowOverwrite permits extraction to replace existing files. Default
-	// (false) rejects writes to a destination that already exists; symlink
-	// hardening (O_NOFOLLOW on Unix) is always enforced regardless of this
-	// flag. Set true when the caller intentionally wants to clobber.
+	// (false) rejects writes to a destination that already exists. Either
+	// way nothing is written through a link (see Output): with this flag a
+	// link at a file's name is replaced, never followed. Set true when the
+	// caller intentionally wants to clobber.
 	AllowOverwrite bool
 
 	// MaxNameLen bounds one entry's path, and MaxNameBytes all entries'
@@ -37,9 +38,10 @@ type Limits struct {
 	// permission bits are private either way (privatePerm).
 	KeepSpecialModes bool
 
-	// KeepOwnership restores each entry's owner and group from the
-	// archive, which takes effect when extracting as root. By default
-	// entries belong to whoever extracts them.
+	// KeepOwnership restores each file's and directory's owner and group
+	// from the archive, which takes effect when extracting as root. By
+	// default entries belong to whoever extracts them; symlinks always do
+	// (see Output.ExtractTar).
 	KeepOwnership bool
 }
 

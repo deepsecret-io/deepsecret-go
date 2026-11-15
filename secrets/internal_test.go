@@ -122,16 +122,16 @@ func TestWriteChecks(t *testing.T) {
 	}
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, "file"), []byte("x"), 0o600)
-	if err := checkDestination(dir, "file/inner", false); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+	if err := checkDestination(lstatIn(dir), dir, "file/inner", false); err == nil || !strings.Contains(err.Error(), "is not a directory") {
 		t.Fatalf("under a file: %v", err)
 	}
-	if err := checkDestination(dir, "file", false); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if err := checkDestination(lstatIn(dir), dir, "file", false); err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("existing: %v", err)
 	}
-	if err := checkDestination(dir, "file", true); err != nil {
+	if err := checkDestination(lstatIn(dir), dir, "file", true); err != nil {
 		t.Fatalf("existing with overwrite: %v", err)
 	}
-	if err := checkDestination(dir, "new/dir/f", false); err != nil {
+	if err := checkDestination(lstatIn(dir), dir, "new/dir/f", false); err != nil {
 		t.Fatalf("new path: %v", err)
 	}
 }

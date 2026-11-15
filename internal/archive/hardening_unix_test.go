@@ -120,7 +120,7 @@ func TestWriteFileCreatesPrivateFiles(t *testing.T) {
 		"setuid":      {0o777 | os.ModeSetuid, 0o700},
 		"sub/dir-bit": {0o644 | os.ModeDir, 0o600},
 	} {
-		path, _, err := WriteFile(out, name, tc.mode, strings.NewReader("x"), 1, false, nil)
+		path, _, err := writeOne(out, name, tc.mode, strings.NewReader("x"), 1, false)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -129,7 +129,7 @@ func TestWriteFileCreatesPrivateFiles(t *testing.T) {
 	if err := os.Chmod(filepath.Join(out, "shared.txt"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := WriteFile(out, "shared.txt", 0o666, strings.NewReader("y"), 1, true, nil); err != nil {
+	if _, _, err := writeOne(out, "shared.txt", 0o666, strings.NewReader("y"), 1, true); err != nil {
 		t.Fatal(err)
 	}
 	want[filepath.Join(out, "sub")] = 0o700
@@ -144,7 +144,7 @@ func TestExtractTarCreatesPrivateDirectories(t *testing.T) {
 	if _, err := ExtractTar(data, out, compress.None, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := WriteFile(out, "other/file.txt", 0o600, strings.NewReader("o"), 1, false, nil); err != nil {
+	if _, _, err := writeOne(out, "other/file.txt", 0o600, strings.NewReader("o"), 1, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, dir := range []string{out, filepath.Join(out, "sub"), filepath.Join(out, "other")} {
@@ -189,7 +189,7 @@ func TestWriteFileReportsFileLeftBehind(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(sub, 0o700) })
 	r := &leftoverReader{dir: sub, data: strings.NewReader("too long")}
-	_, _, err := WriteFile(out, "sub/a.txt", 0o600, r, 3, false, nil)
+	_, _, err := writeOne(out, "sub/a.txt", 0o600, r, 3, false)
 	if err == nil || !strings.Contains(err.Error(), "size limit") || !strings.Contains(err.Error(), "left behind") {
 		t.Errorf("write: %v, want the size error and the file left behind", err)
 	}

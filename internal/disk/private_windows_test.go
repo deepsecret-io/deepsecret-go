@@ -79,7 +79,7 @@ func TestCreatedFilesArePrivate(t *testing.T) {
 	}
 
 	path := filepath.Join(dir, "entry.txt")
-	f, err := CreateNew(path, 0o644)
+	f, err := createNew(path, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +90,8 @@ func TestCreatedFilesArePrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	disktest.AssertPrivate(t, path)
-	if _, err := CreateNew(path, 0o600); !os.IsExist(err) {
-		t.Errorf("CreateNew of a file already there: %v, want exist", err)
+	if _, err := createNew(path, 0o600); !os.IsExist(err) {
+		t.Errorf("createNew of a file already there: %v, want exist", err)
 	}
 	if data, err := ReadPrivate(path); err != nil || string(data) != "plaintext" {
 		t.Errorf("ReadPrivate: %q, %v", data, err)
@@ -114,7 +114,7 @@ func TestCreatedFilesArePrivate(t *testing.T) {
 	disktest.AssertPrivate(t, path+".renamed")
 
 	readOnly := filepath.Join(dir, "read-only.txt")
-	f, err = CreateNew(readOnly, 0o444)
+	f, err = createNew(readOnly, 0o444)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestCreatedFilesArePrivate(t *testing.T) {
 func TestOthersMayOpenIsRefused(t *testing.T) {
 	base := t.TempDir()
 	path := filepath.Join(base, "key.json")
-	f, err := CreateNew(path, 0o600)
+	f, err := createNew(path, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,14 +178,14 @@ func TestOthersMayOpenIsRefused(t *testing.T) {
 	if err := CheckPrivateDir(link); err == nil {
 		t.Error("a symlink to a private folder was accepted")
 	}
-	// CreateNew refuses a link at its path rather than create its target.
+	// createNew refuses a link at its path rather than create its target.
 	target := filepath.Join(base, "target.txt")
 	fileLink := filepath.Join(base, "file-link")
 	if err := os.Symlink(target, fileLink); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CreateNew(fileLink, 0o600); !os.IsExist(err) {
-		t.Errorf("CreateNew through a dangling link: %v, want exist", err)
+	if _, err := createNew(fileLink, 0o600); !os.IsExist(err) {
+		t.Errorf("createNew through a dangling link: %v, want exist", err)
 	}
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {
 		t.Errorf("the link's target was created: %v", err)
@@ -196,7 +196,7 @@ func TestOthersMayOpenIsRefused(t *testing.T) {
 // opened before the file's ACL was fixed.
 func TestReadPrivateRefusesAFileOpenForWriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "key.json")
-	f, err := CreateNew(path, 0o600)
+	f, err := createNew(path, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
