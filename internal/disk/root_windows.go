@@ -127,8 +127,9 @@ func openParent(root *os.Root, name string) (*os.File, string, error) {
 // keptAsWritten reports whether leaf, one part of a name, is one Windows
 // keeps as it is written, the way os.Root reads it: not empty, "." or
 // "..", no separator, no colon (which names a stream of another file), no
-// reserved device name such as NUL, and no trailing dot or space, which
-// the Win32 layer strips.
+// device name such as NUL (filepath.IsLocal asks this Windows, so NUL.txt
+// is refused before Windows 11 and is a plain file name since), and no
+// trailing dot or space, which the Win32 layer strips.
 func keptAsWritten(leaf string) bool {
 	return leaf != "" && leaf != "." && leaf != ".." && filepath.IsLocal(leaf) &&
 		!strings.ContainsAny(leaf, `/\:`) && !strings.HasSuffix(leaf, ".") && !strings.HasSuffix(leaf, " ")

@@ -83,14 +83,16 @@ func TestCreateInIsPrivate(t *testing.T) {
 
 // A name Windows would not keep as written is refused: a stream of
 // another file, a device, or a trailing dot or space the Win32 layer
-// strips, which os.Root would read as another name.
+// strips, which os.Root would read as another name. (A device name with
+// an extension, such as COM1.txt, is a plain file name since Windows 11,
+// so whether it is refused depends on the Windows the test runs on.)
 func TestCreateInRefusesNamesWindowsRewrites(t *testing.T) {
 	dir := t.TempDir()
 	root := openRoot(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"a.txt:stream", "NUL", "COM1.txt", "dot.", "space ", `..\escape`} {
+	for _, name := range []string{"a.txt:stream", "NUL", "COM1", "con", "dot.", "space ", `..\escape`} {
 		if f, err := CreateIn(root, name, 0o600); err == nil {
 			f.Close()
 			t.Errorf("CreateIn(%q) succeeded", name)
