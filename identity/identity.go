@@ -19,7 +19,7 @@ import (
 	"github.com/deepsecret-io/deepsecret-go/keystore"
 )
 
-// Client reaches the caller's account, org and groups, and the keys registered
+// Client reaches the caller's account, org and teams, and the keys registered
 // on the server. Get one from deepsecret.NewClient, as its Identity field.
 type Client struct {
 	api     *transport.Client
@@ -33,13 +33,13 @@ func New(api *transport.Client, store *knownkeys.Store, keysDir string) *Client 
 }
 
 // WhoAmI returns the authenticated user's info and tier limits.
-func (c *Client) WhoAmI(ctx context.Context) (*Actor, error) {
+func (c *Client) WhoAmI(ctx context.Context) (*Member, error) {
 	return whoAmI(ctx, c.api)
 }
 
-// ResolveActorID returns the authenticated user's actor ID.
-func (c *Client) ResolveActorID(ctx context.Context) (string, error) {
-	return resolveActorID(ctx, c.api)
+// ResolveMemberID returns the signed-in member's ID.
+func (c *Client) ResolveMemberID(ctx context.Context) (string, error) {
+	return resolveMemberID(ctx, c.api)
 }
 
 // ListKeys returns all identity keys registered on the server.
@@ -126,28 +126,29 @@ func (c *Client) DeleteKey(ctx context.Context, identityID string) error {
 	return deleteKey(ctx, c.api, identityID)
 }
 
-// ListGroups returns all groups in the given org with their members. Only
+// ListTeams returns all teams in the given org with their members. Only
 // the org's owner and admins may list them; WhoAmI reports this as the
-// "groups" permission.
-func (c *Client) ListGroups(ctx context.Context, orgID string) ([]Group, error) {
-	return listGroups(ctx, c.api, "/groups", orgID)
+// "teams" permission.
+func (c *Client) ListTeams(ctx context.Context, orgID string) ([]Team, error) {
+	return listTeams(ctx, c.api, "/teams", orgID)
 }
 
-// ListMyGroups returns the groups of the given org that the caller belongs
+// ListMyTeams returns the teams of the given org that the caller belongs
 // to, with their members, to send to. Any active member may call it. A
 // member's Role is always empty here.
-func (c *Client) ListMyGroups(ctx context.Context, orgID string) ([]Group, error) {
-	return listGroups(ctx, c.api, "/my-groups", orgID)
+func (c *Client) ListMyTeams(ctx context.Context, orgID string) ([]Team, error) {
+	return listTeams(ctx, c.api, "/my-teams", orgID)
 }
 
-// Membership is the single org membership pulled from /api/me. An actor
-// belongs to at most one org, so this is a pointer (nil when the actor is in
+// Membership is the single org membership pulled from /api/me. A member
+// belongs to at most one org, so this is a pointer (nil when the member is in
 // ONBOARDING).
 type Membership struct {
 	OrgID string `json:"org_id"`
-	Role  string `json:"role"`
+	// Role is "owner", "admin" or "member".
+	Role string `json:"role"`
 	// OrgKind is "personal" for a one-person workspace, which has no
-	// members, groups or audit log, or "organization".
+	// members, teams or audit log, or "organization".
 	OrgKind string `json:"org_kind"`
 }
 
@@ -177,23 +178,23 @@ type Profile struct {
 	Name  string `json:"name"`
 }
 
-// Actor bundles everything whoAmI returns: the raw /api/me payload
+// Member bundles everything whoAmI returns: the raw /api/me payload
 // plus a few flat fields derived from a follow-up /api/v1/orgs call so
 // callers don't have to thread two requests through their own code.
 //
-// EffectiveState says whether the actor is active. The plan's limits are not
+// EffectiveState says whether the member is active. The plan's limits are not
 // here: the server enforces them, and callers that want them fetch
 // /api/v1/tiers.
-type Actor struct {
-	Profile        Profile         `json:"actor"`
+type Member struct {
+	Profile        Profile         `json:"member"`
 	Membership     *Membership     `json:"membership"`
 	EffectiveState string          `json:"effective_state"`
 	Permissions    map[string]bool `json:"permissions"`
 	Subscription   Subscription    `json:"subscription"`
 
 	// Flat conveniences populated post-parse so existing call sites
-	// (encrypt.go, the CLI, examples) keep reading actor.OrgID etc.
-	// without traversing the new nested shape. Empty when the actor
+	// (encrypt.go, the CLI, examples) keep reading member.OrgID etc.
+	// without traversing the new nested shape. Empty when the member
 	// has no membership.
 	ID                 string `json:"-"`
 	Email              string `json:"-"`
@@ -215,14 +216,14 @@ type Key struct {
 	SecurityKey bool `json:"security_key"`
 }
 
-// whoAmI returns the authenticated user's info. Hits /api/v1/actors/me
+// whoAmI returns the authenticated user's info. Hits /api/v1/members/me
 // for the canonical authz state and, at the same time, /api/v1/orgs to
 // populate the flat TierName field (the spec moved tier display info off
-// the actor row to the org response, and old SDK consumers expect it on
-// Actor). The two requests run together, so whoAmI takes one round
+// the member row to the org response, and old SDK consumers expect it on
+// Member). The two requests run together, so whoAmI takes one round
 // trip. The /orgs call is best-effort: a failure leaves TierName empty
 // rather than failing the whole call.
-func whoAmI(ctx context.Context, c *transport.Client) (*Actor, error) {
+func whoAmI(ctx context.Context, c *transport.Client) (*Member, error) {
 	var (
 		orgResp *transport.Response
 		orgErr  error
@@ -232,13 +233,13 @@ func whoAmI(ctx context.Context, c *transport.Client) (*Actor, error) {
 		defer close(orgDone)
 		orgResp, orgErr = c.Get(ctx, "/api/v1/orgs")
 	}()
-	info, err := actorMe(ctx, c)
+	info, err := memberMe(ctx, c)
 	<-orgDone
 	if err != nil {
 		return nil, err
 	}
 
-	// Best-effort tier-name lookup. /api/v1/orgs returns the actor's
+	// Best-effort tier-name lookup. /api/v1/orgs returns the member's
 	// org with tier_name on it; if the call fails (no membership,
 	// permissions issue, network), we just leave TierName empty.
 	if info.OrgID != "" && orgErr == nil {
@@ -258,16 +259,16 @@ func whoAmI(ctx context.Context, c *transport.Client) (*Actor, error) {
 	return info, nil
 }
 
-// actorMe fetches /api/v1/actors/me alone and fills the flat fields that
+// memberMe fetches /api/v1/members/me alone and fills the flat fields that
 // come from it (all but TierName).
-func actorMe(ctx context.Context, c *transport.Client) (*Actor, error) {
-	resp, err := c.Get(ctx, "/api/v1/actors/me")
+func memberMe(ctx context.Context, c *transport.Client) (*Member, error) {
+	resp, err := c.Get(ctx, "/api/v1/members/me")
 	if err != nil {
 		return nil, err
 	}
-	var info Actor
+	var info Member
 	if err := json.Unmarshal(resp.Data, &info); err != nil {
-		return nil, fmt.Errorf("parse actor: %w", err)
+		return nil, fmt.Errorf("parse member: %w", err)
 	}
 	info.ID = info.Profile.ID
 	info.Email = info.Profile.Email
@@ -299,9 +300,9 @@ func listRemoteKeys(ctx context.Context, c *transport.Client) ([]Key, error) {
 var ErrKMSAccountMismatch = errors.New("the key pair's AWS KMS protection is bound to another DeepSecret account")
 
 // checkKMSAccount refuses a key pair whose key file here is protected by KMS
-// keys bound to an account other than actorID: its encryption context names
+// keys bound to an account other than memberID: its encryption context names
 // that account, so the key policies written for it would not match.
-func checkKMSAccount(dir, fp, actorID string) error {
+func checkKMSAccount(dir, fp, memberID string) error {
 	info, err := keystore.ReadInfo(dir, fp)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -314,8 +315,8 @@ func checkKMSAccount(dir, fp, actorID string) error {
 		return nil
 	}
 	for _, s := range info.Slots {
-		if s.Account != "" && s.Account != actorID {
-			return fmt.Errorf("%w: key pair %s is bound to account %s, and you are signed in as %s", ErrKMSAccountMismatch, keys.ShortFingerprint(fp), s.Account, actorID)
+		if s.Account != "" && s.Account != memberID {
+			return fmt.Errorf("%w: key pair %s is bound to account %s, and you are signed in as %s", ErrKMSAccountMismatch, keys.ShortFingerprint(fp), s.Account, memberID)
 		}
 	}
 	return nil
@@ -403,11 +404,11 @@ func (c *Client) LoadPrimary(ctx context.Context, u keystore.Unlock) (*keys.Pair
 	return kp, fp, nil
 }
 
-// resolveActorID returns the current authenticated user's actor ID, from
-// /api/v1/actors/me alone: one request, with no tier lookup. An answer
+// resolveMemberID returns the signed-in member's ID, from
+// /api/v1/members/me alone: one request, with no tier lookup. An answer
 // without an ID is an error, so a caller never builds a path from "".
-func resolveActorID(ctx context.Context, c *transport.Client) (string, error) {
-	info, err := actorMe(ctx, c)
+func resolveMemberID(ctx context.Context, c *transport.Client) (string, error) {
+	info, err := memberMe(ctx, c)
 	if err != nil {
 		return "", err
 	}
@@ -417,9 +418,9 @@ func resolveActorID(ctx context.Context, c *transport.Client) (string, error) {
 	return info.ID, nil
 }
 
-// GroupMember holds the email and identifying details of a group member.
-// Role is set by ListGroups only.
-type GroupMember struct {
+// TeamMember holds the email and identifying details of a team member.
+// Role ("owner", "admin" or "member") is set by ListTeams only.
+type TeamMember struct {
 	ID        string `json:"id"`
 	Email     string `json:"email"`
 	FirstName string `json:"first_name"`
@@ -427,24 +428,24 @@ type GroupMember struct {
 	Role      string `json:"role"`
 }
 
-// Group represents an org group with its members.
-type Group struct {
-	ID      string        `json:"id"`
-	Name    string        `json:"name"`
-	OrgID   string        `json:"org_id"`
-	Members []GroupMember `json:"members"`
+// Team represents an org team with its members.
+type Team struct {
+	ID      string       `json:"id"`
+	Name    string       `json:"name"`
+	OrgID   string       `json:"org_id"`
+	Members []TeamMember `json:"members"`
 }
 
-// listGroups returns the groups an org's list endpoint, "/groups" or
-// "/my-groups", gives the caller, with their members.
-func listGroups(ctx context.Context, c *transport.Client, endpoint, orgID string) ([]Group, error) {
+// listTeams returns the teams an org's list endpoint, "/teams" or
+// "/my-teams", gives the caller, with their members.
+func listTeams(ctx context.Context, c *transport.Client, endpoint, orgID string) ([]Team, error) {
 	resp, err := c.Get(ctx, "/api/v1/orgs/"+transport.PathSegment(orgID)+endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("list groups: %w", err)
+		return nil, fmt.Errorf("list teams: %w", err)
 	}
-	var groups []Group
-	if err := json.Unmarshal(resp.Data, &groups); err != nil {
-		return nil, fmt.Errorf("parse groups: %w", err)
+	var teams []Team
+	if err := json.Unmarshal(resp.Data, &teams); err != nil {
+		return nil, fmt.Errorf("parse teams: %w", err)
 	}
-	return groups, nil
+	return teams, nil
 }

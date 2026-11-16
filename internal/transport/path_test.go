@@ -20,7 +20,7 @@ import (
 func TestPathSegment(t *testing.T) {
 	for id, want := range map[string]string{
 		"7da383f1-0000-4000-8000-000000000000": "7da383f1-0000-4000-8000-000000000000",
-		"../../actors/me":                      "..%2F..%2Factors%2Fme",
+		"../../members/me":                     "..%2F..%2Fmembers%2Fme",
 		"a/b":                                  "a%2Fb",
 		"a?x=1":                                "a%3Fx=1",
 		"a#b":                                  "a%23b",
@@ -77,7 +77,7 @@ func TestRefusesPathsThatReachAnotherEndpoint(t *testing.T) {
 		"/api/v1/identities",
 		"/api/v1/secrets/s/revisions",
 		"/api/v1/secrets/s/revisions?to=a/../b&from=",
-		"/api/v1/secrets/..%2F..%2Factors%2Fme",
+		"/api/v1/secrets/..%2F..%2Fmembers%2Fme",
 		"/api/v1/secrets/%252E%252E",
 		"/api/v1/secrets/a..b",
 		"/api/v1/secrets/...",
@@ -106,7 +106,7 @@ func TestTransferPathsKeepIDsInOneSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const id, seg = "../../actors/me", "..%2F..%2Factors%2Fme"
+	const id, seg = "../../members/me", "..%2F..%2Fmembers%2Fme"
 	for _, call := range []struct {
 		path string
 		call func()

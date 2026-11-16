@@ -175,7 +175,7 @@ type EncryptOptions struct {
 	// takes it as given: its ID and email decide whether a recipient is the
 	// sender, and its organization goes into the request, so pass only what
 	// WhoAmI returned. The server still decides who the caller is. Optional.
-	Account *identity.Actor
+	Account *identity.Member
 
 	// OnPhase is called as the send begins each phase: transfer.PhaseEncrypting,
 	// then transfer.PhaseUploading, or transfer.PhaseEncrypting alone with LocalFile. It
@@ -394,7 +394,7 @@ type DecryptResult struct {
 
 // RevokeResult is returned by RevokeRecipient.
 type RevokeResult struct {
-	RecipientID   string // actor id of the revoked recipient
+	RecipientID   string // member id of the revoked recipient
 	Email         string
 	SecretDeleted bool // revoking the last recipient deleted the secret
 }
@@ -452,7 +452,7 @@ type IntegrityInfo struct {
 	KeyFingerprint   string  `json:"key_fingerprint" yaml:"key_fingerprint"` // the sender's
 	// Tri-state trust status returned by the API. Drives the colored
 	// indicator in the CLI / UI:
-	//   "primary"   : fingerprint matches the actor's primary identity
+	//   "primary"   : fingerprint matches the member's primary identity
 	//   "secondary" : fingerprint matches a known non-primary identity
 	//   "invalid"   : fingerprint not found (identity has been deleted)
 	SenderKeyStatus *string `json:"sender_key_status" yaml:"sender_key_status"`

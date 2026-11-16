@@ -230,7 +230,7 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
-	senderEmail, err := resolveActorEmail(ctx, c.api, secretInfo.SenderID)
+	senderEmail, err := resolveMemberEmail(ctx, c.api, secretInfo.SenderID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve sender key: %w", err)
 	}

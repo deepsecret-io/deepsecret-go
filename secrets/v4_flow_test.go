@@ -41,7 +41,7 @@ import (
 // agreement checks at create, so these tests pin the JSON contract the SDK
 // speaks. Callers authenticate with their email as the API key.
 
-type fakeActor struct {
+type fakeMember struct {
 	id, email string
 	kp        *keys.Pair
 	fp        string
@@ -57,13 +57,13 @@ type fakeWrap struct {
 type fakeRevision struct {
 	id, secretID string
 	manifest     []byte
-	wraps        map[string]fakeWrap // by actor id
+	wraps        map[string]fakeWrap // by member id
 	filesMeta    any                 // the names and sizes in the create request's files_meta, served back as the API does
 }
 
 type fakeSecret struct {
 	id, name, senderID string
-	recipients         []string // actor ids
+	recipients         []string // member ids
 	revisions          []*fakeRevision
 }
 
@@ -71,7 +71,7 @@ type fakeAPI struct {
 	t       *testing.T
 	srv     *httptest.Server
 	mu      sync.Mutex
-	actors  map[string]*fakeActor // by email
+	members map[string]*fakeMember // by email
 	secrets map[string]*fakeSecret
 	revs    map[string]*fakeRevision
 	objects string // directory holding stored objects, one file each
@@ -90,7 +90,7 @@ type fakeAPI struct {
 	// editBundle, when set, edits the primary key bundle listed for an
 	// email before it is served, as a hostile server would.
 	editBundle func(email string, bundle map[string]any)
-	// whoAmI, when set, is the email /actors/me answers with, whoever
+	// whoAmI, when set, is the email /members/me answers with, whoever
 	// calls: a server lying about who the caller is.
 	whoAmI string
 	// known holds each client's known keys file, as each person's own
@@ -165,7 +165,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home) // the home directory on Windows
-	f := &fakeAPI{t: t, actors: map[string]*fakeActor{}, secrets: map[string]*fakeSecret{},
+	f := &fakeAPI{t: t, members: map[string]*fakeMember{}, secrets: map[string]*fakeSecret{},
 		revs: map[string]*fakeRevision{}, objects: t.TempDir(), multipartAt: 1 << 62,
 		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}, known: t.TempDir()}
 	for i, email := range emails {
@@ -173,21 +173,21 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Each actor is on a device of their own: only their key pairs are
+		// Each member is on a device of their own: only their key pairs are
 		// on it.
 		fp, _ := keys.Fingerprint(kp)
 		keysDir := filepath.Join(home, email, ".deepsecret", "keys")
 		if err := keystore.Save(keysDir, fp, kp, ""); err != nil {
 			t.Fatal(err)
 		}
-		f.actors[email] = &fakeActor{id: fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1), email: email, kp: kp, fp: fp, keys: keysDir}
+		f.members[email] = &fakeMember{id: fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1), email: email, kp: kp, fp: fp, keys: keysDir}
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/v1/actors/me", f.me)
+	mux.HandleFunc("GET /api/v1/members/me", f.me)
 	mux.HandleFunc("GET /api/v1/orgs", func(w http.ResponseWriter, _ *http.Request) { ok(w, []any{}) })
-	mux.HandleFunc("GET /api/v1/actors/email/{email}", f.actorByEmail)
-	mux.HandleFunc("GET /api/v1/actors/{id}", f.actorByID)
+	mux.HandleFunc("GET /api/v1/members/email/{email}", f.memberByEmail)
+	mux.HandleFunc("GET /api/v1/members/{id}", f.memberByID)
 	mux.HandleFunc("GET /api/v1/identities", f.ownKeys)
 	mux.HandleFunc("POST /api/v1/identities", func(w http.ResponseWriter, _ *http.Request) {
 		f.mu.Lock()
@@ -195,7 +195,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 		f.mu.Unlock()
 		ok(w, map[string]string{})
 	})
-	mux.HandleFunc("GET /api/v1/identities/actor/{email}", f.publicKeys)
+	mux.HandleFunc("GET /api/v1/identities/member/{email}", f.publicKeys)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/secrets", f.create)
 	mux.HandleFunc("POST /api/v1/orgs/{org}/storage/presign", f.presignUpload)
 	mux.HandleFunc("PUT /s3/{key}", f.putObject)
@@ -217,7 +217,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	mux.HandleFunc("GET /api/v1/secrets/{id}", f.secret)
 	mux.HandleFunc("PUT /api/v1/secrets/{id}/policies", f.secret)
 	mux.HandleFunc("GET /api/v1/secrets/{id}/revisions", f.revisions)
-	mux.HandleFunc("DELETE /api/v1/secrets/{id}/recipients/{actor}", f.revoke)
+	mux.HandleFunc("DELETE /api/v1/secrets/{id}/recipients/{member}", f.revoke)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -225,7 +225,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 
 func (f *fakeAPI) client(email string) *deepsecret.Client {
 	f.t.Helper()
-	return f.clientOn(email, f.actors[email].keys, f.knownFile(email))
+	return f.clientOn(email, f.members[email].keys, f.knownFile(email))
 }
 
 // clientOn is email's client on a device with keysDir and knownFile.
@@ -238,9 +238,9 @@ func (f *fakeAPI) clientOn(email, keysDir, knownFile string) *deepsecret.Client 
 	return c
 }
 
-// sameDevice puts the key pairs of every actor in as on the first one's
+// sameDevice puts the key pairs of every member in as on the first one's
 // device, as for a user with several accounts.
-func (f *fakeAPI) sameDevice(as ...*fakeActor) {
+func (f *fakeAPI) sameDevice(as ...*fakeMember) {
 	f.t.Helper()
 	for _, a := range as[1:] {
 		if err := keystore.Save(as[0].keys, a.fp, a.kp, ""); err != nil {
@@ -267,10 +267,10 @@ func fail(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]any{"success": false, "error": msg})
 }
 
-func (f *fakeAPI) caller(r *http.Request) *fakeActor { return f.actors[r.Header.Get("DS-API-KEY")] }
+func (f *fakeAPI) caller(r *http.Request) *fakeMember { return f.members[r.Header.Get("DS-API-KEY")] }
 
-func (f *fakeAPI) byID(id string) *fakeActor {
-	for _, a := range f.actors {
+func (f *fakeAPI) byID(id string) *fakeMember {
+	for _, a := range f.members {
 		if a.id == id {
 			return a
 		}
@@ -284,22 +284,22 @@ func (f *fakeAPI) me(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	a := f.caller(r)
 	if f.whoAmI != "" {
-		a = f.actors[f.whoAmI]
+		a = f.members[f.whoAmI]
 	}
-	ok(w, map[string]any{"actor": map[string]string{"id": a.id, "email": a.email},
+	ok(w, map[string]any{"member": map[string]string{"id": a.id, "email": a.email},
 		"membership": map[string]string{"org_id": "org-1", "role": "owner"}})
 }
 
-func (f *fakeAPI) actorByEmail(w http.ResponseWriter, r *http.Request) {
-	a := f.actors[r.PathValue("email")]
+func (f *fakeAPI) memberByEmail(w http.ResponseWriter, r *http.Request) {
+	a := f.members[r.PathValue("email")]
 	if a == nil {
-		fail(w, http.StatusNotFound, "Actor not found")
+		fail(w, http.StatusNotFound, "Member not found")
 		return
 	}
 	ok(w, map[string]string{"id": a.id})
 }
 
-func (f *fakeAPI) actorByID(w http.ResponseWriter, r *http.Request) {
+func (f *fakeAPI) memberByID(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]string{"email": f.byID(r.PathValue("id")).email})
 }
 
@@ -309,9 +309,9 @@ func (f *fakeAPI) ownKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeAPI) publicKeys(w http.ResponseWriter, r *http.Request) {
-	a := f.actors[r.PathValue("email")]
+	a := f.members[r.PathValue("email")]
 	if a == nil {
-		fail(w, http.StatusNotFound, "Actor not found")
+		fail(w, http.StatusNotFound, "Member not found")
 		return
 	}
 	var pubKeys []map[string]any
@@ -693,14 +693,14 @@ func (f *fakeAPI) revoke(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s := f.secrets[r.PathValue("id")]
-	actor := r.PathValue("actor")
-	if s.senderID != f.caller(r).id || !slices.Contains(s.recipients, actor) {
+	member := r.PathValue("member")
+	if s.senderID != f.caller(r).id || !slices.Contains(s.recipients, member) {
 		fail(w, http.StatusNotFound, "Recipient not found")
 		return
 	}
-	s.recipients = slices.DeleteFunc(s.recipients, func(id string) bool { return id == actor })
+	s.recipients = slices.DeleteFunc(s.recipients, func(id string) bool { return id == member })
 	for _, rev := range s.revisions {
-		delete(rev.wraps, actor)
+		delete(rev.wraps, member)
 	}
 	ok(w, map[string]bool{"secret_deleted": len(s.recipients) == 0})
 }
@@ -736,7 +736,7 @@ func TestValidateRecipients(t *testing.T) {
 // unless listed.
 func TestSendOnceToManyRecipients(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 
 	res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{bob.email, carol.email}, "hello, both", secrets.EncryptOptions{Name: "greeting"})
 	if err != nil {
@@ -760,7 +760,7 @@ func TestSendOnceToManyRecipients(t *testing.T) {
 	}
 
 	digest := sha256.Sum256(stored)
-	for _, r := range []*fakeActor{bob, carol} {
+	for _, r := range []*fakeMember{bob, carol} {
 		out, err := f.client(r.email).Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
 		if err != nil {
 			t.Fatalf("%s decrypt: %v", r.email, err)
@@ -800,7 +800,7 @@ func nextSecond() {
 // id still opens.
 func TestServerCannotSwapOrRollBackRevisions(t *testing.T) {
 	f := newFakeAPI(t, "carol@example.com", "dave@example.com")
-	carol, dave := f.actors["carol@example.com"], f.actors["dave@example.com"]
+	carol, dave := f.members["carol@example.com"], f.members["dave@example.com"]
 	send := func(name, text string) *secrets.EncryptResult {
 		t.Helper()
 		res, err := f.client(carol.email).Secrets.EncryptText(context.Background(), []string{dave.email}, text, secrets.EncryptOptions{Name: name})
@@ -878,7 +878,7 @@ func TestServerCannotSwapOrRollBackRevisions(t *testing.T) {
 type relabelledRollback struct {
 	f            *fakeAPI
 	bob          *deepsecret.Client // the recipient, who opened the newest revision
-	alice, alias *fakeActor         // the sender, and the address the server names instead
+	alice, alias *fakeMember        // the sender, and the address the server names instead
 	secretID     string
 	replayed     string // the first revision, served as the latest
 }
@@ -893,7 +893,7 @@ func (r relabelledRollback) open(opt secrets.DecryptOptions) (*secrets.DecryptRe
 func newRelabelledRollback(t *testing.T) relabelledRollback {
 	t.Helper()
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "alice.new@example.com")
-	alice, alias := f.actors["alice@example.com"], f.actors["alice.new@example.com"]
+	alice, alias := f.members["alice@example.com"], f.members["alice.new@example.com"]
 	send := func(text string) *secrets.EncryptResult {
 		t.Helper()
 		res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, text, secrets.EncryptOptions{Name: "api-token"})
@@ -994,7 +994,7 @@ func TestForgettingTheSenderKeepsTheRollbackRecordOfTheirKey(t *testing.T) {
 // org.
 func TestSelfSend(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
-	alice := f.actors["alice@example.com"]
+	alice := f.members["alice@example.com"]
 	c := f.client(alice.email)
 	res, err := c.Secrets.EncryptData(context.Background(), []string{alice.email}, map[string]string{"K": "V"}, secrets.EncryptOptions{Name: "vault"})
 	if err != nil {
@@ -1013,7 +1013,7 @@ func TestSelfSend(t *testing.T) {
 // refused with the server's message unless RevokeMissing is set.
 func TestResendLeavingOutRecipient(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email, carol.email}, "v1", secrets.EncryptOptions{Name: "db"}); err != nil {
 		t.Fatal(err)
@@ -1041,7 +1041,7 @@ func TestResendLeavingOutRecipient(t *testing.T) {
 
 func TestRevokeRecipient(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client(alice.email)
 	res, err := c.Secrets.EncryptText(context.Background(), []string{bob.email, carol.email}, "x", secrets.EncryptOptions{Name: "token"})
 	if err != nil {
@@ -1074,7 +1074,7 @@ func TestValidateRecipientsRefusesHostileEmails(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{
-		"a b@example.com", "alice@example.com\r\nX-Injected: 1", "../../actors/me@x.io",
+		"a b@example.com", "alice@example.com\r\nX-Injected: 1", "../../members/me@x.io",
 		"a/b@example.com", "a?b@example.com", "a#b@example.com", "a%2f@example.com",
 		"a\x1b[31m@example.com", "a\u202e@example.com", "a\u009b@example.com",
 		"alice@localhost", "alice@", "@example.com", strings.Repeat("a", 250) + "@example.com",

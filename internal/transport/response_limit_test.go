@@ -36,13 +36,13 @@ func TestAPIResponseOverLimitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.maxResponse = limit
-	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
+	if _, err := c.Get(context.Background(), "/api/v1/members/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
 		t.Fatalf("err = %v, want apierror.ErrResponseTooLarge", err)
 	}
 
 	// The same response within the bound is read whole.
 	c.maxResponse = 65 * limit
-	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); err != nil {
+	if _, err := c.Get(context.Background(), "/api/v1/members/me"); err != nil {
 		t.Fatalf("a body under the bound failed: %v", err)
 	}
 }
@@ -59,7 +59,7 @@ func TestAPIResponseDeclaredOverLimitFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Get(context.Background(), "/api/v1/actors/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
+	if _, err := c.Get(context.Background(), "/api/v1/members/me"); !errors.Is(err, apierror.ErrResponseTooLarge) {
 		t.Fatalf("err = %v, want apierror.ErrResponseTooLarge", err)
 	}
 }

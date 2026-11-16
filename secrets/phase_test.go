@@ -92,7 +92,7 @@ func TestPhases(t *testing.T) {
 // for a PIN or a touch never runs inside a phase.
 func TestPhasesBeginAfterTheUnlock(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice := f.actors["alice@example.com"]
+	alice := f.members["alice@example.com"]
 	key := &testSecurityKey{secrets: map[string][]byte{}}
 	e, err := keystore.Edit(context.Background(), alice.keys, alice.fp, keystore.Unlock{})
 	if err != nil {

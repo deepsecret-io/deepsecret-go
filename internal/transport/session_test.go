@@ -63,7 +63,7 @@ func (s *sessionServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.refreshes.Add(1)
 		delete(s.valid, tok)
 		s.issued++
-		fresh = fakeToken("actor-1", time.Now().Add(s.lifetime), 100+s.issued)
+		fresh = fakeToken("member-1", time.Now().Add(s.lifetime), 100+s.issued)
 		s.valid[fresh] = true
 		if s.onRefresh != nil {
 			s.onRefresh()
@@ -83,7 +83,7 @@ func (s *sessionServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestSession_RefreshesShortlyBeforeExpiry(t *testing.T) {
-	old := fakeToken("actor-1", time.Now().Add(2*time.Minute), 1)
+	old := fakeToken("member-1", time.Now().Add(2*time.Minute), 1)
 	srv, c := newSessionServer(t, old)
 	var saved []string
 	c.SetSessionStore(SessionStore{Save: func(token string, exp time.Time) error {
@@ -116,7 +116,7 @@ func TestSession_RenewsOnUseAfterAnEighthOfItsLifetime(t *testing.T) {
 		{"eight minutes old", 8 * time.Minute, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(tokenLifetime-tc.age), 1))
+			srv, c := newSessionServer(t, fakeToken("member-1", time.Now().Add(tokenLifetime-tc.age), 1))
 			for range 3 {
 				if _, err := c.Get(context.Background(), "/api/v1/me"); err != nil {
 					t.Fatal(err)
@@ -145,7 +145,7 @@ func TestSession_FailingRefreshIsNotRetriedPerRequest(t *testing.T) {
 		fmt.Fprint(w, `{"success":true,"data":{}}`)
 	}))
 	defer srv.Close()
-	c, err := NewClient(srv.URL, "bearer:"+fakeToken("actor-1", time.Now().Add(40*time.Minute), 1))
+	c, err := NewClient(srv.URL, "bearer:"+fakeToken("member-1", time.Now().Add(40*time.Minute), 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestSession_FailingRefreshIsNotRetriedPerRequest(t *testing.T) {
 // Workers sharing a client refresh once: the second refresh of the same
 // token would fail, since the first revoked it.
 func TestSession_ConcurrentRequestsRefreshOnce(t *testing.T) {
-	srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(time.Minute), 1))
+	srv, c := newSessionServer(t, fakeToken("member-1", time.Now().Add(time.Minute), 1))
 	var wg sync.WaitGroup
 	var failed atomic.Int32
 	for range 20 {
@@ -183,8 +183,8 @@ func TestSession_ConcurrentRequestsRefreshOnce(t *testing.T) {
 // Another process refreshed the shared session, which revoked this
 // client's token: the client picks up the stored token and retries.
 func TestSession_AdoptsTheStoredTokenOnUnauthorized(t *testing.T) {
-	mine := fakeToken("actor-1", time.Now().Add(tokenLifetime), 1)
-	theirs := fakeToken("actor-1", time.Now().Add(tokenLifetime), 2)
+	mine := fakeToken("member-1", time.Now().Add(tokenLifetime), 1)
+	theirs := fakeToken("member-1", time.Now().Add(tokenLifetime), 2)
 	srv, c := newSessionServer(t, mine)
 	srv.mu.Lock()
 	delete(srv.valid, mine)
@@ -202,8 +202,8 @@ func TestSession_AdoptsTheStoredTokenOnUnauthorized(t *testing.T) {
 // A stored token of another account, from a login made meanwhile, is
 // never used for this client's requests.
 func TestSession_IgnoresAnotherAccountsToken(t *testing.T) {
-	mine := fakeToken("actor-1", time.Now().Add(tokenLifetime), 1)
-	other := fakeToken("actor-2", time.Now().Add(tokenLifetime), 2)
+	mine := fakeToken("member-1", time.Now().Add(tokenLifetime), 1)
+	other := fakeToken("member-2", time.Now().Add(tokenLifetime), 2)
 	srv, c := newSessionServer(t, mine)
 	srv.mu.Lock()
 	delete(srv.valid, mine)
@@ -244,7 +244,7 @@ func TestSession_APIKeysAreNotRefreshed(t *testing.T) {
 // token: the server has revoked the old one, so losing it would end the
 // session for every call sharing the client.
 func TestSession_RefreshOutlivesACancelledCall(t *testing.T) {
-	old := fakeToken("actor-1", time.Now().Add(2*time.Minute), 1)
+	old := fakeToken("member-1", time.Now().Add(2*time.Minute), 1)
 	srv, c := newSessionServer(t, old)
 	var saved []string
 	c.SetSessionStore(SessionStore{Save: func(token string, _ time.Time) error {
@@ -274,7 +274,7 @@ func TestSession_RefreshOutlivesACancelledCall(t *testing.T) {
 
 // A call's context ends that call only.
 func TestCancelledCallEndsOnlyThatCall(t *testing.T) {
-	srv, c := newSessionServer(t, fakeToken("actor-1", time.Now().Add(time.Hour), 1))
+	srv, c := newSessionServer(t, fakeToken("member-1", time.Now().Add(time.Hour), 1))
 	_ = srv
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

@@ -349,14 +349,14 @@ Only the device holding a key file knows how it is protected, so the
 server stores what the owner's client reports: one boolean per registered
 key, `security_key`. It is not signed and decides nothing; it only labels
 the owner's own key lists. Other users never get it: the lookup senders use
-(`GET /api/v1/identities/actor/:email`) keeps its fields, and only the
+(`GET /api/v1/identities/member/:email`) keeps its fields, and only the
 owner's responses (`GET /api/v1/identities`, `GET /:id`, the response to
 registering) carry it.
 
 - Registering sends it (`Identity.Sync(kp, securityKey)`), from the key
   file on the registering device.
 - `PUT /api/v1/identities/:id/security-key {"security_key": bool}` changes
-  it, for the owner's keys only (another actor's key is not found), audited
+  it, for the owner's keys only (another member's key is not found), audited
   as a configuration change. The CLI's `security-key protect` and
   `unprotect`, and the desktop app's Protect and Unprotect, call it when the
   key is registered and the client is signed in; a failure leaves the local

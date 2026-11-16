@@ -55,7 +55,7 @@ func TestIDsCannotReachAnotherEndpoint(t *testing.T) {
 		defer mu.Unlock()
 		paths, queries = nil, nil
 	}
-	for _, id := range []string{"../../actors/me", "a/b", "a?x=1", "a#b"} {
+	for _, id := range []string{"../../members/me", "a/b", "a?x=1", "a#b"} {
 		for _, call := range calls {
 			reset()
 			call.call(id)

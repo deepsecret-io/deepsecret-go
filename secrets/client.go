@@ -32,11 +32,11 @@ func (c *Client) keys() string { return c.keysDir }
 
 // listSecrets returns secrets in the given direction ("sent" or "received").
 func (c *Client) listSecrets(ctx context.Context, direction string, opts ...ListOptions) ([]Info, int, error) {
-	actorID, err := c.identity.ResolveActorID(ctx)
+	memberID, err := c.identity.ResolveMemberID(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	return listSecretsFor(ctx, c.api, actorID, direction, opts...)
+	return listSecretsFor(ctx, c.api, memberID, direction, opts...)
 }
 
 // ListSent returns sent secrets.

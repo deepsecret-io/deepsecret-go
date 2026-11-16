@@ -79,7 +79,7 @@ func TestSendRefusesIncompleteRecipientBundle(t *testing.T) {
 // while a send to someone else is unaffected.
 func TestSelfSendRefusesSubstitutedKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	substitute(t, f, alice.email)
 	c := f.client(alice.email)
 
@@ -107,8 +107,8 @@ func TestSelfSendRefusesSubstitutedKey(t *testing.T) {
 // too, checked the same way.
 func TestSelfSendByAliasRefusesSubstitutedKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
-	alice := f.actors["alice@example.com"]
-	f.actors["alice.alias@example.com"] = alice
+	alice := f.members["alice@example.com"]
+	f.members["alice.alias@example.com"] = alice
 	substitute(t, f, "alice.alias@example.com")
 
 	_, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{"alice.alias@example.com"}, "for me only", secrets.EncryptOptions{Name: "n"})
@@ -124,7 +124,7 @@ func TestSelfSendByAliasRefusesSubstitutedKey(t *testing.T) {
 // server lists is on this device, and is checked without its password.
 func TestSelfSendWithAnotherLocalIdentity(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
-	alice := f.actors["alice@example.com"]
+	alice := f.members["alice@example.com"]
 	if err := keystore.Save(alice.keys, alice.fp, alice.kp, "correct horse"); err != nil {
 		t.Fatal(err)
 	}
@@ -146,14 +146,14 @@ func TestSelfSendWithAnotherLocalIdentity(t *testing.T) {
 	}
 }
 
-// A server that answers /actors/me as someone else cannot pass off a key of
+// A server that answers /members/me as someone else cannot pass off a key of
 // its own as the caller's: their account was recorded as theirs on this
 // device, so a send to it still takes only a key pair here, on both paths,
 // and the server's key is recorded nowhere. Claiming an account this device
 // does not know records nothing.
 func TestSelfSendWhenServerLiesAboutCaller(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
@@ -179,13 +179,13 @@ func TestSelfSendWhenServerLiesAboutCaller(t *testing.T) {
 }
 
 // The two-phase probe: after an honest send to bob, whose key pair is on
-// his device only, a server answering /actors/me as bob cannot make bob one
+// his device only, a server answering /members/me as bob cannot make bob one
 // of alice's own accounts, which would block every send to him and secret
 // from him. Each send, and registering a key, is refused, saying the server
 // claims to be bob, and bob's key stays as it was.
 func TestServerCannotClaimAContactIsYou(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	forgetLocalKey(t, bob)
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
@@ -224,7 +224,7 @@ func TestServerCannotClaimAContactIsYou(t *testing.T) {
 // is recorded for the user's account, and a key belongs to one account.
 func TestServerCannotClaimAContactPinnedWithYourKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)
@@ -310,7 +310,7 @@ func ownNotes(t *testing.T, c *deepsecret.Client, email, identity string) (id, p
 // wantRelabelRefused has the server name sender as the sender of the secret id
 // and of the local file at path, both signed with signer, and list signer for
 // them. Both decrypt paths must refuse them for reader, saying want.
-func wantRelabelRefused(t *testing.T, f *fakeAPI, reader, sender *fakeActor, signer *keys.Pair, id, path, want string) {
+func wantRelabelRefused(t *testing.T, f *fakeAPI, reader, sender *fakeMember, signer *keys.Pair, id, path, want string) {
 	t.Helper()
 	f.mu.Lock()
 	f.secrets[id].senderID = sender.id
@@ -331,7 +331,7 @@ func wantRelabelRefused(t *testing.T, f *fakeAPI, reader, sender *fakeActor, sig
 // among the contact's known keys does not make it theirs.
 func TestOwnSecretDoesNotPassAsContactPinnedWithYourKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)
@@ -349,7 +349,7 @@ func TestOwnSecretDoesNotPassAsContactPinnedWithYourKey(t *testing.T) {
 // as someone new on first use, which would record the key for them.
 func TestOwnSecretDoesNotPassAsContactOnceItsKeyLeftThisDevice(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)
@@ -380,7 +380,7 @@ func TestOwnSecretDoesNotPassAsContactOnceItsKeyLeftThisDevice(t *testing.T) {
 // that key, which uploads nothing.
 func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	f.sameDevice(alice, bob)
 	device := filepath.Join(t.TempDir(), "known_keys.json")
 	a, b := f.clientOn(alice.email, alice.keys, device), f.clientOn(bob.email, bob.keys, device)
@@ -440,7 +440,7 @@ func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
 // key belongs to one account.
 func TestOwnSecretDoesNotPassAsContactRecordedAsYours(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)
@@ -475,13 +475,13 @@ func TestOwnSecretDoesNotPassAsContactRecordedAsYours(t *testing.T) {
 // user's own accounts. A key recorded for him that is not on this device
 // still refuses the claim, until the user forgets it.
 func TestSwitchAccountsThenSend(t *testing.T) {
-	setup := func(t *testing.T) (f *fakeAPI, alice, bob *fakeActor, signIn func(email string) *deepsecret.Client) {
+	setup := func(t *testing.T) (f *fakeAPI, alice, bob *fakeMember, signIn func(email string) *deepsecret.Client) {
 		f = newFakeAPI(t, "alice@example.com", "bob@example.com")
-		alice, bob = f.actors["alice@example.com"], f.actors["bob@example.com"]
+		alice, bob = f.members["alice@example.com"], f.members["bob@example.com"]
 		f.sameDevice(alice, bob)
 		device := filepath.Join(t.TempDir(), "known_keys.json")
 		signIn = func(email string) *deepsecret.Client {
-			return f.clientOn(email, f.actors[email].keys, device)
+			return f.clientOn(email, f.members[email].keys, device)
 		}
 		if _, err := signIn(alice.email).Secrets.EncryptText(context.Background(), []string{alice.email, bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 			t.Fatal(err)
@@ -711,7 +711,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 // to, shows in KnownKeys and is undone by forgetting that entry.
 func TestForgetUndoesAContactMarkedAsYours(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	forgetLocalKey(t, bob)
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
@@ -744,7 +744,7 @@ func TestForgetUndoesAContactMarkedAsYours(t *testing.T) {
 // so a server lying about the caller is caught even before the first send.
 func TestSyncIdentityRecordsOwnAccount(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)
@@ -769,7 +769,7 @@ func TestSyncIdentityRecordsOwnAccount(t *testing.T) {
 // on either decrypt path.
 func TestDecryptRefusesSecretSignedAsYouElsewhere(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
-	alice := f.actors["alice@example.com"]
+	alice := f.members["alice@example.com"]
 	c := f.client(alice.email)
 	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
 		t.Fatal(err)

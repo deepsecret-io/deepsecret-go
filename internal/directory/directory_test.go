@@ -43,11 +43,11 @@ func bundle(t *testing.T, kp *keys.Pair) map[string]any {
 	}
 }
 
-// keysServer serves bundles as every actor's key list.
+// keysServer serves bundles as every member's key list.
 func keysServer(t *testing.T, bundles ...map[string]any) *transport.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/v1/identities/actor/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/identities/member/") {
 			http.NotFound(w, r)
 			return
 		}

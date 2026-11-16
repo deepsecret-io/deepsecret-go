@@ -14,7 +14,7 @@
 // # Package Structure
 //
 //	deepsecret : the client and its setup: NewClient, its options, Logout
-//	identity   : account, org, groups and the keys registered on the server (Client.Identity)
+//	identity   : account, org, teams and the keys registered on the server (Client.Identity)
 //	secrets    : send, receive, local files, list, revoke, policy, resume, storage (Client.Secrets)
 //	trust      : the keys this device knows: list, accept, verify, forget (Client.Trust)
 //	keys       : key pairs, fingerprints and safety numbers; no file access

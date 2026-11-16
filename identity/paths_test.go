@@ -45,8 +45,8 @@ func TestIDsCannotReachAnotherEndpoint(t *testing.T) {
 		name, path string
 		call       func(id string)
 	}{
-		{"ListGroups", "/api/v1/orgs/%s/groups", func(id string) { _, _ = c.ListGroups(ctx, id) }},
-		{"ListMyGroups", "/api/v1/orgs/%s/my-groups", func(id string) { _, _ = c.ListMyGroups(ctx, id) }},
+		{"ListTeams", "/api/v1/orgs/%s/teams", func(id string) { _, _ = c.ListTeams(ctx, id) }},
+		{"ListMyTeams", "/api/v1/orgs/%s/my-teams", func(id string) { _, _ = c.ListMyTeams(ctx, id) }},
 		{"SetPrimaryKey", "/api/v1/identities/%s/primary", func(id string) { _ = c.SetPrimaryKey(ctx, id) }},
 		{"DeleteKey", "/api/v1/identities/%s", func(id string) { _ = c.DeleteKey(ctx, id) }},
 	}
@@ -55,7 +55,7 @@ func TestIDsCannotReachAnotherEndpoint(t *testing.T) {
 		defer mu.Unlock()
 		paths, queries = nil, nil
 	}
-	for _, id := range []string{"../../actors/me", "a/b", "a?x=1", "a#b"} {
+	for _, id := range []string{"../../members/me", "a/b", "a?x=1", "a#b"} {
 		for _, call := range calls {
 			reset()
 			call.call(id)

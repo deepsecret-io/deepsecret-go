@@ -56,7 +56,7 @@ func newFixture(t *testing.T, listed *keys.Pair) fixture {
 	var requests atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		if !strings.HasPrefix(r.URL.Path, "/api/v1/identities/actor/") {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/identities/member/") {
 			http.NotFound(w, r)
 			return
 		}
@@ -94,7 +94,7 @@ func TestAcceptRefusesAKeyTheServerDoesNotList(t *testing.T) {
 func TestAcceptChecksItsInputFirst(t *testing.T) {
 	listed, fp := newPair(t)
 	f := newFixture(t, listed)
-	if err := f.c.Accept(context.Background(), "../../actors/me", fp); err == nil {
+	if err := f.c.Accept(context.Background(), "../../members/me", fp); err == nil {
 		t.Error("accepted an odd email")
 	}
 	if err := f.c.Verify(context.Background(), bob, fp[:16]); err == nil {

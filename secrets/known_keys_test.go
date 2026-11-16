@@ -27,7 +27,7 @@ import (
 )
 
 // forgetLocalKey removes a's key pair from their device.
-func forgetLocalKey(t *testing.T, a *fakeActor) {
+func forgetLocalKey(t *testing.T, a *fakeMember) {
 	t.Helper()
 	if err := os.Remove(filepath.Join(a.keys, a.fp+".json")); err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func forgetLocalKey(t *testing.T, a *fakeActor) {
 
 // rotate gives a a new primary key, on this device and on the server, which
 // still lists the old one.
-func rotate(t *testing.T, a *fakeActor) {
+func rotate(t *testing.T, a *fakeMember) {
 	t.Helper()
 	kp, err := keys.Generate()
 	if err != nil {
@@ -51,7 +51,7 @@ func rotate(t *testing.T, a *fakeActor) {
 }
 
 // setPrimary makes kp, one of a's keys, its primary key on the server again.
-func setPrimary(a *fakeActor, kp *keys.Pair) {
+func setPrimary(a *fakeMember, kp *keys.Pair) {
 	a.old = slices.DeleteFunc(a.old, func(o *keys.Pair) bool { return o == kp })
 	a.old = append(a.old, a.kp)
 	a.kp = kp
@@ -78,7 +78,7 @@ func knownKeys(t *testing.T, c *deepsecret.Client, email string) map[string]trus
 // as yours, with the key you sent with.
 func TestFirstSendAcceptsRecipientKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	// The default file, under the user's home, alice's device.
 	t.Setenv("HOME", filepath.Dir(filepath.Dir(alice.keys)))
 	t.Setenv("USERPROFILE", filepath.Dir(filepath.Dir(alice.keys))) // the home directory on Windows
@@ -118,7 +118,7 @@ func TestFirstSendAcceptsRecipientKey(t *testing.T) {
 // user accepts the new key by its full fingerprint.
 func TestChangedRecipientKeyIsRefused(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
@@ -201,7 +201,7 @@ func TestChangedRecipientKeyIsRefused(t *testing.T) {
 // Accepting or verifying a key makes it the one sends go to.
 func TestAcceptReplacesOldKeys(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
@@ -258,7 +258,7 @@ func TestAcceptReplacesOldKeys(t *testing.T) {
 // checks the secrets it signed, until it is forgotten.
 func TestDecryptChecksSenderKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	send := func(text string) (string, string) {
 		t.Helper()
 		res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{bob.email}, text, secrets.EncryptOptions{Name: text})
@@ -331,7 +331,7 @@ func TestDecryptChecksSenderKey(t *testing.T) {
 // it.
 func TestDecryptOwnSecret(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
-	alice := f.actors["alice@example.com"]
+	alice := f.members["alice@example.com"]
 	c := f.client(alice.email)
 	id, path := ownNotes(t, c, alice.email, "")
 	out, err := c.Secrets.Decrypt(context.Background(), id, secrets.DecryptOptions{})
@@ -352,7 +352,7 @@ func TestDecryptOwnSecret(t *testing.T) {
 // server gives with spaces is refused before the pins are read.
 func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "mallory@example.com")
-	alice, bob, mallory := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["mallory@example.com"]
+	alice, bob, mallory := f.members["alice@example.com"], f.members["bob@example.com"], f.members["mallory@example.com"]
 	cb := f.client(bob.email)
 	resA, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{bob.email}, "from alice", secrets.EncryptOptions{Name: "a"})
 	if err != nil {
@@ -386,8 +386,8 @@ func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 
 	f.mu.Lock()
 	mallory.email = "alice@example.com "
-	f.actors[mallory.email] = mallory
-	f.actors["alice@example.com%20"] = mallory
+	f.members[mallory.email] = mallory
+	f.members["alice@example.com%20"] = mallory
 	mallory.old = append(mallory.old, bob.kp)
 	f.secrets[note.Secret.ID].senderID = mallory.id
 	f.mu.Unlock()
@@ -401,7 +401,7 @@ func TestOwnKeyDoesNotPassAsKnownSender(t *testing.T) {
 // open as a first contact from them. Both paths refuse it.
 func TestOwnKeyDoesNotPassAsNewSender(t *testing.T) {
 	f := newFakeAPI(t, "bob@example.com", "carol@example.com")
-	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	bob, carol := f.members["bob@example.com"], f.members["carol@example.com"]
 	cb := f.client(bob.email)
 	note, err := cb.Secrets.EncryptText(context.Background(), []string{bob.email}, "bob's note", secrets.EncryptOptions{Name: "n"})
 	if err != nil {
@@ -435,7 +435,7 @@ func TestOwnKeyDoesNotPassAsNewSender(t *testing.T) {
 // is recorded for the new address.
 func TestContactKeyIsRefusedForAnotherRecipient(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	bob, carol := f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client("alice@example.com")
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
@@ -495,7 +495,7 @@ func TestContactKeyIsRefusedForAnotherRecipient(t *testing.T) {
 // accepts the key on first use.
 func TestOneKeyForTwoNewRecipientsIsRefused(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	bob, carol := f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client("alice@example.com")
 	f.mu.Lock()
 	carol.kp, carol.fp = bob.kp, bob.fp
@@ -566,7 +566,7 @@ func relabelLocalSender(t *testing.T, path, email string) {
 // leaves it unknown, and the next send that succeeds reports it.
 func TestFirstUseRecordedOnlyAfterSend(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	bob, carol := f.actors["bob@example.com"], f.actors["carol@example.com"]
+	bob, carol := f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client("alice@example.com")
 	if _, err := c.Secrets.EncryptText(context.Background(), []string{carol.email}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
@@ -609,7 +609,7 @@ func TestFirstUseRecordedOnlyAfterSend(t *testing.T) {
 // check, as when the payload fails its check, records nothing.
 func TestSenderFirstUseRecordedOnlyAfterDecrypt(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{bob.email}, "hello", secrets.EncryptOptions{Name: "n"})
 	if err != nil {
 		t.Fatal(err)
@@ -656,7 +656,7 @@ func TestSenderFirstUseRecordedOnlyAfterDecrypt(t *testing.T) {
 func TestRecordFirstUseRefusesAKeyRecordedMeanwhile(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	c := f.client("alice@example.com")
-	store := knownkeys.New(f.knownFile("alice@example.com"), f.srv.URL, f.actors["alice@example.com"].keys)
+	store := knownkeys.New(f.knownFile("alice@example.com"), f.srv.URL, f.members["alice@example.com"].keys)
 	k1, k2, k3 := fmt.Sprintf("%064x", 1), fmt.Sprintf("%064x", 2), fmt.Sprintf("%064x", 3)
 	if err := store.RecordFirstUse([]knownkeys.Person{{Email: "bob@example.com", Fingerprint: k1}}, false); err != nil {
 		t.Fatal(err)
@@ -676,13 +676,13 @@ func TestRecordFirstUseRefusesAKeyRecordedMeanwhile(t *testing.T) {
 func TestKnownKeysArePerServer(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "known_keys.json")
 	f1 := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	c1 := f1.clientOn("alice@example.com", f1.actors["alice@example.com"].keys, file)
+	c1 := f1.clientOn("alice@example.com", f1.members["alice@example.com"].keys, file)
 	if _, err := c1.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", secrets.EncryptOptions{Name: "n"}); err != nil {
 		t.Fatal(err)
 	}
 
 	f2 := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	c2 := f2.clientOn("alice@example.com", f2.actors["alice@example.com"].keys, file)
+	c2 := f2.clientOn("alice@example.com", f2.members["alice@example.com"].keys, file)
 	res, err := c2.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", secrets.EncryptOptions{Name: "n"})
 	if err != nil || len(res.FirstUse) != 1 {
 		t.Fatalf("send on another server: %+v, %v", res, err)
@@ -722,7 +722,7 @@ func TestDamagedKnownKeysFileRefusesSends(t *testing.T) {
 func TestKnownKeysConcurrentChanges(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	c := f.client("alice@example.com")
-	store := knownkeys.New(f.knownFile("alice@example.com"), f.srv.URL, f.actors["alice@example.com"].keys)
+	store := knownkeys.New(f.knownFile("alice@example.com"), f.srv.URL, f.members["alice@example.com"].keys)
 	const n = 16
 	var wg sync.WaitGroup
 	errs := make(chan error, n)

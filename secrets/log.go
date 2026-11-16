@@ -65,11 +65,11 @@ func logKeyPair(log *slog.Logger, fp, requested string) {
 
 // logRecipientKeys logs the keys a send seals for a recipient: what was
 // checked of the bundle the server lists, and why the key is trusted
-// (keyTrust). actorID is "" when the send creates no secret.
-func logRecipientKeys(log *slog.Logger, email, actorID, fp string, own, first bool) {
+// (keyTrust). memberID is "" when the send creates no secret.
+func logRecipientKeys(log *slog.Logger, email, memberID, fp string, own, first bool) {
 	args := []any{"email", email}
-	if actorID != "" {
-		args = append(args, "actor_id", actorID)
+	if memberID != "" {
+		args = append(args, "member_id", memberID)
 	}
 	args = append(args, "fingerprint", fp, "checked", "fingerprint and both self-signatures", "trust", knownkeys.KeyTrust(own, first))
 	logattr.Module(log, "recipient").Debug("recipient keys verified", args...)

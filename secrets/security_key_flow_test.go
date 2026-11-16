@@ -53,7 +53,7 @@ func (k *testSecurityKey) Derive(_ context.Context, req keystore.DeriveRequest) 
 // operation.
 func TestSecurityKeyProtectedSender(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	key := &testSecurityKey{secrets: map[string][]byte{}}
 	e, err := keystore.Edit(context.Background(), alice.keys, alice.fp, keystore.Unlock{})
 	if err != nil {

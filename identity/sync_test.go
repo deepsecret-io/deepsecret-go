@@ -31,8 +31,8 @@ func TestSyncRefusesAnEmailKnownAsSomeoneElse(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/identities":
 			uploads.Add(1)
-		case r.URL.Path == "/api/v1/actors/me":
-			data = actorAnswer("actor-1", OrgKindPersonal)
+		case r.URL.Path == "/api/v1/members/me":
+			data = memberAnswer("member-1", OrgKindPersonal)
 		case r.URL.Path == "/api/v1/orgs":
 			data = []map[string]any{}
 		}
@@ -62,7 +62,7 @@ func TestSyncRefusesAnEmailKnownAsSomeoneElse(t *testing.T) {
 // what Sync refuses, a key that is not on this device and one the account
 // does not list, and records nothing then.
 func TestRecordOwnAccount(t *testing.T) {
-	const ana, bo = "ana@example.com", "bo@example.com" // ana is the account actorAnswer names
+	const ana, bo = "ana@example.com", "bo@example.com" // ana is the account memberAnswer names
 	kp, fp := newKeyPair(t)
 	_, elsewhere := newKeyPair(t)
 	someoneElse := strings.Repeat("a", 64)
@@ -99,8 +99,8 @@ func TestRecordOwnAccount(t *testing.T) {
 					uploads.Add(1)
 				case r.URL.Path == "/api/v1/identities":
 					data = map[string]any{"keys": []map[string]any{{"id": "k1", "fingerprint": tc.registered, "is_primary": true}}}
-				case r.URL.Path == "/api/v1/actors/me":
-					data = actorAnswer("actor-1", OrgKindPersonal)
+				case r.URL.Path == "/api/v1/members/me":
+					data = memberAnswer("member-1", OrgKindPersonal)
 				case r.URL.Path == "/api/v1/orgs":
 					data = []map[string]any{}
 				}

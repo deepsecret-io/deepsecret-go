@@ -62,7 +62,7 @@ func bundleFingerprint(k SignedKeyBundle) (string, error) {
 // belongs to the recipient: a server can still list a bundle of its own.
 // When the recipient is the caller, checkOwnKeys closes that gap.
 func GetRecipientKeys(ctx context.Context, c *transport.Client, email string) (*keys.PublicKeys, error) {
-	resp, err := c.Get(ctx, "/api/v1/identities/actor/"+transport.PathSegment(email))
+	resp, err := c.Get(ctx, "/api/v1/identities/member/"+transport.PathSegment(email))
 	if err != nil {
 		return nil, fmt.Errorf("lookup recipient keys: %w", err)
 	}
@@ -113,7 +113,7 @@ func GetRecipientKeys(ctx context.Context, c *transport.Client, email string) (*
 // primary one when fingerprint is empty), after verifying that key
 // bundle's self-signature, and fails when they registered no such key.
 func ResolveED25519ByEmail(ctx context.Context, c *transport.Client, email, fingerprint string) (string, error) {
-	keysResp, err := c.Get(ctx, "/api/v1/identities/actor/"+transport.PathSegment(email))
+	keysResp, err := c.Get(ctx, "/api/v1/identities/member/"+transport.PathSegment(email))
 	if err != nil {
 		return "", err
 	}

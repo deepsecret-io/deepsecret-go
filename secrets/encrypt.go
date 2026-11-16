@@ -573,16 +573,16 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 			p.size, maxSize)
 	}
 
-	// Resolve actor info (always needed for org_id; also used for tier validation)
+	// Resolve the member info (always needed for org_id; also used for tier validation)
 	// Single line per phase. "Loading X..." pre-events were noise.
-	actorInfo, err := c.senderAccount(ctx, opt)
+	memberInfo, err := c.senderAccount(ctx, opt)
 	if err != nil {
 		return nil, err
 	}
-	if actorInfo.OrgID == "" {
+	if memberInfo.OrgID == "" {
 		return nil, fmt.Errorf("no organization found: activate a plan first")
 	}
-	logattr.Module(log, "auth").Debug("account resolved", "actor_id", actorInfo.ID, "org_id", actorInfo.OrgID, "tier", actorInfo.TierName)
+	logattr.Module(log, "auth").Debug("account resolved", "member_id", memberInfo.ID, "org_id", memberInfo.OrgID, "tier", memberInfo.TierName)
 
 	kp, senderFP, err := c.loadIdentity(ctx, opt.Identity, opt.unlock())
 	if err != nil {
@@ -590,32 +590,32 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 	}
 	logKeyPair(log, senderFP, opt.Identity)
 
-	// Resolve every recipient's actor id and primary keys. The sender is a
+	// Resolve every recipient's member id and primary keys. The sender is a
 	// recipient only when the caller listed them: by one of their accounts
 	// this device recorded, the caller's among them, or by an address the
 	// server resolves to the caller's account.
-	known, err := c.store.RecordOwnAccount(actorInfo.Email, senderFP, false)
+	known, err := c.store.RecordOwnAccount(memberInfo.Email, senderFP, false)
 	if err != nil {
 		return nil, err
 	}
 	pubs := make([]*keys.PublicKeys, len(recipients))
-	actorIDs := make([]string, len(recipients))
+	memberIDs := make([]string, len(recipients))
 	var firstUse []Recipient
 	for i, email := range recipients {
-		actorID, err := resolveRecipientID(ctx, c.api, email)
+		memberID, err := resolveRecipientID(ctx, c.api, email)
 		if err != nil {
 			return nil, fmt.Errorf("resolve recipient %s: %w", email, err)
 		}
-		self := knownkeys.OwnAccount(known[strings.ToLower(email)]) || (actorID != "" && actorID == actorInfo.ID)
+		self := knownkeys.OwnAccount(known[strings.ToLower(email)]) || (memberID != "" && memberID == memberInfo.ID)
 		pubKeys, first, err := c.recipientKeys(ctx, known, email, self, senderFP)
 		if err != nil {
 			return nil, err
 		}
-		pubs[i], actorIDs[i] = pubKeys, actorID
+		pubs[i], memberIDs[i] = pubKeys, memberID
 		if first {
 			firstUse = append(firstUse, Recipient{Email: email, Fingerprint: pubKeys.Fingerprint})
 		}
-		logRecipientKeys(log, email, actorID, pubKeys.Fingerprint, self, first)
+		logRecipientKeys(log, email, memberID, pubKeys.Fingerprint, self, first)
 	}
 
 	algo, err := chooseCompression(p, compress.Algorithm(opt.Compress), log)
@@ -663,14 +663,14 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 			return nil, fmt.Errorf("encrypt: no wrap was made for %s", recipients[i]) // #nosec G602 -- pubs holds one key per recipient
 		}
 		in := recipientInput{
-			RecipientID:    actorIDs[i],
+			RecipientID:    memberIDs[i],
 			KeyFingerprint: pub.Fingerprint,
 			Wrap:           secretWrap{Enc: w.Enc, Ct: w.Ciphertext},
 		}
-		if actorIDs[i] == actorInfo.ID {
+		if memberIDs[i] == memberInfo.ID {
 			// The caller's own org is known. For anyone else the server
 			// resolves it.
-			in.RecipientOrgID = actorInfo.OrgID
+			in.RecipientOrgID = memberInfo.OrgID
 		}
 		inputs[i] = in
 		sentTo[i] = Recipient{Email: recipients[i], Fingerprint: pub.Fingerprint} // #nosec G602 -- pubs holds one key per recipient
@@ -679,7 +679,7 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 	// The server checks the manifest against revision_id, name, size,
 	// checksum_sha256 and key_fingerprint, so they are taken from it.
 	req := &createRequest{
-		OrgID:           actorInfo.OrgID,
+		OrgID:           memberInfo.OrgID,
 		Name:            name,
 		RevisionID:      m.RevisionID,
 		ChecksumSHA256:  digestHex,
@@ -751,7 +751,7 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 		secretLog.Info("secret created", "secret_id", secret.ID, "revision_id", revisionID, "multipart", secret.IsMultipart)
 	}
 	for _, r := range revoked {
-		secretLog.Info("access revoked", "secret_id", secret.ID, "actor_id", r.ID, "email", r.Email)
+		secretLog.Info("access revoked", "secret_id", secret.ID, "member_id", r.ID, "email", r.Email)
 	}
 
 	// Upload AFTER the revision record exists so the backend's presign flow
@@ -781,7 +781,7 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 	} else {
 		transport.LogSinglePutPlan(log, size, opt.PresignExpiryMinutes)
 		tUp := time.Now()
-		if err := c.api.PresignUploadFrom(ctx, actorInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus.transport()); err != nil {
+		if err := c.api.PresignUploadFrom(ctx, memberInfo.OrgID, revisionID, sp, size, opt.OnUploadProgress, opt.PresignExpiryMinutes, opt.UploadStatus.transport()); err != nil {
 			return nil, fmt.Errorf("upload: %w", err)
 		}
 
@@ -877,13 +877,13 @@ func (c *Client) recipientKeys(ctx context.Context, known map[string][]knownkeys
 
 // senderAccount is the sender's account: the one the caller gave, or else
 // the server's answer now.
-func (c *Client) senderAccount(ctx context.Context, opt EncryptOptions) (*identity.Actor, error) {
+func (c *Client) senderAccount(ctx context.Context, opt EncryptOptions) (*identity.Member, error) {
 	if opt.Account != nil {
 		return opt.Account, nil
 	}
 	a, err := c.identity.WhoAmI(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("fetch actor info: %w", err)
+		return nil, fmt.Errorf("fetch member info: %w", err)
 	}
 	return a, nil
 }

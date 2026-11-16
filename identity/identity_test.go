@@ -28,7 +28,7 @@ func newKeyPair(t *testing.T) (*keys.Pair, string) {
 	return kp, fp
 }
 
-// meServer answers /actors/me with me and /orgs with orgs (or a 500 when
+// meServer answers /members/me with me and /orgs with orgs (or a 500 when
 // orgs is nil), and counts the requests each path gets.
 func meServer(t *testing.T, me map[string]any, orgs []map[string]any) (*transport.Client, func(path string) int) {
 	t.Helper()
@@ -40,7 +40,7 @@ func meServer(t *testing.T, me map[string]any, orgs []map[string]any) (*transpor
 		mu.Unlock()
 		var data any
 		switch {
-		case r.URL.Path == "/api/v1/actors/me":
+		case r.URL.Path == "/api/v1/members/me":
 			data = me
 		case r.URL.Path == "/api/v1/orgs" && orgs != nil:
 			data = orgs
@@ -63,9 +63,9 @@ func meServer(t *testing.T, me map[string]any, orgs []map[string]any) (*transpor
 	}
 }
 
-func actorAnswer(id, kind string) map[string]any {
+func memberAnswer(id, kind string) map[string]any {
 	return map[string]any{
-		"actor":           map[string]any{"id": id, "email": "ana@example.com", "name": "Ana"},
+		"member":          map[string]any{"id": id, "email": "ana@example.com", "name": "Ana"},
 		"membership":      map[string]any{"org_id": "org-1", "role": "owner", "org_kind": kind},
 		"effective_state": "ACTIVE_OWNER",
 		"subscription":    map[string]any{"status": "active"},
@@ -76,7 +76,7 @@ func actorAnswer(id, kind string) map[string]any {
 // from an organization, and the tier name from /orgs.
 func TestWhoAmIReadsTheOrgKind(t *testing.T) {
 	for _, kind := range []string{OrgKindPersonal, OrgKindOrganization} {
-		c, _ := meServer(t, actorAnswer("actor-1", kind), []map[string]any{{"id": "org-1", "tier_name": "Personal"}})
+		c, _ := meServer(t, memberAnswer("member-1", kind), []map[string]any{{"id": "org-1", "tier_name": "Personal"}})
 		info, err := whoAmI(context.Background(), c)
 		if err != nil {
 			t.Fatal(err)
@@ -84,33 +84,33 @@ func TestWhoAmIReadsTheOrgKind(t *testing.T) {
 		if info.Membership == nil || info.Membership.OrgKind != kind || info.Membership.Role != "owner" {
 			t.Errorf("membership %+v, want kind %s", info.Membership, kind)
 		}
-		if info.ID != "actor-1" || info.Email != "ana@example.com" || info.OrgID != "org-1" || info.TierName != "Personal" {
+		if info.ID != "member-1" || info.Email != "ana@example.com" || info.OrgID != "org-1" || info.TierName != "Personal" {
 			t.Errorf("flat fields %+v", info)
 		}
 	}
 
 	// /orgs failing only leaves the tier name out.
-	c, _ := meServer(t, actorAnswer("actor-1", OrgKindPersonal), nil)
+	c, _ := meServer(t, memberAnswer("member-1", OrgKindPersonal), nil)
 	info, err := whoAmI(context.Background(), c)
 	if err != nil || info.TierName != "" || info.Membership.OrgKind != OrgKindPersonal {
 		t.Fatalf("without /orgs: %+v, %v", info, err)
 	}
 }
 
-// resolveActorID, which every secrets list calls first, makes one request:
-// /actors/me, never the tier lookup. An answer without an ID fails.
-func TestResolveActorIDIsOneRequest(t *testing.T) {
-	c, hits := meServer(t, actorAnswer("actor-1", OrgKindOrganization), []map[string]any{{"id": "org-1", "tier_name": "Team"}})
-	id, err := resolveActorID(context.Background(), c)
-	if err != nil || id != "actor-1" {
-		t.Fatalf("resolveActorID = %q, %v", id, err)
+// resolveMemberID, which every secrets list calls first, makes one request:
+// /members/me, never the tier lookup. An answer without an ID fails.
+func TestResolveMemberIDIsOneRequest(t *testing.T) {
+	c, hits := meServer(t, memberAnswer("member-1", OrgKindOrganization), []map[string]any{{"id": "org-1", "tier_name": "Team"}})
+	id, err := resolveMemberID(context.Background(), c)
+	if err != nil || id != "member-1" {
+		t.Fatalf("resolveMemberID = %q, %v", id, err)
 	}
-	if hits("/api/v1/actors/me") != 1 || hits("/api/v1/orgs") != 0 {
-		t.Errorf("requests: actors/me %d, orgs %d; want 1 and 0", hits("/api/v1/actors/me"), hits("/api/v1/orgs"))
+	if hits("/api/v1/members/me") != 1 || hits("/api/v1/orgs") != 0 {
+		t.Errorf("requests: members/me %d, orgs %d; want 1 and 0", hits("/api/v1/members/me"), hits("/api/v1/orgs"))
 	}
 
-	c, _ = meServer(t, actorAnswer("", OrgKindOrganization), nil)
-	if id, err := resolveActorID(context.Background(), c); err == nil {
+	c, _ = meServer(t, memberAnswer("", OrgKindOrganization), nil)
+	if id, err := resolveMemberID(context.Background(), c); err == nil {
 		t.Fatalf("an answer without an ID gave %q", id)
 	}
 }

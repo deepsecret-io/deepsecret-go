@@ -78,8 +78,8 @@ func TestSyncRefusesAKMSKeyOfAnotherAccount(t *testing.T) {
 			switch {
 			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/identities":
 				uploads.Add(1)
-			case r.URL.Path == "/api/v1/actors/me":
-				data = actorAnswer(tc.signedIn, OrgKindPersonal)
+			case r.URL.Path == "/api/v1/members/me":
+				data = memberAnswer(tc.signedIn, OrgKindPersonal)
 			case r.URL.Path == "/api/v1/orgs":
 				data = []map[string]any{}
 			}
@@ -122,8 +122,8 @@ func TestSyncRefusesAnUnreadableKeyFile(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/identities":
 			uploads.Add(1)
-		case r.URL.Path == "/api/v1/actors/me":
-			data = actorAnswer("6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f", OrgKindPersonal)
+		case r.URL.Path == "/api/v1/members/me":
+			data = memberAnswer("6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f", OrgKindPersonal)
 		case r.URL.Path == "/api/v1/orgs":
 			data = []map[string]any{}
 		}

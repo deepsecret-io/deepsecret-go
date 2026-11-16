@@ -111,7 +111,7 @@ type SlotInfo struct {
 	AAGUID string
 	// KMSKeyARN is the AWS KMS key of a KMS slot.
 	KMSKeyARN string
-	// Account is the DeepSecret account (actor id) a KMS slot is bound to.
+	// Account is the DeepSecret account (member id) a KMS slot is bound to.
 	Account string
 }
 

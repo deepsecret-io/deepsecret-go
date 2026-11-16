@@ -38,35 +38,35 @@ func checkOwnKeys(dir string, pubKeys *keys.PublicKeys, senderFP string) error {
 	return nil
 }
 
-// resolveRecipientID fetches the actor ID for an email.
+// resolveRecipientID fetches the member ID for an email.
 func resolveRecipientID(ctx context.Context, c *transport.Client, email string) (string, error) {
-	resp, err := c.Get(ctx, "/api/v1/actors/email/"+transport.PathSegment(email))
+	resp, err := c.Get(ctx, "/api/v1/members/email/"+transport.PathSegment(email))
 	if err != nil {
 		return "", fmt.Errorf("lookup recipient: %w", err)
 	}
-	var actor struct {
+	var member struct {
 		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(resp.Data, &actor); err != nil {
+	if err := json.Unmarshal(resp.Data, &member); err != nil {
 		return "", fmt.Errorf("parse recipient: %w", err)
 	}
-	return actor.ID, nil
+	return member.ID, nil
 }
 
-// resolveActorEmail returns the email of the actor with id actorID.
-func resolveActorEmail(ctx context.Context, c *transport.Client, actorID string) (string, error) {
-	resp, err := c.Get(ctx, "/api/v1/actors/"+transport.PathSegment(actorID))
+// resolveMemberEmail returns the email of the member with id memberID.
+func resolveMemberEmail(ctx context.Context, c *transport.Client, memberID string) (string, error) {
+	resp, err := c.Get(ctx, "/api/v1/members/"+transport.PathSegment(memberID))
 	if err != nil {
 		return "", err
 	}
-	var actor struct {
+	var member struct {
 		Email string `json:"email"`
 	}
-	if err := json.Unmarshal(resp.Data, &actor); err != nil {
-		return "", fmt.Errorf("parse actor: %w", err)
+	if err := json.Unmarshal(resp.Data, &member); err != nil {
+		return "", fmt.Errorf("parse member: %w", err)
 	}
-	if actor.Email == "" {
-		return "", fmt.Errorf("actor %s has no email", actorID)
+	if member.Email == "" {
+		return "", fmt.Errorf("member %s has no email", memberID)
 	}
-	return actor.Email, nil
+	return member.Email, nil
 }

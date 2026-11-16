@@ -101,7 +101,7 @@ type ListOptions struct {
 
 // listSecretsFor returns secrets in the given direction ("sent" or "received")
 // for the authenticated user. Returns the list, total count, and any error.
-func listSecretsFor(ctx context.Context, c *transport.Client, actorID, direction string, opts ...ListOptions) ([]Info, int, error) {
+func listSecretsFor(ctx context.Context, c *transport.Client, memberID, direction string, opts ...ListOptions) ([]Info, int, error) {
 	opt := ListOptions{Limit: 20}
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -113,9 +113,9 @@ func listSecretsFor(ctx context.Context, c *transport.Client, actorID, direction
 	var path string
 	switch direction {
 	case "sent":
-		path = "/api/v1/secrets/sender/" + transport.PathSegment(actorID)
+		path = "/api/v1/secrets/sender/" + transport.PathSegment(memberID)
 	case "received":
-		path = "/api/v1/secrets/recipient/" + transport.PathSegment(actorID)
+		path = "/api/v1/secrets/recipient/" + transport.PathSegment(memberID)
 	default:
 		return nil, 0, fmt.Errorf("direction must be \"sent\" or \"received\", got %q", direction)
 	}

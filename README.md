@@ -12,7 +12,7 @@ End-to-end encrypted secrets management with hybrid post-quantum cryptography.
 
 ```
 deepsecret-go/       ← package deepsecret: the client and its setup
-├── identity/        ← account, org, groups, keys registered on the server (client.Identity)
+├── identity/        ← account, org, teams, keys registered on the server (client.Identity)
 ├── secrets/         ← send, receive, local files, list, revoke, policy, resume, storage (client.Secrets)
 ├── trust/           ← the keys this device knows: list, accept, verify, forget (client.Trust)
 ├── keys/            ← key pairs, fingerprints, safety numbers; no file access
@@ -313,12 +313,12 @@ accepting any key again.
 
 | Name | Description |
 |---|---|
-| `WhoAmI`, `ResolveActorID` | The caller's account |
+| `WhoAmI`, `ResolveMemberID` | The caller's account |
 | `ListKeys`, `Sync`, `SetPrimaryKey`, `DeleteKey`, `SetKeySecurityKey` | Keys registered on the server |
 | `RecordOwnAccount(ctx, fingerprint)` | Record the account as yours on this device, with a key pair here registered from another device |
 | `LoadPrimary(ctx, unlock)`, `PrimaryFingerprint` | The primary key pair on this device |
-| `ListGroups` | An org's groups and their members, for its owner and admins |
-| `ListMyGroups` | The groups the caller belongs to and their members, for any member |
+| `ListTeams` | An org's teams and their members, for its owner and admins |
+| `ListMyTeams` | The teams the caller belongs to and their members, for any member |
 
 ### `secrets`: `client.Secrets`
 

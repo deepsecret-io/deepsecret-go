@@ -65,11 +65,11 @@ func (k *testKMS) Decrypt(_ context.Context, _ string, c map[string]string, ct [
 // KMS key (or the recovery code) unlocks, once per operation.
 func TestKMSProtectedKeys(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-	alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	k := newTestKMS()
 	const account = "6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f"
 	codes := map[string]string{}
-	for _, a := range []*fakeActor{alice, bob} {
+	for _, a := range []*fakeMember{alice, bob} {
 		e, err := keystore.Edit(context.Background(), a.keys, a.fp, keystore.Unlock{})
 		if err != nil {
 			t.Fatal(err)

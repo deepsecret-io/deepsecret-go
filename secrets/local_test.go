@@ -44,7 +44,7 @@ func openLocalWith(c *deepsecret.Client, path string) (*secrets.DecryptResult, e
 
 func TestLocalFileRoundTrip(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
-	alice, bob, carol := f.actors["alice@example.com"], f.actors["bob@example.com"], f.actors["carol@example.com"]
+	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	path := filepath.Join(t.TempDir(), "note"+secrets.LocalFileExt)
 
 	res, err := f.client(alice.email).Secrets.EncryptText(context.Background(), []string{bob.email, carol.email}, "offline hello", secrets.EncryptOptions{Name: "note", LocalFile: path})
@@ -65,7 +65,7 @@ func TestLocalFileRoundTrip(t *testing.T) {
 		t.Errorf("file mode %v, want 0600", info.Mode().Perm())
 	}
 
-	for _, r := range []*fakeActor{bob, carol} {
+	for _, r := range []*fakeMember{bob, carol} {
 		out, err := f.openLocal(r.email, path)
 		if err != nil {
 			t.Fatalf("%s open: %v", r.email, err)
@@ -228,7 +228,7 @@ func TestLocalFileRefusesTampering(t *testing.T) {
 	cases["sender relabeled"] = struct{ path, want string }{relabeled, "has no registered key"}
 	// A path-changing email is refused before any lookup.
 	pathy := variant("pathy", clone())
-	rewriteHeader(t, pathy, func(h *secrets.LocalHeader) { h.SenderEmail = "../../actors/me@x" })
+	rewriteHeader(t, pathy, func(h *secrets.LocalHeader) { h.SenderEmail = "../../members/me@x" })
 	cases["sender email with a path"] = struct{ path, want string }{pathy, "invalid sender email"}
 	// The revision ID names the output directory, so a sender cannot make
 	// it a path; it is checked before the signature.

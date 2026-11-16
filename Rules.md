@@ -21,7 +21,7 @@ The SDK must be usable standalone without the CLI.
 
 2. Layering inside SDK
 - deepsecret (root) → client setup only: no domain code
-- identity → account, orgs, groups, keys registered on the server
+- identity → account, orgs, teams, keys registered on the server
 - secrets → send, receive, local files, list, revoke, policy, resume, storage
 - trust → the keys this device knows: list, accept, verify, forget
 - keys → key pairs, fingerprints, safety numbers; no file access

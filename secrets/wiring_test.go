@@ -46,7 +46,7 @@ func TestOptionsReachEveryService(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeAPI(t, "alice@example.com", "bob@example.com")
-			alice, bob := f.actors["alice@example.com"], f.actors["bob@example.com"]
+			alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 			given := filepath.Join(t.TempDir(), "named.json")
 			beside := filepath.Join(filepath.Dir(alice.keys), "known_keys.json")
 			want, other := beside, given

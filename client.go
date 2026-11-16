@@ -18,7 +18,7 @@ import (
 
 // Client is the DeepSecret SDK client: one login, with a service per domain.
 type Client struct {
-	// Identity reaches the caller's account, org, groups and registered keys.
+	// Identity reaches the caller's account, org, teams and registered keys.
 	Identity *identity.Client
 	// Secrets sends and receives secrets.
 	Secrets *secrets.Client
