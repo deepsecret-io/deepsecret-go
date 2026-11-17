@@ -10,7 +10,7 @@ package transport
 import (
 	"bytes"
 	"context"
-	"crypto/md5" // #nosec G501 -- MD5 only as S3 requires it: Content-MD5 and part ETags, transfer checksums, never a security control.
+	"crypto/md5" // #nosec G501 -- MD5 as S3 uses it: the Content-MD5 an upload URL is signed for and part ETags. Recipients trust the signed manifest's SHA-256.
 	cryptorand "crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -450,11 +450,15 @@ func checkPath(path string) error {
 	return nil
 }
 
-// presignUploadURL requests a presigned upload URL via the org-scoped endpoint.
-func (c *Client) presignUploadURL(ctx context.Context, orgID, objectKey string, expiryMinutes int) (string, error) {
+// presignUploadURL requests a presigned upload URL via the org-scoped
+// endpoint. contentMD5 is the base64 MD5 of the payload: the API signs it
+// into the URL, so storage refuses any other bytes under that URL, even
+// from someone who got hold of it.
+func (c *Client) presignUploadURL(ctx context.Context, orgID, objectKey, contentMD5 string, expiryMinutes int) (string, error) {
 	resp, err := c.Post(ctx, "/api/v1/orgs/"+PathSegment(orgID)+"/storage/presign", map[string]any{
 		"key":            objectKey,
 		"operation":      "put",
+		"content_md5":    contentMD5,
 		"expiry_minutes": expiryMinutes,
 	})
 	if err != nil {
@@ -519,19 +523,6 @@ func (c *Client) ConfirmUpload(ctx context.Context, revisionID string) error {
 	return nil
 }
 
-// PresignUploadReader gets a presigned PUT URL and streams data from a reader.
-// The caller must provide the exact size and base64-encoded MD5 hash (required
-// by S3 presigned PUT). For convenience, use [PresignUpload] with []byte data.
-//
-// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadReader(ctx context.Context, orgID, objectKey string, r io.ReadSeeker, size int64, contentMD5 string, expiryMinutes int) error {
-	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
-	if err != nil {
-		return err
-	}
-	return c.uploadReaderToPresignedURL(ctx, url, r, size, contentMD5)
-}
-
 // PresignDownloadReader gets a presigned GET URL and returns a reader for the
 // response body. The caller MUST close the returned ReadCloser.
 //
@@ -557,18 +548,6 @@ func (c *Client) PresignDownloadReader(ctx context.Context, revisionID string, e
 	return httpResp.Body, httpResp.ContentLength, nil
 }
 
-// PresignUpload gets a presigned PUT URL and uploads data from a byte slice.
-// Convenience wrapper: computes MD5 and size automatically.
-//
-// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUpload(ctx context.Context, orgID, objectKey string, data []byte, expiryMinutes int) error {
-	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
-	if err != nil {
-		return err
-	}
-	return c.uploadToPresignedURL(ctx, url, data)
-}
-
 // PresignUploadFrom uploads the size bytes of src to a presigned PUT URL
 // for objectKey, reading src once for the Content-MD5 and again for each
 // attempt, so it can be a file. onProgress and status are optional; status
@@ -576,12 +555,12 @@ func (c *Client) PresignUpload(ctx context.Context, orgID, objectKey string, dat
 //
 // expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
 func (c *Client) PresignUploadFrom(ctx context.Context, orgID, objectKey string, src io.ReaderAt, size int64, onProgress func(int64, int64), expiryMinutes int, status *TransferStatus) error {
-	h := md5.New() // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
+	h := md5.New() // #nosec G401 -- the Content-MD5 the upload URL is signed for; recipients trust the signed manifest's SHA-256.
 	if _, err := io.Copy(h, io.NewSectionReader(src, 0, size)); err != nil {
 		return fmt.Errorf("read payload: %w", err)
 	}
 	contentMD5 := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
+	url, err := c.presignUploadURL(ctx, orgID, objectKey, contentMD5, resolveExpiryMinutes(expiryMinutes))
 	if err != nil {
 		return err
 	}
@@ -711,29 +690,6 @@ func (c *Client) putToPresignedURL(ctx context.Context, presignedURL string, mak
 	return fmt.Errorf("upload failed after %d retries: %w", maxRetries, lastErr)
 }
 
-func (c *Client) uploadReaderToPresignedURL(ctx context.Context, presignedURL string, r io.ReadSeeker, size int64, contentMD5 string) error {
-	first := true
-	makeBody := func() (io.Reader, error) {
-		if first {
-			first = false
-			return r, nil
-		}
-		if _, err := r.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek for retry: %w", err)
-		}
-		return r, nil
-	}
-	return c.putToPresignedURL(ctx, presignedURL, makeBody, size, contentMD5, nil)
-}
-
-func (c *Client) uploadToPresignedURL(ctx context.Context, presignedURL string, data []byte) error {
-	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
-	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
-	return c.putToPresignedURL(ctx, presignedURL, func() (io.Reader, error) {
-		return bytes.NewReader(data), nil
-	}, int64(len(data)), contentMD5, nil)
-}
-
 // ── Progress-aware presigned operations ───────────────────────────────────────
 
 // progressCallbackReader wraps a reader with a progress callback.
@@ -751,20 +707,4 @@ func (pr *progressCallbackReader) Read(p []byte) (int, error) {
 		pr.onProgress(pr.transferred, pr.total)
 	}
 	return n, err
-}
-
-// PresignUploadWithProgress uploads data with a progress callback.
-// onProgress is called with (bytesTransferred, totalBytes) during upload.
-//
-// expiryMinutes sets the presigned URL lifetime; 0 = DefaultPresignExpiryMinutes.
-func (c *Client) PresignUploadWithProgress(ctx context.Context, orgID, objectKey string, data []byte, onProgress func(int64, int64), expiryMinutes int) error {
-	url, err := c.presignUploadURL(ctx, orgID, objectKey, resolveExpiryMinutes(expiryMinutes))
-	if err != nil {
-		return err
-	}
-	md5Sum := md5.Sum(data) // #nosec G401 -- S3 Content-MD5, a transfer checksum: the signed manifest covers the payload's SHA-256.
-	contentMD5 := base64.StdEncoding.EncodeToString(md5Sum[:])
-	return c.putToPresignedURL(ctx, url, func() (io.Reader, error) {
-		return bytes.NewReader(data), nil
-	}, int64(len(data)), contentMD5, onProgress)
 }

@@ -118,7 +118,7 @@ func TestTransferPathsKeepIDsInOneSegment(t *testing.T) {
 		{"/api/v1/secrets/revisions/" + seg + "/multipart/status", func() { _, _ = c.MultipartStatus(context.Background(), id) }},
 		{"/api/v1/secrets/revisions/" + seg + "/confirm", func() { _ = c.ConfirmUpload(context.Background(), id) }},
 		{"/api/v1/secrets/revisions/" + seg + "/presign", func() { _, _ = c.presignDownloadURL(context.Background(), id, 1) }},
-		{"/api/v1/orgs/" + seg + "/storage/presign", func() { _, _ = c.presignUploadURL(context.Background(), id, "key", 1) }},
+		{"/api/v1/orgs/" + seg + "/storage/presign", func() { _, _ = c.presignUploadURL(context.Background(), id, "key", "AAAAAAAAAAAAAAAAAAAAAA==", 1) }},
 	} {
 		mu.Lock()
 		paths = nil

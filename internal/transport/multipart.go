@@ -6,7 +6,7 @@ package transport
 import (
 	"cmp"
 	"context"
-	"crypto/md5" // #nosec G501 -- MD5 only as S3 requires it: Content-MD5 and part ETags, transfer checksums, never a security control.
+	"crypto/md5" // #nosec G501 -- MD5 as S3 uses it: each part's Content-MD5 and the ETag a kept part is matched by. Recipients trust the signed manifest's SHA-256.
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"

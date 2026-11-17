@@ -86,6 +86,9 @@ type fakeAPI struct {
 	secretGets, revisionLists, accountGets int
 	// registrations counts key uploads.
 	registrations int
+	// pinnedMD5 is the Content-MD5 each upload URL was issued for, by key:
+	// the API signs it into the URL, so storage refuses any other value.
+	pinnedMD5 map[string]string
 
 	// editBundle, when set, edits the primary key bundle listed for an
 	// email before it is served, as a hostile server would.
@@ -167,7 +170,7 @@ func newFakeAPI(t *testing.T, emails ...string) *fakeAPI {
 	t.Setenv("USERPROFILE", home) // the home directory on Windows
 	f := &fakeAPI{t: t, members: map[string]*fakeMember{}, secrets: map[string]*fakeSecret{},
 		revs: map[string]*fakeRevision{}, objects: t.TempDir(), multipartAt: 1 << 62,
-		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}, known: t.TempDir()}
+		uploads: map[string]*fakeUpload{}, tokens: map[string]int{}, known: t.TempDir(), pinnedMD5: map[string]string{}}
 	for i, email := range emails {
 		kp, err := keys.Generate()
 		if err != nil {
@@ -437,11 +440,21 @@ func (f *fakeAPI) secretByName(senderID, name string) *fakeSecret {
 	return nil
 }
 
+// presignUpload issues an upload URL pinned to the payload's MD5, as the API
+// does: the client must say what it will upload before it gets a URL.
 func (f *fakeAPI) presignUpload(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Key string `json:"key"`
+		Key        string `json:"key"`
+		ContentMD5 string `json:"content_md5"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
+	if sum, err := base64.StdEncoding.DecodeString(body.ContentMD5); err != nil || len(sum) != md5.Size {
+		fail(w, http.StatusBadRequest, "content_md5 must be the base64 MD5 of the payload")
+		return
+	}
+	f.mu.Lock()
+	f.pinnedMD5[body.Key] = body.ContentMD5
+	f.mu.Unlock()
 	ok(w, map[string]string{"url": f.srv.URL + "/s3/" + body.Key})
 }
 
@@ -460,6 +473,15 @@ func (f *fakeAPI) objectSize(key string) int64 {
 }
 
 func (f *fakeAPI) putObject(w http.ResponseWriter, r *http.Request) {
+	// The URL signs the Content-MD5 it was issued for: any other value
+	// fails the signature, as it does on S3.
+	f.mu.Lock()
+	pinned := f.pinnedMD5[r.PathValue("key")]
+	f.mu.Unlock()
+	if pinned == "" || r.Header.Get("Content-MD5") != pinned {
+		fail(w, http.StatusForbidden, "SignatureDoesNotMatch")
+		return
+	}
 	if !md5Matches(r) {
 		fail(w, http.StatusBadRequest, "BadDigest")
 		return
