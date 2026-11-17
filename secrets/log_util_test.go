@@ -146,7 +146,9 @@ func TestFlowLogs(t *testing.T) {
 	for _, l := range []*flowLog{&sent, &opened, &again} {
 		for _, r := range l.records {
 			line := r.module + ": " + r.msg + ": " + r.fields
-			if strings.Contains(line, "7319") || strings.Contains(line, "?t=") {
+			// "7319-alpha" cannot occur in a hex digest or a UUID by chance,
+			// as "7319" alone did now and then.
+			if strings.Contains(line, "7319-alpha") || strings.Contains(line, "?t=") {
 				t.Fatalf("logged a secret: %s", line)
 			}
 		}
