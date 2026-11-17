@@ -50,12 +50,15 @@ func (c *Client) ListKeys(ctx context.Context) ([]Key, error) {
 // Sync records the account on this device as the user's own, used with kp:
 // from then on only key pairs on this device pass for it (see Accept in package
 // trust). Then it uploads kp's public keys to the server, labelled with
-// protection, how its key file on this device is protected (a label for the
-// user's own key lists, see SetKeyProtection). A protection other than the four
+// protection, how its key file on this device is protected (a label shown in
+// the user's key lists and, for keys not protected, to their organization's
+// owner and admins; see SetKeyProtection). A protection other than the four
 // keystore.Protection values, such as "" for a key file that could not be
 // read, leaves the key not labelled. Nothing is uploaded when the server says
-// the account is someone this device knows as another person, or when the key
-// file on this device is protected by KMS keys bound to another account.
+// the account is someone this device knows as another person, when the key
+// file on this device is protected by KMS keys bound to another account, or
+// when the account's organization requires protected keys and protection is
+// not one (ErrKeyProtectionRequired).
 func (c *Client) Sync(ctx context.Context, kp *keys.Pair, protection keystore.Protection) error {
 	fp, err := keys.Fingerprint(kp)
 	if err != nil {
@@ -64,6 +67,9 @@ func (c *Client) Sync(ctx context.Context, kp *keys.Pair, protection keystore.Pr
 	me, err := whoAmI(ctx, c.api)
 	if err != nil {
 		return fmt.Errorf("fetch your account: %w", err)
+	}
+	if me.Membership != nil && me.Membership.KeyProtectionRequired && !protection.Protected() {
+		return ErrKeyProtectionRequired
 	}
 	if err := checkKMSAccount(c.keysDir, fp, me.ID); err != nil {
 		return err
@@ -108,8 +114,11 @@ func (c *Client) RecordOwnAccount(ctx context.Context, fingerprint string) error
 // labelled as protected: what the client of the device that holds its key file
 // reports after that file's protection changed. protection is one of the four
 // keystore.Protection values; anything else, "" included, is refused with
-// ErrUnknownProtection before any request. The label is shown only in the
-// user's own key lists; it is not signed and decides nothing.
+// ErrUnknownProtection before any request. The label is shown in the user's
+// own key lists, and a key not protected is shown to their organization's
+// owner and admins. It is not signed. The server records it whatever the
+// organization's key protection policy says, so a key whose protection was
+// removed does not keep a stale label.
 func (c *Client) SetKeyProtection(ctx context.Context, identityID string, protection keystore.Protection) error {
 	return setKeyProtection(ctx, c.api, identityID, protection)
 }
@@ -154,6 +163,10 @@ type Membership struct {
 	// OrgKind is "personal" for a one-person workspace, which has no
 	// members, teams or audit log, or "organization".
 	OrgKind string `json:"org_kind"`
+	// KeyProtectionRequired is the org's key protection policy: the
+	// server refuses to register a key pair that is not protected by a
+	// password, a security key or an AWS KMS key.
+	KeyProtectionRequired bool `json:"key_protection_required"`
 }
 
 // Org kinds, as OrgKind holds them.
@@ -331,6 +344,23 @@ func checkKMSAccount(dir, fp, memberID string) error {
 // ErrUnknownProtection refuses a protection label that is not one of the
 // four keystore.Protection values.
 var ErrUnknownProtection = errors.New("unknown key pair protection")
+
+// ErrKeyProtectionRequired refuses to register a key pair that is not
+// protected (keystore.Protection.Protected) for an organization that
+// requires protected keys. The server refuses it as well; Sync refuses it
+// first, before anything is uploaded or recorded.
+var ErrKeyProtectionRequired = errors.New("your organization requires a protected key pair: a password, a security key or an AWS KMS key")
+
+// KeyProtectionRequired reports whether the caller's organization requires
+// protected key pairs, so a client can refuse before it generates one that
+// Sync would refuse. False with no organization.
+func (c *Client) KeyProtectionRequired(ctx context.Context) (bool, error) {
+	me, err := memberMe(ctx, c.api)
+	if err != nil {
+		return false, err
+	}
+	return me.Membership != nil && me.Membership.KeyProtectionRequired, nil
+}
 
 // reportable says whether p is a protection the server takes as a label.
 func reportable(p keystore.Protection) bool {

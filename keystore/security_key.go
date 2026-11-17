@@ -89,6 +89,17 @@ const (
 	ProtectionKMS Protection = "aws_kms"
 )
 
+// Protected says whether p takes more than the key file to open: a
+// password, a security key or an AWS KMS key. These are the protections
+// an organization that requires protected keys accepts.
+func (p Protection) Protected() bool {
+	switch p {
+	case ProtectionPassword, ProtectionSecurityKey, ProtectionKMS:
+		return true
+	}
+	return false
+}
+
 // SlotType names a way into a slot file (version 5 or 6).
 type SlotType string
 

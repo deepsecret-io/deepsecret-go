@@ -180,3 +180,55 @@ func TestLoadPrimaryUnlocksWithAPassword(t *testing.T) {
 		t.Errorf("wrong password: %v", err)
 	}
 }
+
+// An org that requires protected keys (membership.key_protection_required)
+// gets no upload of a key pair that is not protected: Sync refuses it with
+// ErrKeyProtectionRequired before anything is sent or recorded, whatever
+// the label, none or unknown. A protected key pair is uploaded, and
+// KeyProtectionRequired reports the policy.
+func TestSyncRefusesAnUnprotectedKeyWhenTheOrgRequiresProtection(t *testing.T) {
+	var uploads atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var data any = map[string]any{}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/identities":
+			uploads.Add(1)
+		case r.URL.Path == "/api/v1/members/me":
+			me := memberAnswer("member-1", OrgKindOrganization)
+			me["membership"].(map[string]any)["key_protection_required"] = true
+			data = me
+		case r.URL.Path == "/api/v1/orgs":
+			data = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": data})
+	}))
+	t.Cleanup(srv.Close)
+	api, err := transport.NewClient(srv.URL, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := knownkeys.New(filepath.Join(t.TempDir(), "known_keys.json"), srv.URL, t.TempDir())
+	c := New(api, store, t.TempDir())
+
+	required, err := c.KeyProtectionRequired(context.Background())
+	if err != nil || !required {
+		t.Fatalf("KeyProtectionRequired = %v, %v; want true", required, err)
+	}
+	for _, p := range []keystore.Protection{keystore.ProtectionNone, ""} {
+		kp, _ := newKeyPair(t)
+		if err := c.Sync(context.Background(), kp, p); !errors.Is(err, ErrKeyProtectionRequired) {
+			t.Fatalf("Sync with %q = %v, want ErrKeyProtectionRequired", p, err)
+		}
+	}
+	if n := uploads.Load(); n != 0 {
+		t.Fatalf("%d unprotected key pairs uploaded", n)
+	}
+	kp, _ := newKeyPair(t)
+	if err := c.Sync(context.Background(), kp, keystore.ProtectionPassword); err != nil {
+		t.Fatalf("Sync with a password: %v", err)
+	}
+	if n := uploads.Load(); n != 1 {
+		t.Errorf("%d uploads of the protected key pair, want 1", n)
+	}
+}
