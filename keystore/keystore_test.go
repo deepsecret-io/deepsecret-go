@@ -4,6 +4,7 @@
 package keystore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -287,5 +288,79 @@ func writeVersioned(t *testing.T, path string, kp *keys.Pair, version int) {
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// editKeyFile rewrites the key file of fp in dir with edit applied to its
+// fields, as someone who can write the file would.
+func editKeyFile(t *testing.T, dir, fp string, edit func(file map[string]any)) {
+	t.Helper()
+	path := filepath.Join(dir, fp+".json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file map[string]any
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	edit(file)
+	if raw, err = json.Marshal(file); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The Argon2 parameters come from the key file, before the password proves
+// anything about it: a file asking for far more memory, time or threads
+// than this SDK writes is refused before a key is derived, so a planted
+// file cannot make the process allocate until it dies.
+func TestLoadRefusesArgon2ParametersOutOfRange(t *testing.T) {
+	for name, edit := range map[string]func(file map[string]any){
+		"memory":  func(file map[string]any) { file["argon2_memory"] = uint32(1<<32 - 1) },
+		"time":    func(file map[string]any) { file["argon2_time"] = uint32(1<<32 - 1) },
+		"threads": func(file map[string]any) { file["argon2_threads"] = 255 },
+	} {
+		dir := t.TempDir()
+		_, fp := v4Key(t, dir, "mypassword")
+		editKeyFile(t, dir, fp, edit)
+		if _, err := Load(dir, fp, "mypassword"); err == nil || !strings.Contains(err.Error(), "Argon2 parameters beyond") {
+			t.Errorf("%s: %v, want the parameters refused", name, err)
+		}
+	}
+	// What this SDK writes, and the most it accepts, pass.
+	dir := t.TempDir()
+	_, fp := v4Key(t, dir, "mypassword")
+	if _, err := Load(dir, fp, "mypassword"); err != nil {
+		t.Fatalf("the SDK's own parameters: %v", err)
+	}
+	if defaultArgon2Memory > maxArgon2Memory || defaultArgon2Time > maxArgon2Time || defaultArgon2Threads > maxArgon2Threads {
+		t.Fatal("the SDK writes parameters it refuses to read")
+	}
+}
+
+// A version 4 key file whose private keys are not those of its public keys
+// is refused when it is read, by Load and by Open: an Ed25519 private key
+// of the wrong size would otherwise panic at the first signature.
+func TestV4LoadChecksThePrivateKeys(t *testing.T) {
+	other, _ := keys.Generate()
+	for name, edit := range map[string]func(file map[string]any){
+		"a short Ed25519 key": func(file map[string]any) {
+			file["ed25519_private"] = file["ed25519_private"].(string)[:20]
+		},
+		"another pair's X25519 key": func(file map[string]any) { file["x25519_private"] = other.X25519Private },
+		"no ML-DSA seed":            func(file map[string]any) { delete(file, "mldsa65_seed") },
+	} {
+		dir := t.TempDir()
+		_, fp := v4Key(t, dir, "")
+		editKeyFile(t, dir, fp, edit)
+		if kp, err := Load(dir, fp, ""); err == nil || kp != nil || !strings.Contains(err.Error(), "key file is damaged") {
+			t.Errorf("Load, %s: %v, want the file refused", name, err)
+		}
+		if kp, err := Open(context.Background(), dir, fp, Unlock{}); err == nil || kp != nil {
+			t.Errorf("Open, %s: %v, want the file refused", name, err)
+		}
 	}
 }

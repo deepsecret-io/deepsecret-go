@@ -6,6 +6,7 @@ package knownkeys
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -93,5 +94,35 @@ func TestStoreReadsAFileFromTheOldBuild(t *testing.T) {
 		if states[email] != state {
 			t.Errorf("%s: state %q, want %q", email, states[email], state)
 		}
+	}
+}
+
+// The known keys file decides which keys this device accepts, so one that
+// other users may open is refused, as a key file is, and what this package
+// writes is private.
+func TestStoreRefusesAFileOpenToOthers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file modes; the Windows rule is tested in internal/disk")
+	}
+	dir := filepath.Join(t.TempDir(), "new", "folder")
+	path := filepath.Join(dir, "known_keys.json")
+	s := New(path, oldServer, t.TempDir())
+	bob := []Person{{Email: "bob@example.com", Fingerprint: strings.Repeat("a", 64)}}
+	if err := s.RecordFirstUse(bob, false); err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[string]os.FileMode{dir: 0o700, path: 0o600} {
+		if info, err := os.Stat(p); err != nil || info.Mode().Perm() != want {
+			t.Fatalf("%s: %v, %v; want mode %o", p, info.Mode().Perm(), err, want)
+		}
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(""); err == nil || !strings.Contains(err.Error(), "open to other users") {
+		t.Fatalf("List of a file open to others: %v, want it refused", err)
+	}
+	if err := s.RecordFirstUse(bob, false); err == nil {
+		t.Fatal("a change to a file open to others was accepted")
 	}
 }

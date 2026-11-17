@@ -99,19 +99,22 @@ type Client struct {
 	// allowed to redirect attacker-controlled bodies anywhere.
 	presignClient *http.Client
 
+	// plainStorage allows presigned URLs over plaintext HTTP. It is set
+	// only when the API base itself is plaintext HTTP, which takes a
+	// loopback host or one in DEEPSECRET_INSECURE_HOSTS: local development
+	// and tests. Against an https API every presigned URL must be https.
+	plainStorage bool
+
 	// maxResponse bounds an API response body: maxAPIResponseSize, which
 	// tests lower.
 	maxResponse int64
 }
 
-// isLocalhostURL returns true if the URL targets loopback (127.0.0.1, ::1,
-// localhost). These are the only hosts where HTTP is acceptable (dev/testing).
-func isLocalhostURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	h := strings.ToLower(u.Hostname())
+// isLoopbackHost reports whether host, a URL's host name, is loopback
+// (127.0.0.1, ::1, localhost). These are the only hosts where HTTP is
+// acceptable without an allowlist (dev/testing).
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(host)
 	return h == "localhost" || h == "127.0.0.1" || h == "::1"
 }
 
@@ -121,28 +124,60 @@ func isLocalhostURL(raw string) bool {
 // allowlist (e.g. "vpn.internal,10.0.0.5"); only those exact hostnames are
 // permitted to use plaintext HTTP, and a loud warning is still printed.
 // The legacy global DEEPSECRET_ALLOW_INSECURE_HTTP env var is no longer
-// honored; set the per-host allowlist instead.
+// honored; set the per-host allowlist instead. It refuses everything
+// parseBaseURL does.
 func ValidateTransportSecurity(apiURL string) error {
-	if !strings.HasPrefix(apiURL, "http://") || isLocalhostURL(apiURL) {
-		return nil
-	}
+	_, _, err := parseBaseURL(apiURL)
+	return err
+}
+
+// parseBaseURL parses apiURL once and returns the base every request is
+// built on, made from the parsed parts: the scheme in lower case, the host
+// and the path without trailing slashes. plain reports a plaintext HTTP
+// base, which only a loopback host or one in DEEPSECRET_INSECURE_HOSTS may
+// be.
+//
+// The scheme is compared after parsing, so "HTTP://host" is plaintext like
+// "http://host" and is held to the same rule: a prefix test let it through
+// and sent the credential in clear. Any scheme but https and http is
+// refused, and so are user info, a query and a fragment, which have no
+// place in a base URL and would end up in every request or in logs. Errors
+// name the scheme and host only.
+func parseBaseURL(apiURL string) (base string, plain bool, err error) {
 	u, err := url.Parse(apiURL)
-	if err != nil {
-		return fmt.Errorf("invalid API URL %q: %w", apiURL, err)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
+		return "", false, errors.New("invalid API URL: it must be an absolute https URL, like https://api.example.com")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	shown := scheme + "://" + u.Host
+	switch {
+	case u.User != nil:
+		return "", false, errors.New("invalid API URL: it must not hold a user name or a password")
+	case u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(apiURL, "#"):
+		return "", false, fmt.Errorf("invalid API URL (%s): it must not hold a query or a fragment", shown)
+	case scheme != "https" && scheme != "http":
+		return "", false, fmt.Errorf("invalid API URL (%s): the scheme must be https", shown)
+	}
+	base = scheme + "://" + u.Host + strings.TrimRight(u.EscapedPath(), "/")
+	if scheme == "https" {
+		return base, false, nil
 	}
 	host := strings.ToLower(u.Hostname())
+	if isLoopbackHost(host) {
+		return base, true, nil
+	}
 
 	allow := os.Getenv("DEEPSECRET_INSECURE_HOSTS")
 	if allow == "" {
-		return fmt.Errorf("API URL uses plaintext HTTP (%s). Credentials would be sent unencrypted.\n  Use HTTPS, or set DEEPSECRET_INSECURE_HOSTS=<host>[,<host>...] to allow this exact host (not recommended)", apiURL)
+		return "", false, fmt.Errorf("API URL uses plaintext HTTP (%s). Credentials would be sent unencrypted.\n  Use HTTPS, or set DEEPSECRET_INSECURE_HOSTS=<host>[,<host>...] to allow this exact host (not recommended)", shown)
 	}
 	for _, h := range strings.Split(allow, ",") {
 		if strings.ToLower(strings.TrimSpace(h)) == host {
 			fmt.Fprintf(os.Stderr, "\n  WARNING: DEEPSECRET_INSECURE_HOSTS allows plaintext HTTP for %q.\n     Credentials will be sent unencrypted. This is dangerous outside of a controlled network.\n\n", host)
-			return nil
+			return base, true, nil
 		}
 	}
-	return fmt.Errorf("API URL uses plaintext HTTP (%s) but host %q is not in DEEPSECRET_INSECURE_HOSTS", apiURL, host)
+	return "", false, fmt.Errorf("API URL uses plaintext HTTP (%s) but host %q is not in DEEPSECRET_INSECURE_HOSTS", shown, host)
 }
 
 // validateAPIKey rejects API keys that contain CRLF, control characters, or
@@ -162,18 +197,18 @@ func validateAPIKey(apiKey string) error {
 	return nil
 }
 
-// NewClient creates a new API client. Returns an error if the URL uses
-// plaintext HTTP on a non-localhost host (override with
-// DEEPSECRET_ALLOW_INSECURE_HTTP=1) or if the API key contains characters
-// that are invalid in an HTTP header value.
+// NewClient creates a new API client. Returns an error if the URL is not
+// one parseBaseURL takes (plaintext HTTP on a host that is neither loopback
+// nor in DEEPSECRET_INSECURE_HOSTS, user info, a query or a fragment) or if
+// the API key contains characters that are invalid in an HTTP header value.
 func NewClient(apiURL, apiKey string) (*Client, error) {
-	if err := ValidateTransportSecurity(apiURL); err != nil {
+	base, plain, err := parseBaseURL(apiURL)
+	if err != nil {
 		return nil, err
 	}
 	if err := validateAPIKey(apiKey); err != nil {
 		return nil, err
 	}
-	base := strings.TrimRight(apiURL, "/")
 
 	apiTransport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -234,6 +269,7 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 
 	return &Client{
 		baseURL:       base,
+		plainStorage:  plain,
 		apiKey:        apiKey,
 		httpClient:    apiClient,
 		presignClient: presignClient,
@@ -514,9 +550,16 @@ func (c *Client) presignDownloadPlan(ctx context.Context, revisionID string, exp
 }
 
 // ConfirmUpload asks the backend to HEAD the uploaded object and mark the
-// revision as uploaded. Downloads are blocked until this succeeds.
+// revision as uploaded. Downloads are blocked until this succeeds. The
+// server answers a confirm of a confirmed revision with success, so a
+// transient failure (transport, 5xx, 429) is retried as the multipart
+// calls are: the payload is already in storage, and giving up here would
+// leave it there with a revision nobody can download.
 func (c *Client) ConfirmUpload(ctx context.Context, revisionID string) error {
-	_, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/confirm", map[string]any{})
+	err := c.retryAPI(ctx, func() error {
+		_, err := c.Post(ctx, "/api/v1/secrets/revisions/"+PathSegment(revisionID)+"/confirm", map[string]any{})
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("confirm upload: %w", err)
 	}
@@ -532,7 +575,7 @@ func (c *Client) PresignDownloadReader(ctx context.Context, revisionID string, e
 	if err != nil {
 		return nil, 0, err
 	}
-	getReq, gerr := http.NewRequestWithContext(ctx, "GET", presignedURL, nil)
+	getReq, gerr := c.presignedRequest(ctx, "GET", presignedURL, nil)
 	if gerr != nil {
 		return nil, 0, gerr
 	}
@@ -657,7 +700,7 @@ func (c *Client) putToPresignedURL(ctx context.Context, presignedURL string, mak
 		retry, err := func() (bool, error) {
 			attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			req, err := http.NewRequestWithContext(attemptCtx, "PUT", presignedURL, body)
+			req, err := c.presignedRequest(attemptCtx, "PUT", presignedURL, body)
 			if err != nil {
 				return false, err
 			}

@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"maps"
+	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -131,5 +133,75 @@ func TestOrgEnforcedIPLockIsReported(t *testing.T) {
 	reported("the policy update", policy)
 	if policy.IPLockSource != "org-enforced" || len(policy.AllowedIPs) != 0 {
 		t.Errorf("the policy update: IP lock source %q with addresses %v", policy.IPLockSource, policy.AllowedIPs)
+	}
+}
+
+// An archive hides its files from the server. The create request of a send
+// that goes as an archive names the secret at random unless the caller
+// named it, never after the path, and carries neither the files' size
+// before compression nor the compression ratio. The sender still gets both
+// in the result.
+func TestArchiveSendTellsTheServerNothingAboutTheFiles(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice := f.client("alice@example.com")
+	folder := filepath.Join(t.TempDir(), "payroll-2026")
+	writeFile(t, filepath.Join(folder, "salaries.csv"), bytes.Repeat([]byte("name,amount\n"), 4096), 0o600)
+	linked := filepath.Join(t.TempDir(), "linked-tree")
+	writeFile(t, filepath.Join(linked, "target.txt"), []byte("target"), 0o600)
+	if err := os.Symlink("target.txt", filepath.Join(linked, "link")); err != nil {
+		t.Skipf("symbolic links are not available: %v", err)
+	}
+	random := regexp.MustCompile(`^sdk-[0-9]+-[0-9a-f]{12}$`)
+
+	for what, c := range map[string]struct {
+		path string
+		opt  secrets.EncryptOptions
+	}{
+		"Archive":                     {folder, secrets.EncryptOptions{Archive: true}},
+		"an archive forced by a link": {linked, secrets.EncryptOptions{}},
+	} {
+		res, err := alice.Secrets.EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{c.path}, c.opt)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if !res.Archived || !random.MatchString(res.Secret.Name) {
+			t.Errorf("%s: archived %v under the name %q, want an archive under a random name", what, res.Archived, res.Secret.Name)
+		}
+		if res.OriginalSize == 0 || res.CompressionRatio == 0 {
+			t.Errorf("%s: the result has original size %d and ratio %v, want both for the sender", what, res.OriginalSize, res.CompressionRatio)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(f.lastBody, &body); err != nil {
+			t.Fatalf("%s: create request: %v", what, err)
+		}
+		for _, field := range []string{"original_size", "compression_ratio", "files_meta"} {
+			if v, sent := body[field]; sent {
+				t.Errorf("%s: the create request carries %s = %s", what, field, v)
+			}
+		}
+		if string(body["compression"]) != `"tar+zstd"` || string(body["files_count"]) != "0" {
+			t.Errorf("%s: compression %s, files_count %s", what, body["compression"], body["files_count"])
+		}
+		for _, leak := range []string{filepath.Base(c.path), "salaries", "target.txt"} {
+			if bytes.Contains(f.lastBody, []byte(leak)) {
+				t.Errorf("%s: the create request names %q", what, leak)
+			}
+		}
+	}
+
+	// A name the caller gives is the caller's to tell.
+	res, err := alice.Secrets.EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{folder}, secrets.EncryptOptions{Archive: true, Name: "q4"})
+	if err != nil || res.Secret.Name != "q4" {
+		t.Fatalf("a named archive: %+v, %v", res, err)
+	}
+	// Without an archive the path still names the secret, and a compressed
+	// send still says how well it compressed.
+	res, err = alice.Secrets.EncryptPaths(context.Background(), []string{"bob@example.com"}, []string{folder}, secrets.EncryptOptions{Compress: secrets.CompressZstd})
+	if err != nil || res.Archived || res.Secret.Name != "payroll-2026" {
+		t.Fatalf("a send without an archive: %+v, %v", res, err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(f.lastBody, &body); err != nil || body["original_size"] == nil || body["compression_ratio"] == nil {
+		t.Fatalf("a compressed send without an archive carries no original size or ratio: %s, %v", f.lastBody, err)
 	}
 }

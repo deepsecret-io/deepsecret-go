@@ -61,7 +61,9 @@ func WithSessionStore(s SessionStore) Option {
 }
 
 // NewClient creates a new DeepSecret SDK client. Every call that can block
-// takes a context, and ends when it does.
+// takes a context, and ends when it does. apiURL must be an https URL with
+// no user info, query or fragment; plaintext HTTP, in any letter case, is
+// taken only for a loopback host or one listed in DEEPSECRET_INSECURE_HOSTS.
 func NewClient(apiURL, apiKey string, opts ...Option) (*Client, error) {
 	api, err := transport.NewClient(apiURL, apiKey)
 	if err != nil {

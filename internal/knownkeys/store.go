@@ -109,9 +109,9 @@ func (e *KeyChangedError) Error() string {
 
 // StaleRevisionError refuses the revision the server gives as a secret's
 // latest when this device already opened a revision of that secret, from
-// the same sender or signed with the same key, signed later: the server may
-// be rolling the secret back. Requesting RevisionID explicitly opens it
-// anyway.
+// the same sender, signed with the same key or under the same secret id,
+// signed later: the server may be rolling the secret back. Requesting
+// RevisionID explicitly opens it anyway.
 type StaleRevisionError struct {
 	SecretName  string
 	SenderEmail string
@@ -453,26 +453,51 @@ func (s *Store) RecordFirstUse(people []Person, sender bool) error {
 	server := s.server
 	var refused error
 	err := s.file.update(func(d *knownKeysDisk) bool {
-		known := d.peopleOn(server)
-		changed := false
-		for _, p := range people {
-			email := strings.ToLower(p.Email)
-			first, err := CheckKey(known, email, p.Fingerprint, sender)
-			if err != nil {
-				refused = err
-				return false
-			}
-			if first {
-				known[email] = firstUse(p.Fingerprint)
-				changed = true
-			}
-		}
-		return changed
+		var changed bool
+		changed, refused = noteFirstUses(d.peopleOn(server), people, sender)
+		return changed && refused == nil
 	})
 	if err == nil {
 		err = refused
 	}
 	return err
+}
+
+// CheckFirstUse checks what RecordFirstUse would, and records nothing: it
+// returns the error RecordFirstUse would return for people now. A resumed
+// upload calls it before it finishes the upload, so a key this device
+// recorded for one of people since the send was sealed stops the resume
+// while the revision is still not downloadable.
+func (s *Store) CheckFirstUse(people []Person, sender bool) error {
+	if len(people) == 0 {
+		return nil
+	}
+	d, err := s.file.read()
+	if err != nil {
+		return err
+	}
+	// d is this call's own copy of the file, so noting in it records nothing.
+	_, err = noteFirstUses(d.peopleOn(s.server), people, sender)
+	return err
+}
+
+// noteFirstUses checks each of people against known with CheckKey and notes
+// in known the keys new to this device, so one key listed for two of people
+// is refused. It reports whether it noted any; on an error known is not to
+// be written.
+func noteFirstUses(known map[string][]Entry, people []Person, sender bool) (changed bool, err error) {
+	for _, p := range people {
+		email := strings.ToLower(p.Email)
+		first, err := CheckKey(known, email, p.Fingerprint, sender)
+		if err != nil {
+			return false, err
+		}
+		if first {
+			known[email] = firstUse(p.Fingerprint)
+			changed = true
+		}
+	}
+	return changed, nil
 }
 
 // CheckSenderKey checks fp, the key whose signatures on a secret from email
@@ -547,15 +572,26 @@ type SenderKey struct {
 // may be: room for a sender's clock that runs a little fast.
 const newestAhead = 5 * time.Minute
 
-// CheckNewest refuses m, the revision the server gives as its secret's
-// latest, when this device already opened a revision of the same secret
-// that was signed later, from email or with the key that signed m. The
-// server names the sender and the manifest signs the key, so the record per
-// key holds when the server names the sender under another address.
-func (s *Store) CheckNewest(email string, m *protocol.Manifest) error {
+// CheckNewest refuses m, the revision the server gives as the latest of the
+// secret secretID, when this device already opened a revision of the same
+// secret that was signed later: from email, with the key that signed m, or
+// under secretID. The server names the sender and the manifest signs the
+// key, so the record per key holds when the server names the sender under
+// another address. Neither of those two is keyed by what the caller asked
+// for, and a revision whose sender address and signing key are both new to
+// this device has no record under them: the record per secret id holds
+// then. Signing times are whole seconds and nothing else orders two
+// revisions, so one signed in the same second as the newest opened passes,
+// under all three: refusing it would refuse a sender's second send within
+// a second.
+func (s *Store) CheckNewest(email, secretID string, m *protocol.Manifest) error {
 	disk, err := s.file.read()
 	if err != nil {
 		return err
+	}
+	stale := func(newest int64) error {
+		return &StaleRevisionError{SecretName: m.SecretName, SenderEmail: email, RevisionID: m.RevisionID,
+			SignedAt: time.Unix(m.Timestamp, 0), NewestSeen: time.Unix(newest, 0)}
 	}
 	records := [2]map[string]int64{
 		disk.Newest[s.server][strings.ToLower(email)],
@@ -563,29 +599,54 @@ func (s *Store) CheckNewest(email string, m *protocol.Manifest) error {
 	}
 	for _, record := range records {
 		if newest, ok := record[m.SecretName]; ok && m.Timestamp < newest {
-			return &StaleRevisionError{SecretName: m.SecretName, SenderEmail: email, RevisionID: m.RevisionID,
-				SignedAt: time.Unix(m.Timestamp, 0), NewestSeen: time.Unix(newest, 0)}
+			return stale(newest)
+		}
+	}
+	if seen, ok := disk.NewestBySecret[s.server][strings.ToLower(secretID)]; ok {
+		if m.Timestamp < seen.At {
+			return stale(seen.At)
 		}
 	}
 	return nil
 }
 
 // NewestRecorder records m's signing time as the newest of its secret from
-// email, and from the key that signed it, once a decrypt of it succeeded.
-// It never lowers a recorded time. The sender's clock is signed, not
-// trusted: a time more than newestAhead past this device's clock is
-// recorded as that limit, so one revision signed far ahead cannot make the
-// sender's later ones look stale for as long.
-func (s *Store) NewestRecorder(email string, m *protocol.Manifest) func() error {
+// email, from the key that signed it, and of the secret secretID, with m's
+// revision id, once a decrypt of it succeeded. It never lowers a recorded
+// time, and at an equal time keeps the revision recorded first. The
+// sender's clock is signed, not trusted: a
+// time more than newestAhead past this device's clock is recorded as that
+// limit, so one revision signed far ahead cannot make the sender's later
+// ones look stale for as long.
+func (s *Store) NewestRecorder(email, secretID string, m *protocol.Manifest) func() error {
 	server, sender, fp, name, signed := s.server, strings.ToLower(email), strings.ToLower(m.SenderFingerprint), m.SecretName, m.Timestamp
+	id, revisionID := strings.ToLower(secretID), m.RevisionID
 	return func() error {
 		at := min(signed, s.now().Add(newestAhead).Unix())
 		return s.file.update(func(d *knownKeysDisk) bool {
 			byEmail := raiseNewest(&d.Newest, server, sender, name, at)
 			byKey := raiseNewest(&d.NewestByKey, server, fp, name, at)
-			return byEmail || byKey
+			bySecret := d.raiseNewestBySecret(server, id, newestRevision{At: at, RevisionID: revisionID})
+			return byEmail || byKey || bySecret
 		})
 	}
+}
+
+// raiseNewestBySecret records seen as the newest revision opened of the
+// secret id on server, unless one signed as late is recorded, and reports
+// whether it did.
+func (d *knownKeysDisk) raiseNewestBySecret(server, id string, seen newestRevision) bool {
+	if have, ok := d.NewestBySecret[server][id]; ok && have.At >= seen.At {
+		return false
+	}
+	if d.NewestBySecret == nil {
+		d.NewestBySecret = map[string]map[string]newestRevision{}
+	}
+	if d.NewestBySecret[server] == nil {
+		d.NewestBySecret[server] = map[string]newestRevision{}
+	}
+	d.NewestBySecret[server][id] = seen
+	return true
 }
 
 // raiseNewest records at as the newest signing time of the secret name from
@@ -731,6 +792,20 @@ type knownKeysDisk struct {
 	// which the manifest signs, in place of the email the server names. A
 	// file written before it was kept has none.
 	NewestByKey map[string]map[string]map[string]int64 `json:"newest_by_key,omitempty"`
+	// NewestBySecret holds, by API base URL and lower-case secret id, the
+	// newest revision this device opened of that secret: what the caller
+	// asked for, where the two records above go by what the server and the
+	// manifest name. A file written before it was kept has none.
+	NewestBySecret map[string]map[string]newestRevision `json:"newest_by_secret,omitempty"`
+}
+
+// newestRevision is the newest revision this device opened of a secret: its
+// signing time (Unix seconds), bounded as NewestRecorder bounds it, and its
+// id, which says which revision set that time. CheckNewest compares the
+// time only.
+type newestRevision struct {
+	At         int64  `json:"at"`
+	RevisionID string `json:"revision_id"`
 }
 
 type Entry struct {
@@ -755,9 +830,11 @@ func (d *knownKeysDisk) peopleOn(server string) map[string][]Entry {
 }
 
 // read reads the file, empty when it does not exist yet. A damaged file is
-// refused, never treated as empty: that would accept any key again.
+// refused, never treated as empty: that would accept any key again. So is
+// one that someone else owns or may open (disk.ReadPrivate), as a key file
+// is: whoever can write it decides which keys this device accepts.
 func (f knownKeysFile) read() (*knownKeysDisk, error) {
-	data, err := os.ReadFile(string(f)) // #nosec G304 -- the known keys file the caller configured, or the default under the user's home.
+	data, err := disk.ReadPrivate(string(f))
 	if errors.Is(err, os.ErrNotExist) {
 		return &knownKeysDisk{Version: knownKeysVersion, Servers: map[string]map[string][]Entry{}}, nil
 	}
@@ -790,7 +867,7 @@ func (f knownKeysFile) read() (*knownKeysDisk, error) {
 // change reports it changed something.
 func (f knownKeysFile) update(change func(*knownKeysDisk) bool) error {
 	path := string(f)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := disk.MkdirPrivate(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("known keys: %w", err)
 	}
 	lock, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE, 0o600) // #nosec G304 -- beside the known keys file the caller configured.
@@ -823,10 +900,11 @@ func (f knownKeysFile) update(change func(*knownKeysDisk) bool) error {
 	return writeFileAtomic(path, data)
 }
 
-// writeFileAtomic replaces path with data through a new 0600 file in the
-// same directory, synced and renamed over it.
+// writeFileAtomic replaces path with data through a new file in the same
+// directory, private to this user (disk.CreateTemp), synced and renamed
+// over it.
 func writeFileAtomic(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	tmp, err := disk.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return err
 	}

@@ -18,7 +18,9 @@
 // names a secret's sender, so it could otherwise present a contact's secret
 // under a new address, where nothing is recorded yet. For the same reason
 // the newest signing time opened per secret, which refuses a rollback, is
-// kept under the key that signed as well as under the sender's address.
+// kept under the key that signed as well as under the sender's address, and
+// under the id of the secret the caller asked for, which holds when both of
+// the others are new to this device.
 //
 // The user's own accounts are recorded too, so the server cannot pass off
 // another key as theirs by lying about who the caller is: only key pairs on

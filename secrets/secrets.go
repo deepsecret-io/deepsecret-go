@@ -236,10 +236,16 @@ func createSecret(ctx context.Context, c *transport.Client, req *createRequest) 
 	if err := json.Unmarshal(resp.Data, &created); err != nil {
 		return nil, nil, fmt.Errorf("parse create response: %w", err)
 	}
+	// The client chose the revision id and signed it into the manifest and
+	// every wrap. The upload and the result go by the id returned here, so
+	// an answer naming another revision is refused, not followed.
+	if !strings.EqualFold(created.Revision.ID, req.RevisionID) {
+		return nil, nil, fmt.Errorf("create secret: the server answered with revision %q, not the revision sent, %s", created.Revision.ID, req.RevisionID)
+	}
 	return &Secret{
 		ID:                created.Secret.ID,
 		Name:              created.Secret.Name,
-		RevisionID:        created.Revision.ID,
+		RevisionID:        req.RevisionID,
 		RevisionNumber:    created.Revision.RevisionNumber,
 		IsMultipart:       created.Revision.IsMultipart,
 		MultipartPartSize: created.Revision.MultipartPartSize,

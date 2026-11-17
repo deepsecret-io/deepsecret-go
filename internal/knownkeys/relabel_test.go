@@ -22,6 +22,11 @@ const (
 	aliceNew = "alice.new@example.com"
 	testFPA  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	testFPB  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	// testSecret is the id of the secret the rollback tests open, and
+	// otherSecret that of another one.
+	testSecret  = "10000000-0000-4000-8000-0000000000aa"
+	otherSecret = "10000000-0000-4000-8000-0000000000bb"
 )
 
 var discard = slog.New(slog.DiscardHandler)
@@ -213,17 +218,17 @@ func TestNewestIsKeptPerSenderKey(t *testing.T) {
 	at := time.Unix(1793534400, 0)
 	v1, v2 := manifest(testFPA, "rev-1", at), manifest(testFPA, "rev-2", at.Add(time.Hour))
 	s.now = func() time.Time { return at.Add(2 * time.Hour) }
-	if err := s.CheckNewest(alice, v2); err != nil {
+	if err := s.CheckNewest(alice, testSecret, v2); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.NewestRecorder(alice, v2)(); err != nil {
+	if err := s.NewestRecorder(alice, testSecret, v2)(); err != nil {
 		t.Fatal(err)
 	}
 
 	stale := func(what, email string, m *protocol.Manifest) {
 		t.Helper()
 		var refused *StaleRevisionError
-		if err := s.CheckNewest(email, m); !errors.As(err, &refused) {
+		if err := s.CheckNewest(email, testSecret, m); !errors.As(err, &refused) {
 			t.Fatalf("%s: %v, want a StaleRevisionError", what, err)
 		}
 		if refused.SenderEmail != email || refused.RevisionID != "rev-1" || refused.SecretName != "api-token" ||
@@ -239,15 +244,15 @@ func TestNewestIsKeptPerSenderKey(t *testing.T) {
 	stale("under the sender's address, their key forgotten", alice, v1)
 	stale("under a new address, their key forgotten", aliceNew, v1)
 
-	if err := s.CheckNewest(aliceNew, v2); err != nil {
+	if err := s.CheckNewest(aliceNew, testSecret, v2); err != nil {
 		t.Fatalf("the newest revision under a new address: %v", err)
 	}
-	if err := s.CheckNewest(aliceNew, manifest(testFPB, "rev-1", at)); err != nil {
+	if err := s.CheckNewest(aliceNew, otherSecret, manifest(testFPB, "rev-1", at)); err != nil {
 		t.Fatalf("another key's revision under a new address: %v", err)
 	}
 	other := manifest(testFPA, "rev-1", at)
 	other.SecretName = "other-app"
-	if err := s.CheckNewest(alice, other); err != nil {
+	if err := s.CheckNewest(alice, otherSecret, other); err != nil {
 		t.Fatalf("another secret from the same key: %v", err)
 	}
 }
@@ -270,17 +275,17 @@ func TestOldFileWithoutNewestByKeyStillLoads(t *testing.T) {
 		return m
 	}
 	var stale *StaleRevisionError
-	if err := s.CheckNewest(sender, note("rev-1", recorded.Add(-time.Second))); !errors.As(err, &stale) {
+	if err := s.CheckNewest(sender, testSecret, note("rev-1", recorded.Add(-time.Second))); !errors.As(err, &stale) {
 		t.Fatalf("a revision older than the old file's record: %v, want a StaleRevisionError", err)
 	}
 	newer := note("rev-3", recorded.Add(time.Hour))
-	if err := s.CheckNewest(sender, newer); err != nil {
+	if err := s.CheckNewest(sender, testSecret, newer); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.NewestRecorder(sender, newer)(); err != nil {
+	if err := s.NewestRecorder(sender, testSecret, newer)(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CheckNewest("someone.else@example.com", note("rev-2", recorded)); !errors.As(err, &stale) {
+	if err := s.CheckNewest("someone.else@example.com", testSecret, note("rev-2", recorded)); !errors.As(err, &stale) {
 		t.Fatalf("an older revision under another address: %v, want a StaleRevisionError", err)
 	}
 	raw, err := os.ReadFile(path)
@@ -304,30 +309,124 @@ func TestNewestRecordIsCappedByThisDevicesClock(t *testing.T) {
 	now := time.Unix(1793534400, 0)
 	s.now = func() time.Time { return now }
 	ahead := manifest(testFPA, "rev-1", now.AddDate(1, 0, 0))
-	if err := s.CheckNewest(alice, ahead); err != nil {
+	if err := s.CheckNewest(alice, testSecret, ahead); err != nil {
 		t.Fatalf("a revision signed a year ahead: %v, want it opened", err)
 	}
-	if err := s.NewestRecorder(alice, ahead)(); err != nil {
+	if err := s.NewestRecorder(alice, testSecret, ahead)(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Ten minutes later the sender, their clock set right, signs again.
 	now = now.Add(10 * time.Minute)
 	honest := manifest(testFPA, "rev-2", now)
-	if err := s.CheckNewest(alice, honest); err != nil {
+	if err := s.CheckNewest(alice, testSecret, honest); err != nil {
 		t.Fatalf("an honest revision, by the address record: %v", err)
 	}
-	if err := s.CheckNewest(aliceNew, honest); err != nil {
+	if err := s.CheckNewest(aliceNew, testSecret, honest); err != nil {
 		t.Fatalf("an honest revision, by the key record: %v", err)
 	}
 
 	// The cap is on what is recorded, not on what is refused: a rollback
 	// past a revision signed in time is still caught.
-	if err := s.NewestRecorder(alice, honest)(); err != nil {
+	if err := s.NewestRecorder(alice, testSecret, honest)(); err != nil {
 		t.Fatal(err)
 	}
 	var stale *StaleRevisionError
-	if err := s.CheckNewest(alice, manifest(testFPA, "rev-0", now.Add(-time.Minute))); !errors.As(err, &stale) {
+	if err := s.CheckNewest(alice, testSecret, manifest(testFPA, "rev-0", now.Add(-time.Minute))); !errors.As(err, &stale) {
 		t.Fatalf("a revision older than the honest one: %v, want a StaleRevisionError", err)
+	}
+}
+
+// The two records above go by what the server and the manifest name: a
+// revision whose sender address and signing key are both new to this device
+// has neither. The record per secret id, which is what the caller asked for,
+// still refuses it as a rollback, and does not touch another secret.
+func TestNewestIsKeptPerSecretID(t *testing.T) {
+	s, path := newStore(t)
+	at := time.Unix(1793534400, 0)
+	s.now = func() time.Time { return at.Add(2 * time.Hour) }
+	v2 := manifest(testFPA, "rev-2", at.Add(time.Hour))
+	if err := s.NewestRecorder(alice, testSecret, v2)(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same secret id, served under an address and a key this device
+	// has no record for, in any letter case.
+	old := manifest(testFPB, "rev-1", at)
+	var stale *StaleRevisionError
+	for _, id := range []string{testSecret, strings.ToUpper(testSecret)} {
+		if err := s.CheckNewest(aliceNew, id, old); !errors.As(err, &stale) {
+			t.Fatalf("an older revision of %s under a new address and key: %v, want a StaleRevisionError", id, err)
+		}
+		if stale.RevisionID != "rev-1" || !stale.SignedAt.Equal(at) || !stale.NewestSeen.Equal(at.Add(time.Hour)) {
+			t.Fatalf("%+v", stale)
+		}
+	}
+	if err := s.CheckNewest(aliceNew, otherSecret, old); err != nil {
+		t.Fatalf("another secret, under a new address and key: %v", err)
+	}
+	if err := s.CheckNewest(alice, testSecret, v2); err != nil {
+		t.Fatalf("the newest revision again: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"version": 1`) || !strings.Contains(string(raw), `"newest_by_secret"`) || !strings.Contains(string(raw), `"revision_id": "rev-2"`) {
+		t.Fatalf("the file after a decrypt:\n%s", raw)
+	}
+}
+
+// Signing times are whole seconds, so two revisions can share one, and
+// nothing else orders them: a sender's second send within a second must
+// still open as the latest, so a revision signed in the same second as the
+// newest opened passes. The record keeps the revision that set the time.
+func TestARevisionSignedInTheSameSecondOpens(t *testing.T) {
+	s, _ := newStore(t)
+	at := time.Unix(1793534400, 0)
+	s.now = func() time.Time { return at.Add(time.Hour) }
+	first, second := manifest(testFPA, "rev-1", at), manifest(testFPA, "rev-2", at)
+	if err := s.NewestRecorder(alice, testSecret, first)(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckNewest(alice, testSecret, second); err != nil {
+		t.Fatalf("a second revision signed in the same second: %v", err)
+	}
+	if err := s.NewestRecorder(alice, testSecret, second)(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.file.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.NewestBySecret[s.server][testSecret]; got != (newestRevision{At: at.Unix(), RevisionID: "rev-1"}) {
+		t.Fatalf("the record per secret id: %+v, want the first revision at its signing time", got)
+	}
+	var stale *StaleRevisionError
+	if err := s.CheckNewest(aliceNew, testSecret, manifest(testFPB, "rev-0", at.Add(-time.Second))); !errors.As(err, &stale) {
+		t.Fatalf("a revision signed a second earlier: %v, want a StaleRevisionError", err)
+	}
+}
+
+// CheckFirstUse answers as RecordFirstUse would and records nothing.
+func TestCheckFirstUseRecordsNothing(t *testing.T) {
+	s, path := newStore(t)
+	bob := []Person{{Email: "bob@example.com", Fingerprint: testFPA}}
+	if err := s.CheckFirstUse(bob, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("a check wrote the file: %v", err)
+	}
+	if err := s.RecordFirstUse([]Person{{Email: "bob@example.com", Fingerprint: testFPB}}, false); err != nil {
+		t.Fatal(err)
+	}
+	var changed *KeyChangedError
+	if err := s.CheckFirstUse(bob, false); !errors.As(err, &changed) || changed.Got != testFPA {
+		t.Fatalf("a key other than the one recorded: %v, want a KeyChangedError", err)
+	}
+	if got := people(t, s)["bob@example.com"]; len(got) != 1 || got[0].Fingerprint != testFPB {
+		t.Fatalf("the record after a refused check: %+v", got)
 	}
 }

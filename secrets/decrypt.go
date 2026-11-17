@@ -263,9 +263,12 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 		return nil, fmt.Errorf("check sender %s: %w", senderEmail, err)
 	}
 	// The server picks the latest revision: one signed before a revision
-	// of this secret already opened here is refused as a rollback.
+	// of this secret already opened here is refused as a rollback. The
+	// record is kept under the sender, the signing key and the secret id
+	// asked for, so a sender and a key new to this device do not get past
+	// it.
 	if opt.Revision == "" {
-		if err := c.store.CheckNewest(senderEmail, m); err != nil {
+		if err := c.store.CheckNewest(senderEmail, secretID, m); err != nil {
 			opened.Close()
 			return nil, err
 		}
@@ -312,7 +315,7 @@ func (c *Client) openSecret(ctx context.Context, secretID string, opt DecryptOpt
 	}
 	o := &OpenedSecret{opened: opened, spool: sp, log: log, onProgress: opt.OnDecryptProgress,
 		recordSender: c.senderRecorder(senderEmail, m.SenderFingerprint, sender.First),
-		recordNewest: c.store.NewestRecorder(senderEmail, m)}
+		recordNewest: c.store.NewestRecorder(senderEmail, secretID, m)}
 
 	// Download the ciphertext into the spool, or the ranges a kept
 	// download lacks.
@@ -513,7 +516,9 @@ func (o *OpenedSecret) Payload(ctx context.Context) (*DecryptedPayload, error) {
 
 	var p payload.Payload
 	if err := payload.Unmarshal(plaintext, &p); err != nil {
-		return &DecryptedPayload{Type: "raw", Raw: plaintext}, nil
+		// The digest and the signatures passed, so the sender sealed bytes
+		// that are not a payload: say so, never hand them back as a result.
+		return nil, fmt.Errorf("decode payload: %w", err)
 	}
 	decrypted := &DecryptedPayload{Type: p.Type, Raw: plaintext}
 	switch p.Type {

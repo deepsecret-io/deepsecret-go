@@ -59,6 +59,7 @@ secrets.EncryptOptions{
     Name:       "report-q4",
     Compress:   secrets.CompressZstd,  // zstd or none
     Archive:    true,              // bundle as one tar archive, zstd-compressed (hides file metadata)
+                                   // and, without a Name, send it under a random name, not the path's
     SkipHidden: true,
     TTL:        "7d",              // "30m", "24h", "7d"
     IPs:        []string{"10.0.0.0/8"},
@@ -73,7 +74,11 @@ secrets.EncryptOptions{
 ```
 
 Without `Archive`, the server is told each file's name and size and nothing
-else: never a hash of a file's content.
+else: never a hash of a file's content. With it, or when the files go as an
+archive for another reason (a symbolic link, or `AutoArchive`), the server is
+told nothing about them: no file names or sizes, no secret name taken from
+the path, and neither their size before compression nor the compression
+ratio. It still stores the encrypted payload, so it knows that size.
 
 ## Memory Model
 
@@ -147,7 +152,13 @@ network, so memory does not grow with part size or threads.
   ciphertext in `<ResumeDir>/<revision id>/` until the upload finishes. A
   failed or cancelled upload returns an `*UploadInterruptedError`;
   `ResumeUpload` finishes it later, keeping the parts storage holds.
-  `ListPendingUploads` and `DiscardPendingUpload` manage them.
+  `ListPendingUploads` and `DiscardPendingUpload` manage them. An
+  interrupted send records none of its recipients' keys: the upload lists
+  those new to this device (`PendingUpload.FirstUse`), and the resume that
+  finishes it records them and returns them, as `EncryptResult.FirstUse`
+  does. If this device has recorded another key for one of them since, the
+  resume fails with the `*trust.KeyChangedError` a send would get, before
+  the upload is finished: discard it and send again.
 - **Download resume.** With `DecryptOptions.ResumeDir` set, a large
   download keeps its ciphertext in `<ResumeDir>/<revision id>/`, with a
   record of the byte ranges it holds that is written only after they are
@@ -294,18 +305,20 @@ belongs to:
   to open. Opening a secret's latest revision also refuses one signed
   before a revision of that secret this device already opened, with a
   `*StaleRevisionError` (a possible rollback by the server). That signing
-  time is kept under the sender's address and under the key that signed, so
-  naming the sender under another address does not get around it, and
-  `Trust.Forget` does not clear it. A time more than five minutes ahead of
+  time is kept under the sender's address, under the key that signed and
+  under the id of the secret opened, so naming the sender under another
+  address, or a sender and a key this device has never seen, does not get
+  around it, and `Trust.Forget` does not clear it. A time more than five minutes ahead of
   this device's clock is recorded as that limit, so a sender whose clock ran
   ahead does not make their later revisions look stale. Setting
   `DecryptOptions.Revision` opens an older revision on purpose.
 
 Known keys, and the newest signing time opened per secret (by sender
-address and by signing key), are kept per
+address, by signing key and by secret id), are kept per
 API server in `~/.deepsecret/known_keys.json` (mode 0600;
 `WithKnownKeysFile` moves it). A damaged file refuses sends rather than
-accepting any key again.
+accepting any key again, and so does one that another user owns or may
+open, as for a key file.
 
 ## Packages
 

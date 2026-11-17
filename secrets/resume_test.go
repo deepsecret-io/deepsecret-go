@@ -6,14 +6,18 @@ package secrets_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/deepsecret-io/deepsecret-go/internal/disk/disktest"
+	"github.com/deepsecret-io/deepsecret-go/internal/knownkeys"
 	"github.com/deepsecret-io/deepsecret-go/secrets"
+	"github.com/deepsecret-io/deepsecret-go/trust"
 )
 
 // interruptedSend starts a three-part send that storage stops at part 2,
@@ -207,5 +211,117 @@ func TestAbandonedSendFoldersArePruned(t *testing.T) {
 	}
 	if _, err := os.Stat(recent); err != nil {
 		t.Fatal("a recent folder was removed")
+	}
+}
+
+// An interrupted send recorded none of its recipients' keys: it stopped
+// before a send does. The upload record lists the ones new to this device,
+// and the resume that finishes the upload records them and returns them,
+// so a first contact made through a resume is pinned and reported like any
+// other.
+func TestResumedSendRecordsFirstUseKeys(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	dir := privateDir(t)
+	_, interrupted := interruptedSend(t, f, dir)
+	bob := secrets.Recipient{Email: "bob@example.com", Fingerprint: f.members["bob@example.com"].fp}
+	alice := f.client("alice@example.com")
+
+	if got := interrupted.Upload.FirstUse; len(got) != 1 || got[0] != bob {
+		t.Fatalf("the interrupted upload lists %+v as first use, want bob's key", got)
+	}
+	pending, err := secrets.ListPendingUploads(dir)
+	if err != nil || len(pending) != 1 || len(pending[0].FirstUse) != 1 || pending[0].FirstUse[0] != bob {
+		t.Fatalf("the upload record: %+v, %v, want bob's key listed", pending, err)
+	}
+	if known := knownKeys(t, alice, "bob@example.com"); len(known) != 0 {
+		t.Fatalf("an interrupted send recorded %+v", known)
+	}
+
+	f.mu.Lock()
+	f.refusePart = 0
+	f.mu.Unlock()
+	done, err := alice.Secrets.ResumeUpload(context.Background(), dir, interrupted.Upload.RevisionID, secrets.ResumeOptions{})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if len(done.FirstUse) != 1 || done.FirstUse[0] != bob {
+		t.Fatalf("the resume reports %+v as first use, want bob's key", done.FirstUse)
+	}
+	known := knownKeys(t, alice, "bob@example.com")
+	if k, ok := known[bob.Fingerprint]; !ok || len(known) != 1 || k.State != trust.FirstUse {
+		t.Fatalf("known keys after the resume: %+v, want bob's key accepted on first use", known)
+	}
+
+	// The next send to bob is no first use, and a changed key is refused.
+	res, err := alice.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", secrets.EncryptOptions{Name: "n"})
+	if err != nil || len(res.FirstUse) != 0 {
+		t.Fatalf("a send after the resume: %+v, %v, want no first use", res, err)
+	}
+}
+
+// A key this device recorded for the recipient after the send was sealed
+// stops the resume before the upload is finished, with the error a send to
+// them gets: the revision was sealed for a key no longer accepted for them,
+// so it must not become downloadable.
+func TestResumeRefusesAKeyRecordedMeanwhile(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	dir := privateDir(t)
+	_, interrupted := interruptedSend(t, f, dir)
+	rev := interrupted.Upload.RevisionID
+	alice := f.client("alice@example.com")
+
+	// Meanwhile bob's real key was accepted on this device, by another send.
+	accepted := fmt.Sprintf("%064x", 7)
+	store := knownkeys.New(f.knownFile("alice@example.com"), f.srv.URL, f.members["alice@example.com"].keys)
+	if err := store.RecordFirstUse([]knownkeys.Person{{Email: "bob@example.com", Fingerprint: accepted}}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	f.refusePart = 0
+	before := f.puts
+	f.mu.Unlock()
+	_, err := alice.Secrets.ResumeUpload(context.Background(), dir, rev, secrets.ResumeOptions{})
+	var changed *trust.KeyChangedError
+	if !errors.As(err, &changed) || changed.Email != "bob@example.com" || changed.Got != f.members["bob@example.com"].fp || changed.Sender {
+		t.Fatalf("resume: %v, want a trust.KeyChangedError for bob's key", err)
+	}
+	f.mu.Lock()
+	sent := f.puts - before
+	f.mu.Unlock()
+	if sent != 0 || len(f.object(rev)) != 0 {
+		t.Fatalf("the refused resume sent %d parts and stored %d bytes: the upload must not be finished", sent, len(f.object(rev)))
+	}
+	if known := knownKeys(t, alice, "bob@example.com"); len(known) != 1 || known[accepted].Email != "bob@example.com" {
+		t.Fatalf("known keys after the refused resume: %+v, want the key recorded meanwhile only", known)
+	}
+	// The upload stays, to be discarded.
+	if pending, err := secrets.ListPendingUploads(dir); err != nil || len(pending) != 1 {
+		t.Fatalf("pending after the refused resume: %+v, %v", pending, err)
+	}
+	if err := alice.Secrets.DiscardPendingUpload(context.Background(), dir, rev); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// What an upload record lists goes into the known keys file, so a record
+// listing a malformed key is refused, not resumed.
+func TestResumeRefusesADamagedFirstUseList(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	dir := privateDir(t)
+	_, interrupted := interruptedSend(t, f, dir)
+	rev := interrupted.Upload.RevisionID
+	record := filepath.Join(interrupted.Upload.Dir, "upload.json")
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := strings.Replace(string(raw), f.members["bob@example.com"].fp, "not-a-fingerprint", 1)
+	if edited == string(raw) {
+		t.Fatalf("the record does not list bob's key:\n%s", raw)
+	}
+	writeFile(t, record, []byte(edited), 0o600)
+	if _, err := f.client("alice@example.com").Secrets.ResumeUpload(context.Background(), dir, rev, secrets.ResumeOptions{}); err == nil || !strings.Contains(err.Error(), "damaged") {
+		t.Fatalf("resume of a record listing a malformed key: %v, want it refused", err)
 	}
 }

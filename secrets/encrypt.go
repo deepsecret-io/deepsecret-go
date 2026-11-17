@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -111,14 +112,6 @@ func (c *Client) EncryptBytes(ctx context.Context, recipients []string, raw []by
 //	    "./README.md",
 //	}, secrets.EncryptOptions{Archive: true})
 func (c *Client) EncryptPaths(ctx context.Context, recipients []string, paths []string, opt EncryptOptions) (*EncryptResult, error) {
-	if opt.Name == "" && len(paths) == 1 {
-		// One file or folder names the secret, unless it has no name of
-		// its own, as "." has not.
-		if base := filepath.Base(paths[0]); base != "." && base != string(filepath.Separator) {
-			opt.Name = base
-		}
-	}
-
 	expanded, err := archive.ExpandPaths(paths, opt.SkipHidden)
 	if err != nil {
 		return nil, err
@@ -127,7 +120,17 @@ func (c *Client) EncryptPaths(ctx context.Context, recipients []string, paths []
 	archiveOn, archiveReason := shouldArchive(expanded, opt)
 	emitArchiveDecision(opt, archiveOn, archiveReason, expanded)
 	if archiveOn {
+		// An archive hides the files from the server, so the secret is not
+		// named after the path either: without a name from the caller it
+		// gets the random one (secretName).
 		return c.encryptArchive(ctx, recipients, expanded, opt)
+	}
+	if opt.Name == "" && len(paths) == 1 {
+		// One file or folder names the secret, unless it has no name of
+		// its own, as "." has not.
+		if base := filepath.Base(paths[0]); base != "." && base != string(filepath.Separator) {
+			opt.Name = base
+		}
 	}
 	return c.encryptExpandedFiles(ctx, recipients, expanded, opt)
 }
@@ -572,6 +575,18 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 		return nil, fmt.Errorf("payload size %d exceeds limit %d bytes: reduce input size or increase MaxPayloadSize",
 			p.size, maxSize)
 	}
+	// The TTL and the allowed IPs are refused here, before any network
+	// call and before anything is sealed.
+	ttlSeconds := 0
+	if opt.TTL != "" {
+		var err error
+		if ttlSeconds, err = parseTTL(opt.TTL); err != nil {
+			return nil, fmt.Errorf("invalid TTL %q: %w", opt.TTL, err)
+		}
+	}
+	if err := validateAllowedIPs(opt.IPs); err != nil {
+		return nil, err
+	}
 
 	// Resolve the member info (always needed for org_id; also used for tier validation)
 	// Single line per phase. "Loading X..." pre-events were noise.
@@ -700,17 +715,14 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 	if compressionLabel != "" {
 		req.Compressed = true
 		req.Compression = compressionLabel
-		req.CompressionRatio = compressionRatio
-		req.OriginalSize = originalSize
-	}
-
-	if opt.TTL != "" {
-		ttlSecs, err := parseTTL(opt.TTL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid TTL %q: %w", opt.TTL, err)
+		// An archive hides its files from the server: how large they were
+		// and how well they compressed stay with the sender, in the result.
+		if !p.archived {
+			req.CompressionRatio = compressionRatio
+			req.OriginalSize = originalSize
 		}
-		req.TTLSeconds = ttlSecs
 	}
+	req.TTLSeconds = ttlSeconds
 	if len(opt.IPs) > 0 {
 		req.AllowedIPs = opt.IPs
 	}
@@ -764,7 +776,7 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 	// temporary file.
 	size := m.CiphertextSize
 	if secret.IsMultipart {
-		pending, err := c.startUpload(sp, secret, revisionID, size)
+		pending, err := c.startUpload(sp, secret, revisionID, size, firstUse)
 		if err != nil {
 			return nil, err
 		}
@@ -787,7 +799,8 @@ func (c *Client) encryptAndSend(ctx context.Context, recipients []string, p *pla
 
 		// Confirm the upload so the server checks the stored object's size
 		// and marks the revision downloadable: until then a download of it
-		// is refused.
+		// is refused. A transient failure is retried: the payload is in
+		// storage, and confirming a confirmed revision changes nothing.
 		if err := c.api.ConfirmUpload(ctx, revisionID); err != nil {
 			return nil, fmt.Errorf("confirm upload: %w", err)
 		}
@@ -981,4 +994,25 @@ func parseTTL(s string) (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid TTL unit %q in %q (use 'm' for minutes, 'h' for hours, 'd' for days)", string(unit), s)
 	}
+}
+
+// validateAllowedIPs refuses an allowed-IP entry that is not an IPv4 or
+// IPv6 address or a CIDR block, as the server would once the payload was
+// sealed and the create call made. The server alone bounds how many a
+// secret may list.
+func validateAllowedIPs(ips []string) error {
+	for _, ip := range ips {
+		entry := strings.TrimSpace(ip)
+		switch {
+		case entry == "":
+			return fmt.Errorf("invalid allowed IP: an entry is empty")
+		case strings.Contains(entry, "/"):
+			if _, _, err := net.ParseCIDR(entry); err != nil {
+				return fmt.Errorf("invalid allowed IP %q: not a CIDR block", ip)
+			}
+		case net.ParseIP(entry) == nil:
+			return fmt.Errorf("invalid allowed IP %q: not an IP address or a CIDR block", ip)
+		}
+	}
+	return nil
 }

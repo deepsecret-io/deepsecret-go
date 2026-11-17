@@ -83,7 +83,7 @@ func (s *TransferStatus) transport() *transport.TransferStatus {
 
 // DecryptedPayload holds the decrypted content of a secret.
 type DecryptedPayload struct {
-	Type    string          // "files", "data", "message", or "raw"
+	Type    string          // "files", "data" or "message"
 	Message string          // populated for type="message"
 	Files   []DecryptedFile // populated for type="files"
 	Entries []KeyValue      // populated for type="data"
@@ -122,9 +122,16 @@ type EncryptOptions struct {
 	// The manifest signs it, so recipients can tell which secret a revision
 	// belongs to. Empty means the base name of the one path EncryptPaths
 	// was given, or else "sdk-", the Unix time and a random suffix: a name
-	// no other send has, so the send is a secret of its own.
-	Name       string
-	Compress   Compression
+	// no other send has, so the send is a secret of its own. A send that
+	// goes as an archive never takes the path's name, which the server
+	// would see: without a Name it gets the random one.
+	Name     string
+	Compress Compression
+	// Archive sends the files as one tar archive, zstd-compressed, so the
+	// server learns nothing about them: no file names or sizes, no name
+	// taken from the path, and neither the size before compression nor the
+	// compression ratio. It still stores the encrypted payload, so it knows
+	// that size.
 	Archive    bool
 	SkipHidden bool
 	TTL        string // "30m", "24h", "7d"
@@ -253,10 +260,10 @@ type EncryptResult struct {
 	Revoked           []SecretRecipient // people a send with RevokeMissing removed
 	Compressed        bool
 	Compression       string  // "zstd", "tar+zstd", ""
-	CompressionRatio  float64 // compressed/original * 100
-	OriginalSize      int64
-	PayloadType       string // "message", "data", "files"
-	FilesCount        int    // visible files sent to server metadata (0 when archived)
+	CompressionRatio  float64 // compressed/original * 100; the server is not told it for an archive
+	OriginalSize      int64   // the server is not told it for an archive
+	PayloadType       string  // "message", "data", "files"
+	FilesCount        int     // visible files sent to server metadata (0 when archived)
 	Archived          bool
 	ArchiveEntryCount int // entries in the archive, folders and links included (set only when Archived=true)
 	ArchiveFileCount  int // regular files in the archive (set only when Archived=true)

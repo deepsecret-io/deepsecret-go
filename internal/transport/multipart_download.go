@@ -573,7 +573,7 @@ func (c *Client) doRangeGET(ctx context.Context, presignedURL string, p *piece, 
 	expected := to - from
 	guard := newStallGuard(ctx)
 	defer guard.stop()
-	req, err := http.NewRequestWithContext(guard.ctx, "GET", presignedURL, nil)
+	req, err := c.presignedRequest(guard.ctx, "GET", presignedURL, nil)
 	if err != nil {
 		return err
 	}
@@ -680,6 +680,9 @@ func isDownloadRetryable(err error) bool {
 	}
 	if errors.Is(err, errStalled) {
 		return true
+	}
+	if errors.Is(err, errPresignedURL) {
+		return false
 	}
 	var we *writeError
 	if errors.As(err, &we) {

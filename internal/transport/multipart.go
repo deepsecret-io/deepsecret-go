@@ -659,8 +659,12 @@ func (e *storageError) Error() string {
 
 // isPartRetryable reports whether a failed part PUT is worth retrying:
 // transport errors, stalls, storage 5xx and throttling, and the request
-// timeout S3 reports as a 400.
+// timeout S3 reports as a 400. A presigned URL the client refuses to use
+// is not: the server would hand out the same kind again.
 func isPartRetryable(err error) bool {
+	if errors.Is(err, errPresignedURL) {
+		return false
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return errors.Is(err, errStalled)
 	}
@@ -737,7 +741,7 @@ func (c *Client) putPart(ctx context.Context, presignedURL string, data io.Reade
 		guard.moved()
 		onChunk(n)
 	}}
-	req, err := http.NewRequestWithContext(guard.ctx, "PUT", presignedURL, body)
+	req, err := c.presignedRequest(guard.ctx, "PUT", presignedURL, body)
 	if err != nil {
 		return "", err
 	}

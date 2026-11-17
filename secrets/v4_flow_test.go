@@ -110,7 +110,10 @@ type fakeAPI struct {
 	partSize    int64
 	uploads     map[string]*fakeUpload // by revision id
 	refusePart  int                    // storage refuses this part's PUTs
-	afterPart   func(n int)            // called once storage holds part n
+	// createRevisionID, when set, is the revision id the create answer
+	// names in place of the one the client sent.
+	createRevisionID string
+	afterPart        func(n int) // called once storage holds part n
 
 	// Downloads: the part size the presign suggests, and how many range
 	// GETs a presigned URL serves before it is refused with 403 (0: no
@@ -421,6 +424,9 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request) {
 	s.revisions = append(s.revisions, rev)
 	f.revs[rev.id] = rev
 	revision := map[string]any{"id": rev.id, "revision_number": len(s.revisions), "is_multipart": false}
+	if f.createRevisionID != "" {
+		revision["id"] = f.createRevisionID
+	}
 	if req.Size >= f.multipartAt {
 		revision["is_multipart"], revision["multipart_part_size"] = true, f.partSize
 	}
@@ -1105,5 +1111,130 @@ func TestValidateRecipientsRefusesHostileEmails(t *testing.T) {
 		if err := secrets.ValidateRecipients([]string{bad}); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// A TTL or an allowed IP the server would refuse is refused first, before
+// any network call and before anything is sealed.
+func TestInvalidTTLAndIPsAreRefusedBeforeAnythingIsSent(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice := f.client("alice@example.com")
+	requests := 0
+	handler := f.srv.Config.Handler
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		requests++
+		f.mu.Unlock()
+		handler.ServeHTTP(w, r)
+	})
+	for what, opt := range map[string]secrets.EncryptOptions{
+		"a TTL without a unit":    {TTL: "30"},
+		"a TTL of zero":           {TTL: "0d"},
+		"an IP that is a name":    {IPs: []string{"10.0.0.1", "example.com"}},
+		"a CIDR block too wide":   {IPs: []string{"10.0.0.0/33"}},
+		"an empty allowed IP":     {IPs: []string{" "}},
+		"an IP with a port on it": {IPs: []string{"10.0.0.1:443"}},
+	} {
+		opt.Name = "n"
+		if _, err := alice.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", opt); err == nil || !strings.Contains(err.Error(), "invalid") {
+			t.Errorf("%s: %v, want it refused", what, err)
+		}
+	}
+	f.mu.Lock()
+	n := requests
+	f.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d requests were made for sends with an invalid TTL or IP", n)
+	}
+
+	res, err := alice.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello",
+		secrets.EncryptOptions{Name: "n", TTL: "7d", IPs: []string{"10.0.0.1", "10.0.0.0/8", "2001:db8::/32", "::1"}})
+	if err != nil || res.Secret.ID == "" {
+		t.Fatalf("a valid TTL and valid IPs: %v", err)
+	}
+	var body struct {
+		TTLSeconds int      `json:"ttl_seconds"`
+		AllowedIPs []string `json:"allowed_ips"`
+	}
+	if err := json.Unmarshal(f.lastBody, &body); err != nil || body.TTLSeconds != 7*86400 || len(body.AllowedIPs) != 4 {
+		t.Fatalf("the create request: %+v, %v", body, err)
+	}
+}
+
+// The client chooses the revision id and signs it into the manifest and the
+// wraps. A create answer naming another revision is refused: nothing is
+// uploaded under an id the client did not sign.
+func TestCreateAnswerMustNameTheRevisionSent(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	alice := f.client("alice@example.com")
+	f.createRevisionID = "10000000-0000-4000-8000-00000000000f"
+	res, err := alice.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", secrets.EncryptOptions{Name: "n"})
+	if err == nil || !strings.Contains(err.Error(), "not the revision sent") {
+		t.Fatalf("send: %+v, %v, want the answer refused", res, err)
+	}
+	f.mu.Lock()
+	puts := f.puts
+	f.createRevisionID = ""
+	f.mu.Unlock()
+	if puts != 0 {
+		t.Fatalf("%d uploads after a create answer naming another revision", puts)
+	}
+	res, err = alice.Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, "hello", secrets.EncryptOptions{Name: "m"})
+	if err != nil || res.Secret.RevisionID != f.lastReq.RevisionID {
+		t.Fatalf("an honest answer: %+v, %v", res, err)
+	}
+}
+
+// Bytes that are signed and encrypted correctly but are not a payload are
+// an error: they are never handed back as a result of some other type.
+func TestPayloadThatDoesNotDecodeIsAnError(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
+	res, err := f.client("alice@example.com").Secrets.SendRaw([]string{"bob@example.com"}, "message", []byte("these bytes are not CBOR"), secrets.EncryptOptions{Name: "hostile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.client("bob@example.com").Secrets.Decrypt(context.Background(), res.Secret.ID, secrets.DecryptOptions{})
+	if err == nil || out != nil || !strings.Contains(err.Error(), "decode payload") {
+		t.Fatalf("decrypt: %+v, %v, want a decode error and no result", out, err)
+	}
+}
+
+// The rollback records kept per sender address and per signing key go by
+// what the server and the manifest name. A server that serves an older
+// revision under the secret id the caller asked for, from a sender and a
+// key this device has never seen, gets past both. The record per secret id
+// refuses it.
+func TestRollbackUnderAnUnknownSenderIsRefused(t *testing.T) {
+	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "mallory@example.com")
+	send := func(from, text string) *secrets.EncryptResult {
+		t.Helper()
+		res, err := f.client(from).Secrets.EncryptText(context.Background(), []string{"bob@example.com"}, text, secrets.EncryptOptions{Name: "api-token"})
+		if err != nil {
+			t.Fatalf("send from %s: %v", from, err)
+		}
+		return res
+	}
+	planted := send("mallory@example.com", "TOKEN=planted")
+	nextSecond()
+	honest := send("alice@example.com", "TOKEN=active")
+	bob := f.client("bob@example.com")
+	if got, err := bob.Secrets.Decrypt(context.Background(), honest.Secret.ID, secrets.DecryptOptions{}); err != nil || got.Decrypted.Message != "TOKEN=active" {
+		t.Fatalf("honest: %+v, %v", got, err)
+	}
+
+	// The server now serves mallory's older revision as the latest of the
+	// secret bob asks for, and names mallory as its sender.
+	f.mu.Lock()
+	secret := f.secrets[honest.Secret.ID]
+	secret.senderID = f.members["mallory@example.com"].id
+	secret.revisions = []*fakeRevision{f.revs[planted.Secret.RevisionID]}
+	f.mu.Unlock()
+	var stale *trust.StaleRevisionError
+	got, err := bob.Secrets.Decrypt(context.Background(), honest.Secret.ID, secrets.DecryptOptions{})
+	if !errors.As(err, &stale) || stale.RevisionID != planted.Secret.RevisionID {
+		t.Fatalf("an older revision from an unknown sender, under the secret id asked for: %+v, %v, want a trust.StaleRevisionError", got, err)
+	}
+	if known := knownKeys(t, bob, "mallory@example.com"); len(known) != 0 {
+		t.Fatalf("the refused sender's key was recorded: %+v", known)
 	}
 }

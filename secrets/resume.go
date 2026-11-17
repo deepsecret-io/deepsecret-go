@@ -19,6 +19,7 @@ import (
 
 	"github.com/deepsecret-io/deepsecret-go/apierror"
 	"github.com/deepsecret-io/deepsecret-go/internal/disk"
+	"github.com/deepsecret-io/deepsecret-go/internal/knownkeys"
 	"github.com/deepsecret-io/deepsecret-go/internal/transport"
 )
 
@@ -31,6 +32,11 @@ import (
 // ResumeUpload finishes the upload later: the parts storage already holds
 // are kept and the rest are sent. Nothing is sealed again, so resuming
 // needs no keys, only the session. A finished upload removes the folder.
+//
+// The record also lists the recipients whose key was new to this device
+// when the send was sealed (PendingUpload.FirstUse): the send stopped
+// before it could record them, so ResumeUpload does, and returns them as
+// EncryptResult.FirstUse would have.
 //
 // The folder holds ciphertext only. The server aborts an upload that sees
 // no activity for a day, after which it cannot be resumed.
@@ -49,6 +55,14 @@ type PendingUpload struct {
 	APIURL     string    `json:"api_url"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// FirstUse lists the recipients whose key was new to this device when
+	// the send was sealed, as EncryptResult.FirstUse does: their address
+	// and key fingerprint, nothing secret. The interrupted send recorded
+	// none of them. ResumeUpload records them once the upload finishes, so
+	// they are worth comparing with their owners then, and refuses to
+	// finish it when this device has since recorded another key for one of
+	// them.
+	FirstUse []Recipient `json:"first_use"`
 	// Dir is the folder holding the ciphertext and this record.
 	Dir string `json:"-"`
 }
@@ -149,7 +163,9 @@ func pruneAbandoned(dir, except string) {
 
 // startUpload records a multipart upload about to start, when its spool
 // can resume. The record is what ResumeUpload and ListPendingUploads read.
-func (c *Client) startUpload(sp *spool, secret *Secret, revisionID string, size int64) (*PendingUpload, error) {
+// firstUse is the send's recipients whose key is new to this device: the
+// record keeps them, since a send that stops here records none of them.
+func (c *Client) startUpload(sp *spool, secret *Secret, revisionID string, size int64, firstUse []Recipient) (*PendingUpload, error) {
 	if sp.resume != "upload" {
 		return nil, nil
 	}
@@ -157,6 +173,7 @@ func (c *Client) startUpload(sp *spool, secret *Secret, revisionID string, size 
 	p := &PendingUpload{
 		RevisionID: revisionID, SecretID: secret.ID, Name: secret.Name, Size: size,
 		APIURL: c.api.BaseURL(), CreatedAt: now, UpdatedAt: now, Dir: sp.dir,
+		FirstUse: append([]Recipient{}, firstUse...),
 	}
 	if err := writePending(p); err != nil {
 		return nil, err
@@ -218,6 +235,13 @@ func readPending(dir string) (*PendingUpload, error) {
 	if _, err := uuid.Parse(p.RevisionID); err != nil || filepath.Base(dir) != p.RevisionID {
 		return nil, fmt.Errorf("upload record %s does not match its folder", dir)
 	}
+	// What is listed here goes into the known keys file, so it is held to
+	// that file's rules: a plausible address and a full fingerprint.
+	for _, r := range p.FirstUse {
+		if _, fp, err := knownkeys.NormalizeKeyRef(r.Email, r.Fingerprint); err != nil || fp != r.Fingerprint {
+			return nil, fmt.Errorf("upload record %s is damaged: it lists a recipient's key that is malformed", dir)
+		}
+	}
 	p.Dir = dir
 	return &p, nil
 }
@@ -271,6 +295,15 @@ func ListPendingUploads(dir string) ([]PendingUpload, error) {
 // parts storage holds stay and the rest are sent; on success the folder is
 // removed. A failure that can resume again returns an
 // UploadInterruptedError.
+//
+// The send that was interrupted recorded none of its recipients' keys.
+// The upload returned lists in FirstUse those whose key was new to this
+// device, and a finished resume records them, as a send that finishes
+// does. When this device has since recorded another key for one of them,
+// the resume fails before the upload is finished, with the error a send to
+// them would get (trust.KeyChangedError or trust.KeyRelabelledError): the
+// revision was sealed for a key this device no longer accepts for them.
+// Discard it and send again.
 func (c *Client) ResumeUpload(ctx context.Context, dir, revisionID string, opt ResumeOptions) (*PendingUpload, error) {
 	pdir, err := pendingDir(dir, revisionID, "upload folder")
 	if err != nil {
@@ -285,6 +318,13 @@ func (c *Client) ResumeUpload(ctx context.Context, dir, revisionID string, opt R
 	}
 	if p.APIURL != c.api.BaseURL() {
 		return nil, fmt.Errorf("upload %s was made against %s, not %s", revisionID, p.APIURL, c.api.BaseURL())
+	}
+	// Completing the upload is what gives the recipients access, so the
+	// keys it was sealed for are checked against what this device knows
+	// now, before anything more is sent.
+	firstUse := firstUsePeople(p.FirstUse)
+	if err := c.store.CheckFirstUse(firstUse, false); err != nil {
+		return nil, fmt.Errorf("upload %s was sealed for a key this device no longer accepts; discard it and send again: %w", revisionID, err)
 	}
 	f, err := os.Open(filepath.Join(pdir, payloadFile)) // #nosec G304 -- pdir is <dir>/<UUID> from pendingDir, which checked both.
 	if err != nil {
@@ -308,9 +348,17 @@ func (c *Client) ResumeUpload(ctx context.Context, dir, revisionID string, opt R
 		_ = writePending(p)
 		return nil, &UploadInterruptedError{Upload: *p, Err: err}
 	}
+	// Sent: the keys new to this device that it went to are accepted now,
+	// as at the end of a send. The folder goes either way: the upload is
+	// finished, and nothing is left to resume.
+	recordErr := c.store.RecordFirstUse(firstUse, false)
 	_ = f.Close() // f was only read; it is closed before RemoveAll so Windows can delete it.
-	if err := os.RemoveAll(pdir); err != nil {
-		return p, fmt.Errorf("upload finished, but removing %s failed: %w", pdir, err)
+	removeErr := os.RemoveAll(pdir)
+	if recordErr != nil {
+		return p, fmt.Errorf("secret %s was sent, but recording its recipients' keys on this device failed: %w", p.SecretID, recordErr)
+	}
+	if removeErr != nil {
+		return p, fmt.Errorf("upload finished, but removing %s failed: %w", pdir, removeErr)
 	}
 	return p, nil
 }

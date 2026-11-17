@@ -37,6 +37,16 @@ const (
 	defaultArgon2Threads uint8  = 4
 )
 
+// The most a key file may ask of Argon2id: a few times what this SDK
+// writes. The parameters come from the file, which is read before the
+// password proves anything about it, so a planted or damaged file asking
+// for more is refused before any memory is allocated for it.
+const (
+	maxArgon2Memory  uint32 = 1024 * 1024 // 1 GiB
+	maxArgon2Time    uint32 = 16
+	maxArgon2Threads uint8  = 16
+)
+
 // keyPairOnDisk is the on-wire JSON layout of a stored key. Distinct from
 // keys.Pair so keys.Pair can keep its private fields tagged json:"-": accidental
 // json.Marshal of a keys.Pair never leaks private material; the keystore is the
@@ -143,7 +153,7 @@ func writePrivateFile(path string, data []byte) error {
 // fingerprint may be a prefix of 16 or more characters. It reads version 4
 // files (password or none); a security-key file (version 5) or a KMS file
 // (version 6) needs Open, and returns ErrSecurityKeyRequired or
-// ErrKMSRequired here.
+// ErrKMSRequired here. The private keys must match the public keys.
 func Load(dir, fingerprint, password string) (*keys.Pair, error) {
 	// The fingerprint can come from the server (the primary key it lists),
 	// and it names the file read.
@@ -175,7 +185,9 @@ var (
 )
 
 // loadV4 reads the private keys of a version 4 key file: in clear, or
-// decrypted with password.
+// decrypted with password. The private keys must match the public keys, as
+// for a slot file: a key of the wrong size is refused here, not when it is
+// first used to sign or decrypt.
 func loadV4(disk *keyPairOnDisk, password string) (*keys.Pair, error) {
 	kp := &keys.Pair{
 		ED25519Public: disk.ED25519Public,
@@ -196,6 +208,9 @@ func loadV4(disk *keyPairOnDisk, password string) (*keys.Pair, error) {
 		kp.X25519Private = disk.X25519Private
 		kp.MLKEM768SK = disk.MLKEM768SK
 		kp.MLDSA65Seed = disk.MLDSA65Seed
+	}
+	if err := checkPrivateMatchesPublic(kp); err != nil {
+		return nil, fmt.Errorf("key file is damaged: %w", err)
 	}
 	return kp, nil
 }
@@ -446,6 +461,10 @@ func decryptOnDisk(disk *keyPairOnDisk, kp *keys.Pair, password string) error {
 
 	if disk.Argon2Memory == 0 || disk.Argon2Time == 0 || disk.Argon2Threads == 0 {
 		return fmt.Errorf("key file missing Argon2 parameters; regenerate the key")
+	}
+	if disk.Argon2Memory > maxArgon2Memory || disk.Argon2Time > maxArgon2Time || disk.Argon2Threads > maxArgon2Threads {
+		return fmt.Errorf("key file asks for Argon2 parameters beyond what this SDK accepts (memory %d KiB, time %d, threads %d; at most %d KiB, %d and %d): refusing to derive a key with them",
+			disk.Argon2Memory, disk.Argon2Time, disk.Argon2Threads, maxArgon2Memory, maxArgon2Time, maxArgon2Threads)
 	}
 
 	fp, fpErr := keys.Fingerprint(kp)
