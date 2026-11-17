@@ -343,24 +343,29 @@ Users without one see nothing new.
 
 The remove command says this.
 
-### 5.7 The security key label in key lists
+### 5.7 The protection label in key lists
 
 Only the device holding a key file knows how it is protected, so the
-server stores what the owner's client reports: one boolean per registered
-key, `security_key`. It is not signed and decides nothing; it only labels
-the owner's own key lists. Other users never get it: the lookup senders use
+server stores what the owner's client reports: one label per registered
+key, `protection`, which is `none`, `password`, `security_key` or `aws_kms`
+(the `keystore.Protection` values), or `""` when no client has reported it.
+It is not signed and decides nothing; it only labels the owner's own key
+lists. Other users never get it: the lookup senders use
 (`GET /api/v1/identities/member/:email`) keeps its fields, and only the
 owner's responses (`GET /api/v1/identities`, `GET /:id`, the response to
 registering) carry it.
 
-- Registering sends it (`Identity.Sync(kp, securityKey)`), from the key
-  file on the registering device.
-- `PUT /api/v1/identities/:id/security-key {"security_key": bool}` changes
-  it, for the owner's keys only (another member's key is not found), audited
-  as a configuration change. The CLI's `security-key protect` and
-  `unprotect`, and the desktop app's Protect and Unprotect, call it when the
-  key is registered and the client is signed in; a failure leaves the local
-  change in place and only says so.
+- Registering sends it (`Identity.Sync(kp, protection)`), from the key file
+  on the registering device. A value outside the four is left out, and the
+  key is registered without a label.
+- `PUT /api/v1/identities/:id/protection {"protection": "<value>"}`
+  (`Identity.SetKeyProtection`) changes it, for the owner's keys only
+  (another member's key is not found), audited as a configuration change.
+  The CLI calls it after every change to a key file's slots or protection
+  (`security-key` and `kms` protect, add, remove, recovery-code and
+  unprotect, and `identity import`), and the desktop app after Protect and
+  Unprotect, when the key is registered and the client is signed in; a
+  failure leaves the local change in place and only says so.
 - `secret identity sync` on a key already registered refreshes the label
   from the key file, without unlocking it.
 

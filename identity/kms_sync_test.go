@@ -90,7 +90,7 @@ func TestSyncRefusesAKMSKeyOfAnotherAccount(t *testing.T) {
 			t.Fatal(err)
 		}
 		store := knownkeys.New(filepath.Join(t.TempDir(), "known_keys.json"), srv.URL, dir)
-		err = New(api, store, dir).Sync(context.Background(), kp, false)
+		err = New(api, store, dir).Sync(context.Background(), kp, keystore.ProtectionKMS)
 		srv.Close()
 		if tc.refused != errors.Is(err, ErrKMSAccountMismatch) {
 			t.Errorf("signed in as %s: %v", tc.signedIn, err)
@@ -135,7 +135,7 @@ func TestSyncRefusesAnUnreadableKeyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := knownkeys.New(filepath.Join(t.TempDir(), "known_keys.json"), srv.URL, dir)
-	if err := New(api, store, dir).Sync(context.Background(), kp, false); err == nil || uploads.Load() != 0 {
+	if err := New(api, store, dir).Sync(context.Background(), kp, keystore.ProtectionNone); err == nil || uploads.Load() != 0 {
 		t.Errorf("Sync with an unreadable key file: %v, %d uploads", err, uploads.Load())
 	}
 }

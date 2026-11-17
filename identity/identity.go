@@ -49,12 +49,14 @@ func (c *Client) ListKeys(ctx context.Context) ([]Key, error) {
 
 // Sync records the account on this device as the user's own, used with kp:
 // from then on only key pairs on this device pass for it (see Accept in package
-// trust). Then it uploads kp's public keys to the server, labelled as protected
-// by a security key when securityKey is set (a label for the user's own key
-// lists, see SetKeySecurityKey). Nothing is uploaded when the server says the
-// account is someone this device knows as another person, or when the key
+// trust). Then it uploads kp's public keys to the server, labelled with
+// protection, how its key file on this device is protected (a label for the
+// user's own key lists, see SetKeyProtection). A protection other than the four
+// keystore.Protection values, such as "" for a key file that could not be
+// read, leaves the key not labelled. Nothing is uploaded when the server says
+// the account is someone this device knows as another person, or when the key
 // file on this device is protected by KMS keys bound to another account.
-func (c *Client) Sync(ctx context.Context, kp *keys.Pair, securityKey bool) error {
+func (c *Client) Sync(ctx context.Context, kp *keys.Pair, protection keystore.Protection) error {
 	fp, err := keys.Fingerprint(kp)
 	if err != nil {
 		return fmt.Errorf("compute fingerprint: %w", err)
@@ -69,7 +71,7 @@ func (c *Client) Sync(ctx context.Context, kp *keys.Pair, securityKey bool) erro
 	if _, err := c.store.RecordOwnAccount(me.Email, fp, true); err != nil {
 		return err
 	}
-	return syncIdentity(ctx, c.api, kp, securityKey)
+	return syncIdentity(ctx, c.api, kp, protection)
 }
 
 // RecordOwnAccount records the account on this device as the user's own, used
@@ -102,12 +104,14 @@ func (c *Client) RecordOwnAccount(ctx context.Context, fingerprint string) error
 	return err
 }
 
-// SetKeySecurityKey sets whether the registered key identityID (from ListKeys)
-// is labelled as protected by a security key: what a client reports after
-// protecting a key pair, or taking the protection off. The label is shown only
-// in the user's own key lists; it is not signed and decides nothing.
-func (c *Client) SetKeySecurityKey(ctx context.Context, identityID string, securityKey bool) error {
-	return setKeySecurityKey(ctx, c.api, identityID, securityKey)
+// SetKeyProtection sets how the registered key identityID (from ListKeys) is
+// labelled as protected: what the client of the device that holds its key file
+// reports after that file's protection changed. protection is one of the four
+// keystore.Protection values; anything else, "" included, is refused with
+// ErrUnknownProtection before any request. The label is shown only in the
+// user's own key lists; it is not signed and decides nothing.
+func (c *Client) SetKeyProtection(ctx context.Context, identityID string, protection keystore.Protection) error {
+	return setKeyProtection(ctx, c.api, identityID, protection)
 }
 
 // PrimaryFingerprint returns the fingerprint of the primary key registered on
@@ -211,9 +215,11 @@ type Key struct {
 	IdentityType string `json:"identity_type"`
 	IsPrimary    bool   `json:"is_primary"`
 	CreatedAt    string `json:"created_at"`
-	// SecurityKey is the label a client of the owner set: the key pair is
-	// protected by a security key on that device. Only the owner gets it.
-	SecurityKey bool `json:"security_key"`
+	// Protection is the label a client of the owner set: how the key file
+	// is protected on the device that holds it, one of the four
+	// keystore.Protection values, or "" when no client has reported it. The
+	// server does not check it. Only the owner gets it.
+	Protection keystore.Protection `json:"protection"`
 }
 
 // whoAmI returns the authenticated user's info. Hits /api/v1/members/me
@@ -322,29 +328,49 @@ func checkKMSAccount(dir, fp, memberID string) error {
 	return nil
 }
 
+// ErrUnknownProtection refuses a protection label that is not one of the
+// four keystore.Protection values.
+var ErrUnknownProtection = errors.New("unknown key pair protection")
+
+// reportable says whether p is a protection the server takes as a label.
+func reportable(p keystore.Protection) bool {
+	switch p {
+	case keystore.ProtectionNone, keystore.ProtectionPassword, keystore.ProtectionSecurityKey, keystore.ProtectionKMS:
+		return true
+	}
+	return false
+}
+
 // syncIdentity uploads a key pair's public keys to the server, labelled
-// as protected by a security key on this device when securityKey is set.
-func syncIdentity(ctx context.Context, c *transport.Client, kp *keys.Pair, securityKey bool) error {
+// with protection when it is one the server takes, and not labelled
+// otherwise: a label decides nothing, so it never fails a registration.
+func syncIdentity(ctx context.Context, c *transport.Client, kp *keys.Pair, protection keystore.Protection) error {
 	edSig, mldsaSig, err := directory.SignKeyBundle(kp)
 	if err != nil {
 		return fmt.Errorf("sign key bundle: %w", err)
 	}
-	_, err = c.Post(ctx, "/api/v1/identities", map[string]any{
+	body := map[string]any{
 		"ed25519":           kp.ED25519Public,
 		"x25519":            kp.X25519Public,
 		"mlkem768":          kp.MLKEM768PK,
 		"mldsa65":           kp.MLDSA65PK,
 		"signature":         edSig,
 		"signature_mldsa65": mldsaSig,
-		"security_key":      securityKey,
-	})
+	}
+	if reportable(protection) {
+		body["protection"] = string(protection)
+	}
+	_, err = c.Post(ctx, "/api/v1/identities", body)
 	return err
 }
 
-// setKeySecurityKey sets the label that says whether one of the caller's
-// registered keys is protected by a security key.
-func setKeySecurityKey(ctx context.Context, c *transport.Client, identityID string, securityKey bool) error {
-	_, err := c.Put(ctx, "/api/v1/identities/"+transport.PathSegment(identityID)+"/security-key", map[string]bool{"security_key": securityKey})
+// setKeyProtection sets the label that says how one of the caller's
+// registered keys is protected.
+func setKeyProtection(ctx context.Context, c *transport.Client, identityID string, protection keystore.Protection) error {
+	if !reportable(protection) {
+		return fmt.Errorf("%w: %q", ErrUnknownProtection, protection)
+	}
+	_, err := c.Put(ctx, "/api/v1/identities/"+transport.PathSegment(identityID)+"/protection", map[string]string{"protection": string(protection)})
 	return err
 }
 

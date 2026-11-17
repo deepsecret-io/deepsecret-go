@@ -202,7 +202,7 @@ func TestServerCannotClaimAContactIsYou(t *testing.T) {
 			}
 		}
 	}
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
 		t.Fatalf("register a key: %v, want refused", err)
 	}
 	if f.creates != creates {
@@ -226,7 +226,7 @@ func TestServerCannotClaimAContactPinnedWithYourKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	edSig, mldsaSig, err := directory.SignKeyBundle(alice.kp)
@@ -255,7 +255,7 @@ func TestServerCannotClaimAContactPinnedWithYourKey(t *testing.T) {
 			t.Fatalf("send (local file %q): %v, want refused", opt.LocalFile, err)
 		}
 	}
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
 		t.Fatalf("register a key: %v, want refused", err)
 	}
 	if f.creates != creates {
@@ -333,7 +333,7 @@ func TestOwnSecretDoesNotPassAsContactPinnedWithYourKey(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	pinKeyFor(t, f, c, alice.kp, bob.email)
@@ -351,13 +351,13 @@ func TestOwnSecretDoesNotPassAsContactOnceItsKeyLeftThisDevice(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com", "carol@example.com")
 	alice, bob, carol := f.members["alice@example.com"], f.members["bob@example.com"], f.members["carol@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	signer, signerFP := alice.kp, alice.fp
 	pinKeyFor(t, f, c, signer, bob.email)
 	rotate(t, alice)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	id, path := ownNotes(t, c, alice.email, signerFP)
@@ -384,7 +384,7 @@ func TestSecretFromAnAccountThisDeviceDoesNotKnow(t *testing.T) {
 	f.sameDevice(alice, bob)
 	device := filepath.Join(t.TempDir(), "known_keys.json")
 	a, b := f.clientOn(alice.email, alice.keys, device), f.clientOn(bob.email, bob.keys, device)
-	if err := a.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := a.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	res, err := b.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "n"})
@@ -442,7 +442,7 @@ func TestOwnSecretDoesNotPassAsContactRecordedAsYours(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	spare, err := keys.Generate()
@@ -457,7 +457,7 @@ func TestOwnSecretDoesNotPassAsContactRecordedAsYours(t *testing.T) {
 	id, path := ownNotes(t, c, alice.email, "")
 
 	f.whoAmI = bob.email
-	if err := c.Identity.Sync(context.Background(), spare, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), spare, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	f.whoAmI = ""
@@ -533,7 +533,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 		firstKP, first := bob.kp, bob.fp
 		b := signIn(bob.email)
 		rotate(t, bob)
-		if err := b.Identity.Sync(context.Background(), bob.kp, false); err != nil {
+		if err := b.Identity.Sync(context.Background(), bob.kp, keystore.ProtectionNone); err != nil {
 			t.Fatalf("register bob's new identity: %v", err)
 		}
 		second := bob.fp
@@ -575,7 +575,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 			t.Fatal(err)
 		}
 		b := signIn(bob.email)
-		if err := b.Identity.Sync(context.Background(), bob.kp, false); err != nil {
+		if err := b.Identity.Sync(context.Background(), bob.kp, keystore.ProtectionNone); err != nil {
 			t.Fatalf("register bob's key: %v", err)
 		}
 		if _, err := b.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "n3"}); err != nil {
@@ -645,7 +645,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 	// one account. Sending and registering are refused and nothing changes.
 	t.Run("server says alice is bob", func(t *testing.T) {
 		f, alice, bob, signIn := setup(t)
-		if err := signIn(bob.email).Identity.Sync(context.Background(), bob.kp, false); err != nil {
+		if err := signIn(bob.email).Identity.Sync(context.Background(), bob.kp, keystore.ProtectionNone); err != nil {
 			t.Fatal(err)
 		}
 		a := signIn(alice.email)
@@ -657,7 +657,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 				t.Fatalf("send (local file %q): %v, want refused", opt.LocalFile, err)
 			}
 		}
-		if err := a.Identity.Sync(context.Background(), alice.kp, false); err == nil || !strings.Contains(err.Error(), "your account "+alice.email) {
+		if err := a.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err == nil || !strings.Contains(err.Error(), "your account "+alice.email) {
 			t.Fatalf("register alice's key: %v, want refused", err)
 		}
 		if f.creates != creates {
@@ -684,7 +684,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 				t.Fatalf("send as bob (local file %q): %v, want refused", opt.LocalFile, err)
 			}
 		}
-		if err := b.Identity.Sync(context.Background(), bob.kp, false); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
+		if err := b.Identity.Sync(context.Background(), bob.kp, keystore.ProtectionNone); err == nil || !strings.Contains(err.Error(), "the server says you are "+bob.email) {
 			t.Fatalf("register bob's key: %v, want refused", err)
 		}
 		if f.creates != creates {
@@ -697,7 +697,7 @@ func TestSwitchAccountsThenSend(t *testing.T) {
 		if n, err := b.Trust.Forget(bob.email, first); err != nil || n != 1 {
 			t.Fatalf("forget: %d, %v", n, err)
 		}
-		if err := b.Identity.Sync(context.Background(), bob.kp, false); err != nil {
+		if err := b.Identity.Sync(context.Background(), bob.kp, keystore.ProtectionNone); err != nil {
 			t.Fatalf("register bob's key after forgetting: %v", err)
 		}
 		if _, err := b.Secrets.EncryptText(context.Background(), []string{alice.email}, "hi", secrets.EncryptOptions{Name: "n3"}); err != nil {
@@ -746,7 +746,7 @@ func TestSyncIdentityRecordsOwnAccount(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com", "bob@example.com")
 	alice, bob := f.members["alice@example.com"], f.members["bob@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 	if known := knownKeys(t, c, alice.email); len(known) != 1 || known[alice.fp].State != trust.Own {
@@ -771,7 +771,7 @@ func TestDecryptRefusesSecretSignedAsYouElsewhere(t *testing.T) {
 	f := newFakeAPI(t, "alice@example.com")
 	alice := f.members["alice@example.com"]
 	c := f.client(alice.email)
-	if err := c.Identity.Sync(context.Background(), alice.kp, false); err != nil {
+	if err := c.Identity.Sync(context.Background(), alice.kp, keystore.ProtectionNone); err != nil {
 		t.Fatal(err)
 	}
 

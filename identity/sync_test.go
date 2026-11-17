@@ -48,7 +48,7 @@ func TestSyncRefusesAnEmailKnownAsSomeoneElse(t *testing.T) {
 	if err := store.RecordFirstUse([]knownkeys.Person{{Email: "ana@example.com", Fingerprint: someoneElse}}, false); err != nil {
 		t.Fatal(err)
 	}
-	err = New(api, store, t.TempDir()).Sync(context.Background(), kp, false)
+	err = New(api, store, t.TempDir()).Sync(context.Background(), kp, keystore.ProtectionNone)
 	if err == nil || !strings.Contains(err.Error(), "someone else") {
 		t.Fatalf("Sync = %v", err)
 	}

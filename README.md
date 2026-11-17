@@ -314,7 +314,8 @@ accepting any key again.
 | Name | Description |
 |---|---|
 | `WhoAmI`, `ResolveMemberID` | The caller's account |
-| `ListKeys`, `Sync`, `SetPrimaryKey`, `DeleteKey`, `SetKeySecurityKey` | Keys registered on the server |
+| `ListKeys`, `Sync`, `SetPrimaryKey`, `DeleteKey` | Keys registered on the server |
+| `SetKeyProtection(ctx, id, protection)` | Label a registered key with how its key file is protected on this device (`keystore.Protection*`); `Key.Protection` reads it back, `""` when not reported |
 | `RecordOwnAccount(ctx, fingerprint)` | Record the account as yours on this device, with a key pair here registered from another device |
 | `LoadPrimary(ctx, unlock)`, `PrimaryFingerprint` | The primary key pair on this device |
 | `ListTeams` | An org's teams and their members, for its owner and admins |

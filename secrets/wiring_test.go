@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	deepsecret "github.com/deepsecret-io/deepsecret-go"
+	"github.com/deepsecret-io/deepsecret-go/keystore"
 	"github.com/deepsecret-io/deepsecret-go/secrets"
 	"github.com/deepsecret-io/deepsecret-go/trust"
 )
@@ -58,7 +59,7 @@ func TestOptionsReachEveryService(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if err := c.Identity.Sync(ctx, alice.kp, false); err != nil {
+			if err := c.Identity.Sync(ctx, alice.kp, keystore.ProtectionNone); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := os.Stat(want); err != nil {
