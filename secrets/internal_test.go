@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/deepsecret-io/deepsecret-go/identity"
 	"github.com/deepsecret-io/deepsecret-go/internal/archive"
 	"github.com/deepsecret-io/deepsecret-go/internal/payload"
 	"github.com/deepsecret-io/deepsecret-go/keys"
@@ -94,23 +95,50 @@ func TestShouldArchive(t *testing.T) {
 		return out
 	}
 	for _, c := range []struct {
-		n   int
-		on  bool
-		why string
+		n, limit int
+		on       bool
+		why      string
 	}{
-		{1, false, "1 file: up to 50 are sent without an archive"},
-		{50, false, "50 files: up to 50 are sent without an archive"},
-		{51, true, "51 files: more than 50 are sent as one archive"},
+		{1, 100, false, "1 file: up to 100 are sent without an archive"},
+		{100, 100, false, "100 files: up to 100 are sent without an archive"},
+		{101, 100, true, "101 files: more than 100 are sent as one archive"},
+		{116, 1000, false, "116 files: up to 1000 are sent without an archive"},
+		{5000, -1, false, "the plan has no limit on files per secret"},
+		{3, 0, false, "the plan allows no files"},
 	} {
-		if on, why := shouldArchive(files(c.n), EncryptOptions{AutoArchive: true}); on != c.on || why != c.why {
-			t.Errorf("%d files: %v %q, want %v %q", c.n, on, why, c.on, c.why)
+		if on, why := shouldArchive(files(c.n), EncryptOptions{AutoArchive: true}, c.limit); on != c.on || why != c.why {
+			t.Errorf("%d files, limit %d: %v %q, want %v %q", c.n, c.limit, on, why, c.on, c.why)
 		}
 	}
-	if on, why := shouldArchive(files(1), EncryptOptions{Archive: true}); !on || why != "requested" {
+	if on, why := shouldArchive(files(1), EncryptOptions{Archive: true}, 100); !on || why != "requested" {
 		t.Errorf("--archive: %v %q", on, why)
 	}
-	if on, why := shouldArchive(files(60), EncryptOptions{}); on || why != "not requested" {
+	if on, why := shouldArchive(files(600), EncryptOptions{}, 100); on || why != "not requested" {
 		t.Errorf("without AutoArchive: %v %q", on, why)
+	}
+	link := append(files(2), archive.ExpandedFile{RelPath: "dir/link", IsSymlink: true})
+	if on, _ := shouldArchive(link, EncryptOptions{AutoArchive: true}, -1); !on {
+		t.Error("a symbolic link must still force an archive")
+	}
+}
+
+// The limit comes from the account /members/me returns, and is 50 when
+// the server reports none.
+func TestFilesLimit(t *testing.T) {
+	n := func(v int) *int { return &v }
+	for _, c := range []struct {
+		account *identity.Member
+		want    int
+	}{
+		{nil, 50},
+		{&identity.Member{}, 50},
+		{&identity.Member{Membership: &identity.Membership{}}, 50},
+		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: n(100)}}, 100},
+		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: n(-1)}}, -1},
+	} {
+		if got := filesLimit(c.account); got != c.want {
+			t.Errorf("filesLimit(%+v) = %d, want %d", c.account, got, c.want)
+		}
 	}
 }
 

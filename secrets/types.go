@@ -196,8 +196,10 @@ type EncryptOptions struct {
 	Logger *slog.Logger
 
 	// AutoArchive bundles the files into one tar archive when there are
-	// more than 50 regular files. The server still enforces the plan's
-	// files-per-secret limit on what is sent.
+	// more regular files than the sender's plan accepts in one secret
+	// (membership.max_files_per_secret from /members/me), so a large tree
+	// is sent instead of refused. Up to the limit the files go one by one.
+	// A server that does not report a limit, and a LocalFile send, use 50.
 	AutoArchive bool
 
 	// Identity specifies a local key fingerprint (or prefix) to use for signing.

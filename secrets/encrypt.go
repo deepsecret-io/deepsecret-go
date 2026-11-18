@@ -117,7 +117,18 @@ func (c *Client) EncryptPaths(ctx context.Context, recipients []string, paths []
 		return nil, err
 	}
 
-	archiveOn, archiveReason := shouldArchive(expanded, opt)
+	limit := autoArchiveFiles
+	if opt.AutoArchive && !opt.Archive && opt.LocalFile == "" {
+		// The send needs the sender's account anyway: it is read once
+		// here and handed on, so the archive follows the server's limit.
+		account, err := c.senderAccount(ctx, opt)
+		if err != nil {
+			return nil, err
+		}
+		opt.Account = account
+		limit = filesLimit(account)
+	}
+	archiveOn, archiveReason := shouldArchive(expanded, opt, limit)
 	emitArchiveDecision(opt, archiveOn, archiveReason, expanded)
 	if archiveOn {
 		// An archive hides the files from the server, so the secret is not
@@ -194,10 +205,11 @@ func preflightExpandedSize(expanded []archive.ExpandedFile, limit int64) (int64,
 //  2. Any expanded entry is a SYMLINK: the flat per-file payload format
 //     has no encoding for link targets, so a tree containing symlinks
 //     can only round-trip through tar.
-//  3. opt.AutoArchive is on AND there are more than autoArchiveFiles
-//     regular files: one archive keeps a large tree to one upload and one
-//     download, at the cost of the per-file metadata the server would
-//     otherwise see.
+//  3. opt.AutoArchive is on AND there are more regular files than limit,
+//     the most files the server accepts in one secret: sent one by one
+//     they would be refused, and one archive counts as one file. Up to
+//     the limit the files go one by one, so the server sees their names
+//     and sizes; with no limit (negative) they always do.
 //
 // Notes intentionally NOT triggering archive:
 //   - Plain directory entries: the flat path preserves directory structure
@@ -212,7 +224,7 @@ func preflightExpandedSize(expanded []archive.ExpandedFile, limit int64) (int64,
 // whatever the client decided here.
 //
 // Returns (archive, reason).
-func shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions) (bool, string) {
+func shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions, limit int) (bool, string) {
 	if opt.Archive {
 		return true, "requested"
 	}
@@ -224,20 +236,40 @@ func shouldArchive(expanded []archive.ExpandedFile, opt EncryptOptions) (bool, s
 	if !opt.AutoArchive {
 		return false, "not requested"
 	}
+	if limit < 0 {
+		return false, "the plan has no limit on files per secret"
+	}
+	if limit == 0 {
+		return false, "the plan allows no files"
+	}
 	// Directory entries only place the files: count the regular files.
 	n := regularFiles(expanded)
-	if n > autoArchiveFiles {
-		return true, fmt.Sprintf("%d files: more than %d are sent as one archive", n, autoArchiveFiles)
+	if n > limit {
+		return true, fmt.Sprintf("%s: more than %d are sent as one archive", plural(n), limit)
 	}
-	if n == 1 {
-		return false, fmt.Sprintf("1 file: up to %d are sent without an archive", autoArchiveFiles)
-	}
-	return false, fmt.Sprintf("%d files: up to %d are sent without an archive", n, autoArchiveFiles)
+	return false, fmt.Sprintf("%s: up to %d are sent without an archive", plural(n), limit)
 }
 
-// autoArchiveFiles is the most regular files a send with AutoArchive
-// sends one by one; more go in one archive.
+func plural(n int) string {
+	if n == 1 {
+		return "1 file"
+	}
+	return fmt.Sprintf("%d files", n)
+}
+
+// autoArchiveFiles is the files-per-secret limit AutoArchive assumes when
+// the server does not report one, and for a send written to a local file,
+// which has no server limit to meet.
 const autoArchiveFiles = 50
+
+// filesLimit is the most files the sender's org accepts in one secret, as
+// /members/me reports it, or autoArchiveFiles when it does not.
+func filesLimit(account *identity.Member) int {
+	if account == nil || account.Membership == nil || account.Membership.MaxFilesPerSecret == nil {
+		return autoArchiveFiles
+	}
+	return *account.Membership.MaxFilesPerSecret
+}
 
 func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {
 	if _, err := preflightExpandedSize(expanded, maxPayloadSize(opt)); err != nil {

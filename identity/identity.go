@@ -167,6 +167,10 @@ type Membership struct {
 	// server refuses to register a key pair that is not protected by a
 	// password, a security key or an AWS KMS key.
 	KeyProtectionRequired bool `json:"key_protection_required"`
+	// MaxFilesPerSecret is the most files a secret of the org may hold,
+	// as the server enforces it: -1 for no limit, 0 for none. Nil from a
+	// server that does not report it.
+	MaxFilesPerSecret *int `json:"max_files_per_secret"`
 }
 
 // Org kinds, as OrgKind holds them.
