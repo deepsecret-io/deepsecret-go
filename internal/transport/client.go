@@ -200,11 +200,24 @@ func validateAPIKey(apiKey string) error {
 // nor in DEEPSECRET_INSECURE_HOSTS, user info, a query or a fragment) or if
 // the API key contains characters that are invalid in an HTTP header value.
 func NewClient(apiURL, apiKey string) (*Client, error) {
-	base, plain, err := parseBaseURL(apiURL)
-	if err != nil {
+	if err := validateAPIKey(apiKey); err != nil {
 		return nil, err
 	}
-	if err := validateAPIKey(apiKey); err != nil {
+	return newClient(apiURL, apiKey)
+}
+
+// NewPublicClient creates a client for the API's unauthenticated routes,
+// such as the start of a sign-in. It sends no credential, and takes the
+// same URLs, transport security and redirect rules as NewClient.
+func NewPublicClient(apiURL string) (*Client, error) {
+	return newClient(apiURL, "")
+}
+
+// newClient builds a client authenticated with apiKey, or with nothing
+// when apiKey is "".
+func newClient(apiURL, apiKey string) (*Client, error) {
+	base, plain, err := parseBaseURL(apiURL)
+	if err != nil {
 		return nil, err
 	}
 
@@ -367,7 +380,7 @@ func (c *Client) send(ctx context.Context, method, path string, data []byte, key
 	}
 	if token, ok := strings.CutPrefix(key, "bearer:"); ok {
 		req.Header.Set("Authorization", "Bearer "+token)
-	} else {
+	} else if key != "" {
 		req.Header.Set("DS-API-KEY", key)
 	}
 	req.Header.Set("Content-Type", "application/json")

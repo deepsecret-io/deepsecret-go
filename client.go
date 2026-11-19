@@ -5,6 +5,10 @@ package deepsecret
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/deepsecret-io/deepsecret-go/identity"
@@ -119,3 +123,32 @@ const (
 	// LogModuleKey is the field that names a record's module.
 	LogModuleKey = logattr.ModuleKey
 )
+
+// SignInURL asks the API at apiURL for the Google sign-in page that, once
+// the user signs in, sends them back to returnURL with clientState, which
+// a genuine redirect echoes. It goes through the SDK's transport, so it
+// takes the same URLs and transport security as NewClient, and sends no
+// credential. The error never names the request URL, whose query holds
+// clientState.
+func SignInURL(ctx context.Context, apiURL, returnURL, clientState string) (string, error) {
+	api, err := transport.NewPublicClient(apiURL)
+	if err != nil {
+		return "", err
+	}
+	q := url.Values{"return_url": {returnURL}, "client_state": {clientState}}
+	resp, err := api.Get(ctx, "/api/v1/auth/sso/google?"+q.Encode())
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return "", fmt.Errorf("could not reach the DeepSecret API: %w", ue.Err)
+		}
+		return "", err
+	}
+	var data struct {
+		AuthURL string `json:"auth_url"`
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil || data.AuthURL == "" {
+		return "", errors.New("the DeepSecret API's answer to the sign-in request holds no sign-in URL")
+	}
+	return data.AuthURL, nil
+}
