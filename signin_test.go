@@ -40,7 +40,7 @@ func TestSignInURL(t *testing.T) {
 // error, and plaintext HTTP to a host that is not loopback is refused
 // before any request.
 func TestSignInURL_Errors(t *testing.T) {
-	refuse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	refuse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"success":false,"error":"Invalid return_url"}`))
 	}))
@@ -49,7 +49,7 @@ func TestSignInURL_Errors(t *testing.T) {
 		t.Errorf("refusal: %v", err)
 	}
 
-	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"success":true,"data":{}}`))
 	}))
 	defer empty.Close()
