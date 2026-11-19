@@ -99,14 +99,18 @@ type ListOptions struct {
 	Email  string // filter by sender (for received) or recipient (for sent)
 }
 
+// listPageSize is a list's page size when the caller names none: the most
+// the server returns in one page.
+const listPageSize = 100
+
 // listSecretsFor returns secrets in the given direction ("sent" or "received")
 // for the authenticated user. Returns the list, total count, and any error.
 func listSecretsFor(ctx context.Context, c *transport.Client, memberID, direction string, opts ...ListOptions) ([]Info, int, error) {
-	opt := ListOptions{Limit: 20}
+	opt := ListOptions{Limit: listPageSize}
 	if len(opts) > 0 {
 		opt = opts[0]
 		if opt.Limit == 0 {
-			opt.Limit = 20
+			opt.Limit = listPageSize
 		}
 	}
 
