@@ -257,18 +257,18 @@ func plural(n int) string {
 	return fmt.Sprintf("%d files", n)
 }
 
-// autoArchiveFiles is the files-per-secret limit AutoArchive assumes when
-// the server does not report one, and for a send written to a local file,
-// which has no server limit to meet.
+// autoArchiveFiles is the files-per-secret limit AutoArchive assumes for a
+// sender with no org, and for a send written to a local file, which has no
+// server limit to meet.
 const autoArchiveFiles = 50
 
 // filesLimit is the most files the sender's org accepts in one secret, as
-// /members/me reports it, or autoArchiveFiles when it does not.
+// /members/me reports it, or autoArchiveFiles for a sender with no org.
 func filesLimit(account *identity.Member) int {
-	if account == nil || account.Membership == nil || account.Membership.MaxFilesPerSecret == nil {
+	if account == nil || account.Membership == nil {
 		return autoArchiveFiles
 	}
-	return *account.Membership.MaxFilesPerSecret
+	return account.Membership.MaxFilesPerSecret
 }
 
 func (c *Client) encryptExpandedFiles(ctx context.Context, recipients []string, expanded []archive.ExpandedFile, opt EncryptOptions) (*EncryptResult, error) {

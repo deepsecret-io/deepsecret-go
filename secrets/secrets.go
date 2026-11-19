@@ -215,7 +215,6 @@ type createResponse struct {
 		ID                string `json:"id"`
 		RevisionNumber    int    `json:"revision_number"`
 		IsMultipart       bool   `json:"is_multipart"`
-		MultipartState    string `json:"multipart_state,omitempty"`
 		MultipartPartSize int64  `json:"multipart_part_size,omitempty"`
 	} `json:"revision"`
 	// Revoked lists the people a send with RevokeMissing removed.

@@ -42,7 +42,6 @@ type Compression string
 
 // The compressions a send can ask for.
 const (
-	CompressNone Compression = ""
 	CompressZstd Compression = "zstd"
 )
 

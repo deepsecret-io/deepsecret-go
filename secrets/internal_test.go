@@ -122,19 +122,17 @@ func TestShouldArchive(t *testing.T) {
 	}
 }
 
-// The limit comes from the account /members/me returns, and is 50 when
-// the server reports none.
+// The limit comes from the account /members/me returns, and is 50 for a
+// sender with no org.
 func TestFilesLimit(t *testing.T) {
-	n := func(v int) *int { return &v }
 	for _, c := range []struct {
 		account *identity.Member
 		want    int
 	}{
 		{nil, 50},
 		{&identity.Member{}, 50},
-		{&identity.Member{Membership: &identity.Membership{}}, 50},
-		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: n(100)}}, 100},
-		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: n(-1)}}, -1},
+		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: 100}}, 100},
+		{&identity.Member{Membership: &identity.Membership{MaxFilesPerSecret: -1}}, -1},
 	} {
 		if got := filesLimit(c.account); got != c.want {
 			t.Errorf("filesLimit(%+v) = %d, want %d", c.account, got, c.want)

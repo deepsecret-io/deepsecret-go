@@ -781,7 +781,7 @@ func ReadInfo(dir, fingerprint string) (*KeyFileInfo, error) {
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	name := resolveFingerprint(dir, fingerprint)
+	name := ResolveFingerprint(dir, fingerprint)
 	f, err := readKeyFile(dir, name)
 	if err != nil {
 		return nil, err
@@ -818,7 +818,7 @@ func Open(ctx context.Context, dir, fingerprint string, u Unlock) (*keys.Pair, e
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	name := resolveFingerprint(dir, fingerprint)
+	name := ResolveFingerprint(dir, fingerprint)
 	f, err := readKeyFile(dir, name)
 	if err != nil {
 		return nil, err
@@ -1062,7 +1062,7 @@ func Edit(ctx context.Context, dir, fingerprint string, u Unlock) (*SlotEditor, 
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	name := resolveFingerprint(dir, fingerprint)
+	name := ResolveFingerprint(dir, fingerprint)
 	f, err := readKeyFile(dir, name)
 	if err != nil {
 		return nil, err
@@ -1131,9 +1131,6 @@ func newSlotFileEditor(dir string, kp *keys.Pair, version int) (*SlotEditor, err
 
 // Fingerprint is the full fingerprint of the key pair being edited.
 func (e *SlotEditor) Fingerprint() string { return e.fp }
-
-// KeyPair is the unlocked key pair.
-func (e *SlotEditor) KeyPair() *keys.Pair { return e.kp }
 
 // Slots lists the slots as they stand, changes included.
 func (e *SlotEditor) Slots() []SlotInfo {

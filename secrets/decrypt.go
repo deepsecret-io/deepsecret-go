@@ -917,11 +917,10 @@ func (c *Client) resolveRevision(ctx context.Context, secretID, latestRevID, loc
 		}
 	}
 	if target == nil {
-		if targetID != "" {
-			return nil, fmt.Errorf("revision %s not found", targetID)
+		if targetID == "" {
+			return nil, fmt.Errorf("the server named no latest revision for this secret")
 		}
-		// Fallback: pick last revision
-		target = &revisions[len(revisions)-1]
+		return nil, fmt.Errorf("revision %s not found", targetID)
 	}
 
 	for _, r := range target.Integrity.Recipients {

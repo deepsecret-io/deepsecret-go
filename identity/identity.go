@@ -168,9 +168,8 @@ type Membership struct {
 	// password, a security key or an AWS KMS key.
 	KeyProtectionRequired bool `json:"key_protection_required"`
 	// MaxFilesPerSecret is the most files a secret of the org may hold,
-	// as the server enforces it: -1 for no limit, 0 for none. Nil from a
-	// server that does not report it.
-	MaxFilesPerSecret *int `json:"max_files_per_secret"`
+	// as the server enforces it: -1 for no limit, 0 for none.
+	MaxFilesPerSecret int `json:"max_files_per_secret"`
 }
 
 // Org kinds, as OrgKind holds them.
@@ -492,7 +491,6 @@ type TeamMember struct {
 type Team struct {
 	ID      string       `json:"id"`
 	Name    string       `json:"name"`
-	OrgID   string       `json:"org_id"`
 	Members []TeamMember `json:"members"`
 }
 

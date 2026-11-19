@@ -123,9 +123,7 @@ func isLoopbackHost(host string) bool {
 // closed networks, set DEEPSECRET_INSECURE_HOSTS to a comma-separated host
 // allowlist (e.g. "vpn.internal,10.0.0.5"); only those exact hostnames are
 // permitted to use plaintext HTTP, and a loud warning is still printed.
-// The legacy global DEEPSECRET_ALLOW_INSECURE_HTTP env var is no longer
-// honored; set the per-host allowlist instead. It refuses everything
-// parseBaseURL does.
+// It refuses everything parseBaseURL does.
 func ValidateTransportSecurity(apiURL string) error {
 	_, _, err := parseBaseURL(apiURL)
 	return err
@@ -280,11 +278,12 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 // BaseURL returns the configured API base URL.
 func (c *Client) BaseURL() string { return c.baseURL }
 
-// CheckMaintenance probes the API with an unauthenticated /health request.
+// CheckMaintenance probes the API with an unauthenticated request to
+// /status/maintenance, which maintenance mode answers with 503.
 // Returns (true, message) if the API is in maintenance mode, (false, "") if
 // it's serving normally, and a non-nil error if the probe itself failed.
 func (c *Client) CheckMaintenance(ctx context.Context) (bool, string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/health", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/api/v1/status/maintenance", nil)
 	if err != nil {
 		return false, "", err
 	}

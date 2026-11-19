@@ -161,7 +161,7 @@ func Load(dir, fingerprint, password string) (*keys.Pair, error) {
 	if !validKeyName(fingerprint) {
 		return nil, errInvalidKeyName
 	}
-	f, err := readKeyFile(dir, resolveFingerprint(dir, fingerprint))
+	f, err := readKeyFile(dir, ResolveFingerprint(dir, fingerprint))
 	if err != nil {
 		return nil, err
 	}
@@ -177,8 +177,8 @@ func Load(dir, fingerprint, password string) (*keys.Pair, error) {
 	return loadV4(f.v4, password)
 }
 
-// Errors of password-protected (version 4) key files. Their text is part
-// of the contract: callers have matched on it.
+// Errors of password-protected (version 4) key files. Match them with
+// errors.Is.
 var (
 	ErrPasswordRequired = errors.New("key pair is password-encrypted, provide a password")
 	ErrWrongPassword    = errors.New("wrong password or corrupted key file")
@@ -360,10 +360,14 @@ func validKeyName(fp string) bool {
 	return true
 }
 
-// resolveFingerprint resolves a possibly-truncated fingerprint to the full
-// filename in the keys directory. Falls back to a prefix scan when the exact
-// match is not found.
-func resolveFingerprint(dir, fp string) string {
+// ResolveFingerprint returns the full fingerprint of the key file in dir
+// that fp names: fp itself when a file has that name, else the one file
+// whose name starts with fp, a prefix of 16 or more characters. With no
+// such file, or more than one, it returns fp, which then names no file.
+func ResolveFingerprint(dir, fp string) string {
+	if !validKeyName(fp) {
+		return fp // not a fingerprint, so it names no file in dir
+	}
 	if _, err := os.Stat(filepath.Join(dir, fp+".json")); err == nil {
 		return fp
 	}
@@ -371,16 +375,23 @@ func resolveFingerprint(dir, fp string) string {
 	if err != nil {
 		return fp
 	}
+	match := ""
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
 		name := e.Name()[:len(e.Name())-5]
-		if len(fp) >= 16 && len(name) > len(fp) && name[:len(fp)] == fp {
-			return name
+		if len(name) > len(fp) && name[:len(fp)] == fp {
+			if match != "" {
+				return fp
+			}
+			match = name
 		}
 	}
-	return fp
+	if match == "" {
+		return fp
+	}
+	return match
 }
 
 // ── Password encryption (Argon2id + AES-256-GCM) ────────────────────────────

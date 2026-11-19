@@ -168,18 +168,6 @@ func EncodeZstd(data []byte) ([]byte, error) {
 	return Compress(data, Zstd)
 }
 
-// DecodeZstd decompresses Zstandard data with default size limits.
-// Use [Decompress] directly if you need custom limits.
-func DecodeZstd(data []byte) ([]byte, error) {
-	return Decompress(data, Zstd, nil)
-}
-
-// DecodeZstdBounded decompresses Zstandard data with size limits.
-// Convenience wrapper for Decompress(data, Zstd, limits).
-func DecodeZstdBounded(data []byte, limits *Limits) ([]byte, error) {
-	return Decompress(data, Zstd, limits)
-}
-
 // readBounded reads up to maxBytes from r.
 func readBounded(r io.Reader, maxBytes int64) ([]byte, error) {
 	limited := io.LimitReader(r, maxBytes+1)
